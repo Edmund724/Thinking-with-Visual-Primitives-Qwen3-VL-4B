@@ -6,11 +6,15 @@ from pathlib import Path
 
 
 def setup_logging(
-    name: str = "tvp",
+    name: str | None = None,
     level: int = logging.INFO,
     log_file: Path | None = None,
 ) -> logging.Logger:
     """Setup logger with console and optional file handler."""
+    if name is None:
+        name = "tvp"
+        if log_file is not None:
+            name = Path(log_file).stem
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.handlers = []  # Clear existing

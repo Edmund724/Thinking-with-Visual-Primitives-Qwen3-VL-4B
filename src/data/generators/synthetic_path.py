@@ -154,7 +154,7 @@ def generate_path_dataset(n: int = 30000, seed: int = 42) -> List[Dict]:
             ),
             "reasoning": "\n".join(thinking_parts),
             "answer": "Path traced successfully.",
-            "task_type": "path",
+            "task_type": "point",
         })
 
     return data

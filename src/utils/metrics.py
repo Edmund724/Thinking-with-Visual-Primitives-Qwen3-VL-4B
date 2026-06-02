@@ -317,7 +317,7 @@ def process_reward(
         "pred_has_answer": pred_answer is not None,
     }
 
-    if task_type in ("box", "point"):
+    if task_type in ("box", "point", "path"):
         pred_boxes = parse_boxes(pred_reasoning)
         gt_boxes = parse_boxes(gt_reasoning)
         avg_iou, num_match, num_gt = match_boxes(pred_boxes, gt_boxes, iou_threshold)
@@ -333,7 +333,7 @@ def process_reward(
             "box_num_gt": num_gt,
         })
 
-    if task_type in ("point", "maze"):
+    if task_type in ("point", "maze", "path"):
         pred_points = parse_points(pred_reasoning)
         gt_points = parse_points(gt_reasoning)
         avg_dist, num_match, num_gt = match_points(

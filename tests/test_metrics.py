@@ -185,3 +185,12 @@ class TestProcessReward:
         r = process_reward(pred, gt, task_type="point")
         assert r["answer_correct"] is True
         assert r["point_avg_dist"] == 0.0
+
+    def test_path_task(self):
+        """path task_type should be treated like point for reward computation."""
+        pred = "<think><|point|>[[100,200]]<|/point|></think>\n\nThe answer is A."
+        gt = "<think><|point|>[[100,200]]<|/point|></think>\n\nThe answer is A."
+        r = process_reward(pred, gt, task_type="path")
+        assert r["answer_correct"] is True
+        assert r["point_avg_dist"] == 0.0
+        assert "box_avg_iou" in r

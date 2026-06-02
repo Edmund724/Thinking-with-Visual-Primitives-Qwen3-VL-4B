@@ -149,9 +149,9 @@ def dfs_exploration_with_backtracking(
 
         for nx, ny in reversed(neighbors):
             stack.append(((nx, ny), path + [(nx, ny)]))
-        thinking_lines.append(
-            f"Move to {format_point([(normalize_coordinate(neighbors[0][0], w), normalize_coordinate(neighbors[0][1], h))])}"
-        )
+            thinking_lines.append(
+                f"Move to {format_point([(normalize_coordinate(nx, w), normalize_coordinate(ny, h))])}"
+            )
 
     return "\n".join(thinking_lines)
 

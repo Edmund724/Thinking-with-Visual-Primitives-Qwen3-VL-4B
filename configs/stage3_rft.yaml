@@ -1,4 +1,17 @@
 # Stage 3: RFT (Rejection Sampling Fine-Tuning)
+# GRPO output -> generate 5 rollouts per sample -> select best by
+# process_reward -> SFT on filtered high-quality data.
+#
+# NOTE: lora_r / lora_alpha / lora_dropout are read from the saved adapter
+# config when loading from grpo_checkpoint, NOT from this YAML.
+#
+# NOTE: accept_threshold (1.2) = answer_correct(1.0) + syntax_valid(0.2).
+# Higher scores require additional IoU / point-distance bonuses.
+#
+# NOTE: rejection_iou_threshold and rejection_point_dist_threshold are
+# passed to process_reward()'s matching thresholds (greedy pair matching).
+# They do NOT directly control filtering — accept_threshold is the gate.
+
 base_model: ./models/Qwen3-VL-4B-Thinking
 grpo_checkpoint: outputs/stage2_grpo/round_3
 output_dir: outputs/stage3_rft

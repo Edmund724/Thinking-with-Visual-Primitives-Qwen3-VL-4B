@@ -186,11 +186,11 @@ print(response)
 
 预期输出包含：
 ```
-<thinking>
+<think>
 I can see two cats in the image. Let me mark them.
 <|box|>[[120, 80, 340, 290]]<|/box|>
 <|box|>[[410, 95, 620, 310]]<|/box|>
-</thinking>
+</think>
 
 The answer is 2.
 ```
@@ -218,7 +218,7 @@ The answer is 2.
 | Paged AdamW 8-bit | 优化器状态压缩 |
 | bf16 计算 | 速度 + 显存双赢 |
 
-单卡 24GB 可以同时容纳 **Policy 模型 + Reference 模型**（GRPO 阶段各约 6GB，加上激活值与缓存，峰值约 18GB）。
+单卡 24GB 可以同时容纳 **Policy 模型 + Reference 模型**（TRL 的 GRPOTrainer 对 PEFT 模型通过禁用 adapter 复用相同基座权重，峰值显存约 14-18GB，其中 KV cache 为最大支出）。
 
 ### 过程奖励函数 (Process Reward)
 
@@ -256,7 +256,7 @@ tvp-4b-5090d/
 ├── src/
 │   ├── models/
 │   │   ├── qwen_vl_loader.py         # Qwen3VL + QLoRA 加载器
-│   │   └── inference_engine.py       # 推理封装（adapter 切换）
+│   │   └── visual_primitive_parser.py # 视觉原语解析封装
 │   ├── data/
 │   │   ├── datasets/
 │   │   │   ├── sft_dataset.py        # SFT 数据集（assistant-only loss mask）
@@ -282,7 +282,9 @@ tvp-4b-5090d/
 │   ├── run_stage3_rft.py
 │   └── run_full_pipeline.sh          # 全流水线（参考）
 ├── tests/
-│   └── test_primitive_parser.py      # 坐标解析单元测试
+│   ├── test_primitive_parser.py      # 坐标解析单元测试
+│   ├── test_metrics.py               # 奖励函数与几何工具测试
+│   └── test_logging_utils.py         # 日志工具测试
 ├── requirements.txt
 └── README.md
 ```
@@ -305,7 +307,8 @@ pytest tests/ -v
 @article{deepseek2026thinking,
   title={Thinking with Visual Primitives},
   author={DeepSeek-AI},
-  year={2026}
+  year={2026},
+  note={Preprint. arXiv}
 }
 ```
 
@@ -315,8 +318,18 @@ pytest tests/ -v
 @article{qwen3vl2025,
   title={Qwen3-VL: Advancing Multimodal Understanding and Agentic Ability},
   author={Qwen Team},
-  journal={arXiv preprint},
+  journal={arXiv preprint arXiv:2504.01955},
   year={2025}
+}
+```
+
+以及本项目：
+
+```bibtex
+@misc{tvp4b5090d2026,
+  title={TVP-4B-5090D: Thinking with Visual Primitives on Qwen3-VL-4B},
+  note={Single-GPU reproduction with QLoRA + TRL GRPO + RFT},
+  year={2026}
 }
 ```
 

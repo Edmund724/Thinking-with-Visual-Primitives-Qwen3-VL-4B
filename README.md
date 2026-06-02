@@ -23,7 +23,7 @@
 | 显存要求 | 多卡 A100/H100 | **单卡 RTX 5090D 24GB** |
 | 数据规模 | 460K+ 迷宫 / 125K+ 路径 | 50K 迷宫 / 15K 路径 (可扩展) |
 
-由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级三阶段 pipeline**，在保持核心思想不变的前提下，通过 **4-bit QLoRA + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
+由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级四阶段 pipeline**（含 Pretrain），在保持核心思想不变的前提下，通过 **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
 
 ---
 
@@ -89,28 +89,49 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 
 ---
 
-## 🚀 训练流程（三阶段）
+## 🚀 训练流程（四阶段）
 
 ```
-Stage 1: SFT Unified      混合 Box + Maze + Path 有监督微调    ~6h
-Stage 2: GRPO             组相对策略优化，3 轮阈值收紧         ~10h
-Stage 3: RFT              拒绝采样 + SFT 提纯                  ~2h
-                        ─────────────────────────────────────────
-                        Total:                                ~18h
+Stage 0: Pretrain         Embedding 初始化（纯文本，25K）            ~0.5h
+Stage 1: SFT Unified      混合 Box + Maze + Path 有监督微调           ~27h
+Stage 2: GRPO             组相对策略优化，3 轮阈值收紧                ~22h
+Stage 3: RFT              拒绝采样 + SFT 提纯                         ~4h
+                        ──────────────────────────────────────────────
+                        Total:                                       ~54h
 ```
+
+### Stage 0: Pretrain（Embedding 初始化）
+
+**论文思想**：先初始化新特殊 token（`<|box|>`, `<|point|>` 等）的 embedding，再学思维链。
+
+**纯文本训练，无图像**。只训练 `embed_tokens` 层（4-bit 基座权重全部冻结）。25K 条程序化生成样本，3 epochs，半小时内完成。
+
+```bash
+# 1. 生成训练数据（一次性，已内置在脚本中）
+python scripts/generate_pretrain_data.py
+# → data/pretrain/pretrain_data.json (25K samples, ~5MB)
+
+# 2. 训练 embedding-only（~30 min）
+python scripts/run_pretrain.py \
+    --model_path models/Qwen3-VL-4B-Thinking \
+    --output_dir outputs/stage0_pretrain \
+    --num_epochs 3
+```
+
+**输出**: `outputs/stage0_pretrain/pretrain_state_dict.pt`（~740MB）
+
+> 💡 如果跳过 Pretrain 直接从 Stage 1 开始，不加 `--pretrain_embedding_path` 即可。
 
 ### Stage 1: SFT Unified
 
-在 COCO Grounding + 合成迷宫 + 合成路径数据上进行统一的有监督微调，让模型学会输出包含视觉原语的 thinking 格式。
+在 Pretrain 的 embedding 基础上，加入 **maze + path + thinking chain**，让模型学会将"坐标输出技能"整合到"推理思维"中。
 
 ```bash
 python scripts/run_stage1_sft_unified.py \
     --config configs/stage1_sft_unified.yaml \
+    --pretrain_embedding_path outputs/stage0_pretrain \
     --coco_image_dir data/coco/train2017 \
-    --coco_ann_file data/coco/annotations/instances_train2017.json \
-    --num_coco 40000 \
-    --num_maze 50000 \
-    --num_path 15000
+    --coco_ann_file data/coco/annotations/instances_train2017.json
 ```
 
 **输出**: `outputs/stage1_sft_unified/`
@@ -250,6 +271,7 @@ reward = process_reward(
 ```
 tvp-4b-5090d/
 ├── configs/                          # YAML 训练配置
+│   ├── stage0_pretrain.yaml
 │   ├── stage1_sft_unified.yaml
 │   ├── stage2_grpo.yaml
 │   └── stage3_rft.yaml
@@ -260,7 +282,8 @@ tvp-4b-5090d/
 │   ├── data/
 │   │   ├── datasets/
 │   │   │   ├── sft_dataset.py        # SFT 数据集（assistant-only loss mask）
-│   │   │   └── grpo_dataset.py       # GRPO 数据集
+│   │   │   ├── grpo_dataset.py       # GRPO 数据集
+│   │   │   └── image_loader.py       # Lazy image loading（防 OOM）
 │   │   ├── generators/
 │   │   │   ├── coco_box_generator.py # COCO 标注 → box 训练样本
 │   │   │   ├── synthetic_maze.py     # 合成迷宫生成器
@@ -277,10 +300,11 @@ tvp-4b-5090d/
 │       ├── metrics.py                # IoU / 撞墙 / 过程 reward
 │       └── logging_utils.py          # 日志初始化
 ├── scripts/                          # 阶段入口脚本
+│   ├── run_stage0_pretrain.py
 │   ├── run_stage1_sft_unified.py
 │   ├── run_stage2_grpo.py
 │   ├── run_stage3_rft.py
-│   └── run_full_pipeline.sh          # 全流水线（参考）
+│   └── run_full_pipeline.sh          # 全流水线
 ├── tests/
 │   ├── test_primitive_parser.py      # 坐标解析单元测试
 │   ├── test_metrics.py               # 奖励函数与几何工具测试
@@ -347,3 +371,22 @@ pytest tests/ -v
 ## 📄 License
 
 MIT
+
+---
+
+## 🤗 模型权重
+
+训练完成后的 LoRA 适配器权重将上传至 **ModelScope**：
+
+```
+# 即将上线
+modelscope download Edmund724/tvp-4b-5090d-qwen3-vl-4b --local_dir ./weights
+```
+
+使用方式：
+```python
+from src.models.qwen_vl_loader import load_qlora_model
+model, processor = load_qlora_model("./weights")
+```
+
+> 适配器仅包含 LoRA 参数（~330M），需配合基座模型 `Qwen/Qwen3-VL-4B-Thinking` 使用。

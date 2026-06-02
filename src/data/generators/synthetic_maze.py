@@ -241,19 +241,26 @@ def render_maze_image(
     return img
 
 
-def generate_maze_dataset(n: int = 100000, seed: int = 42) -> List[Dict]:
+def generate_maze_dataset(
+    n: int = 100000, seed: int = 42, cache_dir: str = "data/cache/maze"
+) -> List[Dict]:
     """Generate maze dataset with 50% solvable / 50% unsolvable.
 
+    Images are saved to disk and image_path is returned to avoid OOM.
+
     Returns list of dicts with keys:
-        image: PIL.Image
+        image: str (path to saved image)
         prompt: str
         thinking: str
         answer: str
         maze_grid: np.ndarray
         task_type: str = "maze"
     """
+    import os
+
     random.seed(seed)
     np.random.seed(seed)
+    os.makedirs(cache_dir, exist_ok=True)
     data = []
 
     for idx in range(n):
@@ -265,6 +272,8 @@ def generate_maze_dataset(n: int = 100000, seed: int = 42) -> List[Dict]:
             continue
 
         img = render_maze_image(maze_grid, start, end)
+        img_path = os.path.join(cache_dir, f"maze_{seed}_{idx:06d}.png")
+        img.save(img_path)
 
         if random.random() < MAZE_SOLVABLE_RATIO:
             # Solvable maze
@@ -279,7 +288,7 @@ def generate_maze_dataset(n: int = 100000, seed: int = 42) -> List[Dict]:
             answer = r"\boxed{False}"
 
         data.append({
-            "image": img,
+            "image": img_path,
             "prompt": "Is there a path from the green circle (start) to the red square (end)? Use <|point|> to show your exploration process step by step.",
             "reasoning": thinking,
             "answer": answer,

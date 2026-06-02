@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# TVP-4B-5090D: Full 3-Stage Pipeline Runner
-# Stage 1: SFT Unified -> Stage 2: GRPO -> Stage 3: RFT
+# TVP-4B-5090D: Full 4-Stage Pipeline Runner
+# Stage 0: Pretrain -> Stage 1: SFT Unified -> Stage 2: GRPO -> Stage 3: RFT
 #
 # Usage:
 #   bash scripts/run_full_pipeline.sh [--skip-data-check] [--from-stage N]
 #
-# WARNING: This pipeline runs ~18 hours on single RTX 5090D.
+# WARNING: This pipeline runs ~50-60 hours on single RTX 5090D.
 # Each stage saves checkpoints; you can resume from any stage.
 
 set -euo pipefail
@@ -15,7 +15,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 # Parse args
-FROM_STAGE=1
+FROM_STAGE=0
 SKIP_DATA_CHECK=false
 
 while [[ $# -gt 0 ]]; do
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "================================================"
-echo "TVP-4B-5090D: Full 3-Stage Pipeline"
+echo "TVP-4B-5090D: Full 4-Stage Pipeline"
 echo "Starting from Stage $FROM_STAGE"
 echo "================================================"
 
@@ -38,19 +38,18 @@ echo "Dependencies OK."
 mkdir -p outputs logs data
 
 # =====================================================
-# Stage 1: SFT Unified (Box + Maze + Path)
+# Stage 0: Pretrain (COCO Box Grounding — No Thinking)
 # =====================================================
-if [ "$FROM_STAGE" -le 1 ]; then
+if [ "$FROM_STAGE" -le 0 ]; then
     echo ""
     echo "================================================"
-    echo "Stage 1/3: SFT Unified"
-    echo "  - COCO Box samples"
-    echo "  - Synthetic Maze"
-    echo "  - Synthetic Path"
-    echo "Estimated: ~6 hours"
+    echo "Stage 0/3: Pretrain (COCO Box Grounding)"
+    echo "  - No Chain-of-Thought"
+    echo "  - Pure grounding: see object -> output box"
+    echo "  - Following paper's curriculum learning"
+    echo "Estimated: ~10 hours"
     echo "================================================"
 
-    # Check COCO if not skipped
     COCO_DIR="data/coco"
     if [ ! -f "$COCO_DIR/annotations/instances_train2017.json" ] && [ "$SKIP_DATA_CHECK" = false ]; then
         echo "WARNING: COCO data not found at $COCO_DIR"
@@ -62,10 +61,39 @@ if [ "$FROM_STAGE" -le 1 ]; then
         exit 1
     fi
 
+    python scripts/run_stage0_pretrain.py \
+        --config configs/stage0_pretrain.yaml \
+        --coco_image_dir "$COCO_DIR/train2017" \
+        --coco_ann_file "$COCO_DIR/annotations/instances_train2017.json" \
+        --num_coco 40000
+fi
+
+# =====================================================
+# Stage 1: SFT Unified (Box + Maze + Path + Thinking)
+# =====================================================
+if [ "$FROM_STAGE" -le 1 ]; then
+    echo ""
+    echo "================================================"
+    echo "Stage 1/3: SFT Unified"
+    echo "  - COCO Box + Synthetic Maze + Synthetic Path"
+    echo "  - Chain-of-Thought reasoning added"
+    echo "  - Loads from Stage 0 adapter (curriculum)"
+    echo "Estimated: ~27 hours"
+    echo "================================================"
+
+    MODEL_PATH=""
+    if [ -d "outputs/stage0_pretrain" ]; then
+        MODEL_PATH="outputs/stage0_pretrain"
+        echo "Using Stage 0 checkpoint: $MODEL_PATH"
+    else
+        echo "WARNING: Stage 0 checkpoint not found, using base model from config"
+    fi
+
     python scripts/run_stage1_sft_unified.py \
         --config configs/stage1_sft_unified.yaml \
-        --coco_image_dir "$COCO_DIR/train2017" \
-        --coco_ann_file "$COCO_DIR/annotations/instances_train2017.json"
+        ${MODEL_PATH:+--model_path "$MODEL_PATH"} \
+        --coco_image_dir data/coco/train2017 \
+        --coco_ann_file data/coco/annotations/instances_train2017.json
 fi
 
 # =====================================================
@@ -76,7 +104,7 @@ if [ "$FROM_STAGE" -le 2 ]; then
     echo "================================================"
     echo "Stage 2/3: GRPO (Group Relative Policy Optimization)"
     echo "  - 3 rounds, tightening IoU / point-dist thresholds"
-    echo "Estimated: ~10 hours"
+    echo "Estimated: ~20-25 hours"
     echo "================================================"
 
     MODEL_PATH=""
@@ -105,7 +133,7 @@ if [ "$FROM_STAGE" -le 3 ]; then
     echo "  - Rollout 5x per sample"
     echo "  - Filter by process reward"
     echo "  - SFT on high-quality subset"
-    echo "Estimated: ~2 hours"
+    echo "Estimated: ~3-5 hours"
     echo "================================================"
 
     MODEL_PATH=""
@@ -113,7 +141,6 @@ if [ "$FROM_STAGE" -le 3 ]; then
         MODEL_PATH="outputs/stage2_grpo/round_3"
         echo "Using Stage 2 Round 3 checkpoint: $MODEL_PATH"
     elif [ -d "outputs/stage2_grpo" ]; then
-        # Fallback: find the latest round directory
         MODEL_PATH="$(find outputs/stage2_grpo -maxdepth 1 -type d -name 'round_*' | sort | tail -1)"
         echo "Using latest GRPO checkpoint: $MODEL_PATH"
     else

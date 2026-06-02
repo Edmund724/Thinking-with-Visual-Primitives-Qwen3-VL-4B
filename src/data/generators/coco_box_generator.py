@@ -94,11 +94,7 @@ def generate_coco_box_samples(
         if not os.path.exists(img_path):
             continue
 
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except Exception:
-            continue
-
+        # Lazy loading: store image_path, load PIL Image on demand
         anns = image_anns[img_id]
         if not anns:
             continue
@@ -155,7 +151,7 @@ def generate_coco_box_samples(
             prompt = f"Find all visible objects and describe their locations with <|box|>."
 
         data.append({
-            "image": image,
+            "image": img_path,
             "prompt": prompt,
             "reasoning": thinking,
             "answer": answer,

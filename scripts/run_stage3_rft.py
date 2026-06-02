@@ -14,6 +14,7 @@ import yaml
 
 import torch
 
+from src.data.datasets.image_loader import load_image
 from src.data.datasets.sft_dataset import SFTDataset
 from src.data.generators.coco_box_generator import generate_coco_box_samples
 from src.data.generators.synthetic_maze import generate_maze_dataset
@@ -29,6 +30,7 @@ logger = setup_logging(log_file="logs/stage3_rft.log")
 
 def rejection_sample(model, processor, sample, config, max_new_tokens):
     """Generate 5 rollouts, return best by process reward."""
+    image = load_image(sample["image"])
     messages = [
         {
             "role": "system",
@@ -37,7 +39,7 @@ def rejection_sample(model, processor, sample, config, max_new_tokens):
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": sample["image"]},
+                {"type": "image", "image": image},
                 {"type": "text", "text": sample["prompt"]},
             ],
         },
@@ -53,7 +55,7 @@ def rejection_sample(model, processor, sample, config, max_new_tokens):
     )
     inputs = processor(
         text=[prompt_text],
-        images=[sample["image"]],
+        images=[image],
         return_tensors="pt",
     )
     inputs = {k: v.to(model.device) for k, v in inputs.items()}

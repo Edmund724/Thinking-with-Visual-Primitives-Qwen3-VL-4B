@@ -4,6 +4,7 @@ import re
 
 # Model
 BASE_MODEL_NAME = "Qwen/Qwen3-VL-4B-Thinking"
+BASE_VOCAB_SIZE = 151936  # Qwen3-VL-4B-Thinking original vocab size
 
 # Visual Primitive Tags (revised to paper format)
 BOX_OPEN = "<|box|>"

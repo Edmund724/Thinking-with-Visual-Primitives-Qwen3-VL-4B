@@ -20,8 +20,8 @@ per_device_batch_size: 1
 gradient_accumulation_steps: 8
 learning_rate: 1.0e-5
 num_train_epochs: 1
-lora_r: 64
-lora_alpha: 128
+lora_r: 256
+lora_alpha: 512
 lora_dropout: 0.05
 optimizer: paged_adamw_8bit
 bf16: true

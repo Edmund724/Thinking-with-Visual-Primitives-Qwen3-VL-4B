@@ -1,21 +1,28 @@
 # Stage 1: SFT Unified
 # Supervised fine-tuning on mixed Box (COCO) + Maze + Path data.
-# Uses QLoRA (4-bit NF4 + double quantization) for single RTX 5090D (24GB).
+# Now includes Chain-of-Thought reasoning (thinking chain).
+#
+# Prerequisite: Stage 0 Pretrain (outputs/stage0_pretrain).
+# If skipped, set base_model back to ./models/Qwen3-VL-4B-Thinking.
 #
 # NOTE: max_seq_length=2048 includes BOTH image tokens and text tokens.
 # Qwen3-VL produces ~256-1024 visual tokens per image, so text space
 # is effectively 1024-1792 tokens. Increase to 4096 if truncation is observed.
 # At 4096, estimated GPU memory increase: ~4-6GB.
+#
+# NOTE: lora_r=256 / lora_alpha=512 are loaded from the adapter checkpoint
+# (Stage 0 adapter). These values here serve as documentation only.
 
 base_model: ./models/Qwen3-VL-4B-Thinking
+stage0_pretrain: outputs/stage0_pretrain
 output_dir: outputs/stage1_sft_unified
 max_seq_length: 2048
 per_device_batch_size: 1
 gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
 num_train_epochs: 1
-lora_r: 64
-lora_alpha: 128
+lora_r: 256
+lora_alpha: 512
 lora_dropout: 0.05
 optimizer: paged_adamw_8bit
 bf16: true

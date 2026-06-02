@@ -13,6 +13,8 @@ from typing import Any, Dict, List
 import torch
 from torch.utils.data import Dataset
 
+from .image_loader import load_image
+
 
 class GRPODataset(Dataset):
     """Dataset for GRPO training with multimodal inputs.
@@ -31,6 +33,7 @@ class GRPODataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.data[idx]
+        image = load_image(sample["image"])
 
         return {
             "prompt": [
@@ -46,7 +49,7 @@ class GRPODataset(Dataset):
                     "content": sample["prompt"],
                 },
             ],
-            "image": sample["image"],
+            "image": image,
             "gt_text": (
                 sample["reasoning"]
                 + "\n</think>\n\nThe answer is "

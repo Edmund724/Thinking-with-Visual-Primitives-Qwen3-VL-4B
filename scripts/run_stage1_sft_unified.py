@@ -19,6 +19,7 @@ from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
 from src.utils.logging_utils import setup_logging
+from src.utils.constants import BASE_VOCAB_SIZE
 
 logger = setup_logging(log_file="logs/stage1_sft_unified.log")
 
@@ -33,13 +34,28 @@ def main(args):
 
     torch.cuda.empty_cache()
 
-    # 1. Load model + processor
-    logger.info("Loading model...")
-    model, processor = load_qlora_model(
-        model_name=config["base_model"],
-        lora_r=config.get("lora_r", 64),
-        lora_alpha=config.get("lora_alpha", 128),
-    )
+    # 1. Load model with optional pretrained embedding injection
+    base_model = config["base_model"]
+    pretrain_path = config.get("stage0_pretrain") or args.pretrain_embedding_path
+
+    if pretrain_path and os.path.exists(os.path.join(pretrain_path, "pretrain_state_dict.pt")):
+        logger.info(f"Loading from base model + injecting pretrained embeddings from {pretrain_path}...")
+        model, processor = load_qlora_model(
+            model_name=base_model,
+            lora_r=config.get("lora_r", 256),
+            lora_alpha=config.get("lora_alpha", 512),
+            pretrain_embedding_path=os.path.join(pretrain_path, "pretrain_state_dict.pt"),
+            old_vocab_size=BASE_VOCAB_SIZE,
+        )
+    else:
+        # Fallback: load from existing adapter or base model directly
+        model_path = args.model_path or config.get("stage0_checkpoint") or base_model
+        logger.info(f"Loading from {model_path} (no pretrain embedding found)...")
+        model, processor = load_qlora_model(
+            model_name=model_path,
+            lora_r=config.get("lora_r", 256),
+            lora_alpha=config.get("lora_alpha", 512),
+        )
     log_memory_status("After model loading:")
 
     # 2. Generate mixed training data
@@ -111,6 +127,10 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 1: SFT Unified")
     parser.add_argument("--config", type=str, default="configs/stage1_sft_unified.yaml")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Path to model checkpoint (default: stage0_checkpoint from config)")
+    parser.add_argument("--pretrain_embedding_path", type=str, default=None,
+                        help="Path to pretrain embedding checkpoint (preferred over --model_path)")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")

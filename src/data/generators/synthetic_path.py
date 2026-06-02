@@ -117,22 +117,31 @@ def generate_path_tracing_image(
     return img, curves
 
 
-def generate_path_dataset(n: int = 30000, seed: int = 42) -> List[Dict]:
+def generate_path_dataset(
+    n: int = 30000, seed: int = 42, cache_dir: str = "data/cache/path"
+) -> List[Dict]:
     """Generate uniform-style path tracing dataset.
 
+    Images are saved to disk and image_path is returned to avoid OOM.
+
     Returns list of dicts with:
-        image: PIL.Image
+        image: str (path to saved image)
         prompt: str
         thinking: str
         answer: str
-        task_type: str = "path"
+        task_type: str = "point"
     """
+    import os
+
     random.seed(seed)
     np.random.seed(seed)
+    os.makedirs(cache_dir, exist_ok=True)
     data = []
 
     for idx in range(n):
         img, curves = generate_path_tracing_image(n_curves=random.randint(2, 4))
+        img_path = os.path.join(cache_dir, f"path_{seed}_{idx:06d}.png")
+        img.save(img_path)
 
         # Pick one curve as target
         target = random.choice(curves)
@@ -146,7 +155,7 @@ def generate_path_dataset(n: int = 30000, seed: int = 42) -> List[Dict]:
         thinking_parts.append("Path complete.")
 
         data.append({
-            "image": img,
+            "image": img_path,
             "prompt": (
                 f"Trace the curve from the {target['start_shape']} labeled {target['start_label']} "
                 f"to the {target['end_shape']} labeled {target['end_label']}. "

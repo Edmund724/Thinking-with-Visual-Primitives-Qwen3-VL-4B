@@ -11,6 +11,8 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
 
+from .image_loader import load_image
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,6 +134,7 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.data[idx]
+        image = load_image(sample["image"])
 
         prompt_messages, full_messages = self._build_messages(sample)
 
@@ -144,7 +147,7 @@ class SFTDataset(Dataset):
 
         inputs = self.processor(
             text=[full_text],
-            images=[sample["image"]],
+            images=[image],
             return_tensors="pt",
             padding="max_length",
             max_length=self.max_length,
@@ -159,7 +162,7 @@ class SFTDataset(Dataset):
             inputs["input_ids"],
             prompt_messages,
             full_messages,
-            sample["image"],
+            image,
         )
 
         # Mask padding tokens

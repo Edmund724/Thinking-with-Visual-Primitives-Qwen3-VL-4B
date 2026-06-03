@@ -80,6 +80,7 @@ def main(args):
         per_device_batch_size=args.batch_size,
         max_length=args.max_length,
         warmup_steps=args.warmup_steps,
+        logger=logger,
     )
 
     # 4. Save only trained embedding weights

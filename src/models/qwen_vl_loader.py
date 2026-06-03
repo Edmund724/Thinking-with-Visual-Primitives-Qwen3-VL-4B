@@ -134,11 +134,19 @@ def load_qlora_model(
     # Add special tokens for visual primitives
     special_tokens_dict = {"additional_special_tokens": SPECIAL_TOKENS}
     num_added = processor.tokenizer.add_special_tokens(special_tokens_dict)
+    new_tokenizer_len = len(processor.tokenizer)
     logger.info(f"Added {num_added} special tokens: {SPECIAL_TOKENS}")
 
     # CRITICAL: resize embeddings BEFORE prepare_model_for_kbit_training
-    model.resize_token_embeddings(len(processor.tokenizer))
-    logger.info(f"Resized embeddings to {len(processor.tokenizer)}")
+    # Only expand — never shrink. Model may have more embeddings than tokenizer tokens.
+    current_embed_size = model.get_input_embeddings().num_embeddings
+    if new_tokenizer_len > current_embed_size:
+        model.resize_token_embeddings(new_tokenizer_len)
+        logger.info(f"Resized embeddings: {current_embed_size} → {new_tokenizer_len}")
+    else:
+        logger.info(
+            f"No resize needed: embedding ({current_embed_size}) covers tokenizer ({new_tokenizer_len})"
+        )
 
     # (NEW) Inject pretrained special-token embeddings from Stage 0
     if pretrain_embedding_path is not None:
@@ -256,8 +264,14 @@ def load_reference_model(
     # CRITICAL: add special tokens and resize embeddings to match policy model
     special_tokens_dict = {"additional_special_tokens": SPECIAL_TOKENS}
     num_added = processor.tokenizer.add_special_tokens(special_tokens_dict)
-    logger.info(f"Reference: added {num_added} special tokens, resizing embeddings...")
-    model.resize_token_embeddings(len(processor.tokenizer))
+    new_tokenizer_len = len(processor.tokenizer)
+    logger.info(f"Reference: added {num_added} special tokens, tokenizer len={new_tokenizer_len}")
+    current_embed_size = model.get_input_embeddings().num_embeddings
+    if new_tokenizer_len > current_embed_size:
+        model.resize_token_embeddings(new_tokenizer_len)
+        logger.info(f"Reference: resized embeddings: {current_embed_size} → {new_tokenizer_len}")
+    else:
+        logger.info(f"Reference: no resize needed: embedding ({current_embed_size}) covers tokenizer ({new_tokenizer_len})")
 
     if adapter_to_load is not None:
         model = PeftModel.from_pretrained(model, adapter_to_load)

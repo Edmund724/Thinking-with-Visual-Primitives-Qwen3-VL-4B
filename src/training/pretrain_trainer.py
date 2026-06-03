@@ -8,13 +8,13 @@ Backbone is frozen; only embed_tokens.weight receives gradients.
 """
 
 import logging
+import time
 from typing import Any, Dict
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoProcessor
-
-logger = logging.getLogger(__name__)
+from tqdm import tqdm
 
 
 class PretrainDataset(Dataset):
@@ -33,6 +33,7 @@ class PretrainDataset(Dataset):
         data: list,
         processor: AutoProcessor,
         max_length: int = 256,
+        desc: str = "Tokenizing",
     ):
         self.processor = processor
         self.max_length = max_length
@@ -40,7 +41,7 @@ class PretrainDataset(Dataset):
 
         pad_token_id = processor.tokenizer.pad_token_id or 0
 
-        for sample in data:
+        for sample in tqdm(data, desc=desc, unit="samples"):
             messages = sample["conversations"]
             full_text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,
@@ -103,6 +104,7 @@ def train_pretrain(
     warmup_steps: int = 200,
     logging_steps: int = 50,
     save_steps: int | None = None,
+    logger: logging.Logger | None = None,
 ):
     """Run embedding-only pretrain with a minimal PyTorch training loop.
 
@@ -111,11 +113,18 @@ def train_pretrain(
 
     Uses mixed precision (torch.cuda.amp) for speed.
     """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    t0 = time.time()
+    logger.info("Tokenizing pretrain data...")
     dataset = PretrainDataset(
         data=train_data,
         processor=processor,
         max_length=max_length,
     )
+    logger.info(f"Tokenization done in {time.time() - t0:.1f}s")
+
     dataloader = DataLoader(
         dataset,
         batch_size=per_device_batch_size,
@@ -129,6 +138,8 @@ def train_pretrain(
 
     # Optimizer: only trainable parameters (embed_tokens ± lm_head)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    n_params = sum(p.numel() for p in trainable_params)
+    logger.info(f"Trainable params: {n_params:,} ({n_params/1e6:.1f}M)")
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=len(dataloader) * num_epochs
@@ -136,10 +147,14 @@ def train_pretrain(
 
     model.train()
     global_step = 0
+    logger.info(f"Starting training loop ({num_epochs} epochs, {len(dataloader)} batches/epoch)...")
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
-        for step, batch in enumerate(dataloader):
+        epoch_t0 = time.time()
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
+        for step, batch in enumerate(pbar):
             global_step += 1
 
             # Warmup
@@ -165,20 +180,28 @@ def train_pretrain(
             if global_step > warmup_steps:
                 scheduler.step()
 
-            epoch_loss += loss.item()
+            loss_val = loss.item()
+            epoch_loss += loss_val
+
+            # Update tqdm bar
+            pbar.set_postfix({
+                "loss": f"{loss_val:.4f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+            })
 
             if global_step % logging_steps == 0:
                 logger.info(
                     f"  Epoch {epoch+1}/{num_epochs} | "
                     f"Step {global_step} | "
-                    f"Loss: {loss.item():.4f} | "
+                    f"Loss: {loss_val:.4f} | "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e}"
                 )
 
         avg_loss = epoch_loss / max(len(dataloader), 1)
         logger.info(
             f"Epoch {epoch+1}/{num_epochs} complete. "
-            f"Avg loss: {avg_loss:.4f}"
+            f"Avg loss: {avg_loss:.4f} | "
+            f"Time: {time.time() - epoch_t0:.1f}s"
         )
 
     logger.info("Pretrain training complete.")

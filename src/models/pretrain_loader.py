@@ -72,24 +72,34 @@ def load_pretrain_model(
         trust_remote_code=True,
     )
 
-    # 2. Add special tokens
+    # 2. Record original tokenizer length BEFORE adding special tokens
+    old_vocab_size = len(processor.tokenizer)
+
+    # 3. Add special tokens
     special_tokens_dict = {"additional_special_tokens": SPECIAL_TOKENS}
     num_added = processor.tokenizer.add_special_tokens(special_tokens_dict)
+    new_tokenizer_len = len(processor.tokenizer)
     logger.info(
-        f"Added {num_added} special tokens (vocab: {len(processor.tokenizer)})"
+        f"Added {num_added} special tokens (tokenizer: {old_vocab_size} → {new_tokenizer_len})"
     )
 
-    # 3. Resize embeddings BEFORE prepare_model_for_kbit_training
-    #    bnb NEVER quantizes embedding/lm_head layers, so embed stays fp16
-    model.resize_token_embeddings(len(processor.tokenizer))
-    old_vocab_size = BASE_VOCAB_SIZE
-    logger.info(f"Resized embeddings to {len(processor.tokenizer)}")
+    # 4. Resize embeddings ONLY if tokenizer grew beyond current embedding size.
+    #    NEVER shrink — the model may have more embeddings than tokenizer tokens.
+    current_embed_size = model.get_input_embeddings().num_embeddings
+    if new_tokenizer_len > current_embed_size:
+        model.resize_token_embeddings(new_tokenizer_len)
+        logger.info(f"Resized embeddings: {current_embed_size} → {new_tokenizer_len}")
+    else:
+        logger.info(
+            f"No resize needed: embedding ({current_embed_size}) already covers "
+            f"tokenizer ({new_tokenizer_len})"
+        )
 
-    # 4. Skip prepare_model_for_kbit_training — backbone is frozen,
+    # 5. Skip prepare_model_for_kbit_training — backbone is frozen,
     #    embedding layer stays fp16. Only embed_tokens receives gradients.
     #    (prepare_model_for_kbit_training is for QLoRA training, not needed here)
 
-    # 5. Confirm weight tying
+    # 6. Confirm weight tying
     embed = model.get_input_embeddings()
     lm_head = model.get_output_embeddings()
     tied = embed.weight.data_ptr() == lm_head.weight.data_ptr()
@@ -97,7 +107,7 @@ def load_pretrain_model(
         f"embed_tokens & lm_head {'TIED' if tied else 'NOT tied'}"
     )
 
-    # 6. Freeze ALL parameters, then unfreeze only embed_tokens
+    # 7. Freeze ALL parameters, then unfreeze only embed_tokens
     for param in model.parameters():
         param.requires_grad = False
 
@@ -169,41 +179,50 @@ def inject_pretrained_embeddings(
     """Inject pretrained new-token embeddings into a 4-bit QLoRA model.
 
     Only overwrites rows >= old_vocab_size. Old vocab untouched.
+    Handles both normal (expanded) and shrunk embedding states.
     """
     logger.info(f"Injecting pretrained embeddings from {pretrain_path}...")
 
     pretrain_state = torch.load(pretrain_path, map_location="cpu", weights_only=True)
     pretrained_embed = pretrain_state["embed_tokens.weight"]
+    saved_old_vocab = pretrain_state.get("old_vocab_size", old_vocab_size)
 
     current_embed = model.get_input_embeddings()
     current_weight = current_embed.weight.data
 
-    new_vocab_size = pretrained_embed.shape[0]
-    num_new_tokens = new_vocab_size - old_vocab_size
+    embed_shape = pretrained_embed.shape[0]
 
+    # Detect shrunk embedding state (old bug where resize shrank instead of expanded)
+    if saved_old_vocab >= embed_shape:
+        effective_old = embed_shape - len(SPECIAL_TOKENS)
+        logger.warning(
+            f"Shrunk embedding detected (saved_old={saved_old_vocab} > shape={embed_shape}). "
+            f"Assuming {len(SPECIAL_TOKENS)} new tokens at end. effective_old={effective_old}"
+        )
+    else:
+        effective_old = saved_old_vocab
+
+    num_new_tokens = embed_shape - effective_old
     logger.info(
-        f"  old_vocab={old_vocab_size}, new_vocab={new_vocab_size}, "
+        f"  effective_old={effective_old}, embed_shape={embed_shape}, "
         f"num_new_tokens={num_new_tokens}"
     )
 
     # bnb never quantizes embedding — should be fp16/bf16, not uint8
     if current_weight.dtype in (torch.uint8, torch.int8):
         logger.warning("Embedding is quantized. Attempting dequantized injection...")
-        # Fallback: use module's forward hook to get fp16 weight
-        # Since bnb doesn't quantize embedding, this path should rarely trigger
-        from bitsandbytes.nn.modules import Linear4bit
-        pass  # Complex; rely on the fact that bnb skips embedding layers
+        pass
 
     # Direct indexing (embedding is fp16 in bnb 4-bit models)
-    new_part = pretrained_embed[old_vocab_size:].to(
+    new_part = pretrained_embed[effective_old:].to(
         dtype=current_weight.dtype,
         device=current_weight.device,
     )
     with torch.no_grad():
-        current_weight[old_vocab_size:] = new_part
+        current_weight[effective_old:effective_old + new_part.shape[0]] = new_part
     logger.info(
         f"  Injected {new_part.shape[0]} new token rows. "
-        f"Old tokens preserved ({old_vocab_size} rows untouched)."
+        f"Old tokens preserved ({effective_old} rows untouched)."
     )
 
     if "lm_head.weight" in pretrain_state:
@@ -211,11 +230,11 @@ def inject_pretrained_embeddings(
         lm_weight = lm_head.weight.data
         if lm_weight.dtype not in (torch.uint8, torch.int8):
             pretrained_lm = pretrain_state["lm_head.weight"]
-            new_lm = pretrained_lm[old_vocab_size:].to(
+            new_lm = pretrained_lm[effective_old:effective_old + new_part.shape[0]].to(
                 dtype=lm_weight.dtype, device=lm_weight.device
             )
             with torch.no_grad():
-                lm_weight[old_vocab_size:] = new_lm
+                lm_weight[effective_old:effective_old + new_part.shape[0]] = new_lm
             logger.info("  Injected lm_head new token rows (not tied).")
 
     logger.info("Pretrained embedding injection complete.")

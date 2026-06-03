@@ -376,17 +376,24 @@ MIT
 
 ## 🤗 模型权重
 
-训练完成后的 LoRA 适配器权重将上传至 **ModelScope**：
+训练完成后的**完整模型权重**（含基座 + LoRA 合并后的全量参数）将上传至 **ModelScope**，开箱即用，无需额外加载基座模型：
 
-```
+```bash
 # 即将上线
 modelscope download Edmund724/tvp-4b-5090d-qwen3-vl-4b --local_dir ./weights
 ```
 
 使用方式：
 ```python
-from src.models.qwen_vl_loader import load_qlora_model
-model, processor = load_qlora_model("./weights")
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+model = Qwen3VLForConditionalGeneration.from_pretrained(
+    "./weights",
+    torch_dtype="auto",
+    device_map="auto",
+    trust_remote_code=True,
+)
+processor = AutoProcessor.from_pretrained("./weights", trust_remote_code=True)
 ```
 
-> 适配器仅包含 LoRA 参数（~330M），需配合基座模型 `Qwen/Qwen3-VL-4B-Thinking` 使用。
+> 完整权重约 8-9GB（bf16），支持直接推理与继续微调。

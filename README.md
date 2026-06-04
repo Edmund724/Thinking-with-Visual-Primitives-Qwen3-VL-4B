@@ -23,7 +23,9 @@
 | 显存要求 | 多卡 A100/H100 | **单卡 RTX 5090D 24GB** |
 | 数据规模 | 460K+ 迷宫 / 125K+ 路径 | 50K 迷宫 / 15K 路径 (可扩展) |
 
-由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级四阶段 pipeline**（含 Pretrain），在保持核心思想不变的前提下，通过 **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
+由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级 Separated Experts 架构 + OPD**，在保持核心思想不变的前提下，通过 **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
+
+> **⚠️ Pretrain Limitation**: 原论文的 Pretrain 是 **trillion-scale 多模态预训练**，模型在海量 web 数据上建立"视觉原语作为思维单元"的基础能力。由于算力限制，本项目的 Stage 0 仅做"格式预训练"（Format Pretraining）——让模型学会输出 `<|box|>`、`<|point|>` 等特殊 token 的语法格式。后续 Stage 0.5 视觉 Pretrain 在 COCO 图像上补偿视觉→坐标映射能力。
 
 ---
 
@@ -89,88 +91,121 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 
 ---
 
-## 🚀 训练流程（四阶段）
+## 🚀 训练流程（Separated Experts + OPD）
 
 ```
-Stage 0: Pretrain         Embedding 初始化（纯文本，25K）            ~0.5h
-Stage 1: SFT Unified      混合 Box + Maze + Path 有监督微调           ~27h
-Stage 2: GRPO             组相对策略优化，3 轮阈值收紧                ~22h
-Stage 3: RFT              拒绝采样 + SFT 提纯                         ~4h
-                        ──────────────────────────────────────────────
-                        Total:                                       ~54h
+Stage 0:  Text Pretrain          文本-only embedding 初始化               ~2.5h
+Stage 0.5:Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~8-12h
+Stage 0.5M:Merge LoRA            将视觉预训练 LoRA 合并入基座模型          ~5min
+Stage 1a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~5-8h
+Stage 1b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8-12h
+Stage 2a: Box Expert GRPO        Box 专家 GRPO (3 轮，难度分级)          ~6-10h
+Stage 2b: Point Expert GRPO      Point 专家 GRPO (3 轮，难度分级)        ~8-12h
+Stage 3:  Unified RFT            专家生成 rollout → Unified 学习         ~4-6h
+Stage 4:  OPD                    反向 KL 蒸馏 (D_KL(student || expert))   ~3-5h
+                              ──────────────────────────────────────────────
+                              Total:                                     ~50-70h
 ```
 
-### Stage 0: Pretrain（Embedding 初始化）
+**核心设计**：
+- **分离专家**：Box Expert 和 Point Expert 共享同一个 4-bit 基座模型但各带独立的 LoRA adapter
+- **专家固定**：两个专家在 Stage 2 训好后不再更新，作为固定的 Teacher
+- **专家生成**：Stage 3 RFT 中，专家负责生成 rollout（generator），Unified 模型学习（learner）
+- **难度分级**：Easy/Normal/Hard 三级，仅 Normal 级样本用于训练
+- **反向 KL 蒸馏**：OPD 用 D_KL(student || expert) 让 Unified 模型学习专家的分布
+- **三步 Thinking**：Intent Analysis → Grounding → Summarization
 
-**论文思想**：先初始化新特殊 token（`<|box|>`, `<|point|>` 等）的 embedding，再学思维链。
+### Stage 0: Text Pretrain（格式预训练）✅
 
-**纯文本训练，无图像**。只训练 `embed_tokens` 层（4-bit 基座权重全部冻结）。25K 条程序化生成样本，3 epochs，半小时内完成。
+**纯文本训练，无图像**。只训练 `embed_tokens` 层。25K 条程序化生成样本，3 epochs。
 
 ```bash
-# 1. 生成训练数据（一次性，已内置在脚本中）
-python scripts/generate_pretrain_data.py
-# → data/pretrain/pretrain_data.json (25K samples, ~5MB)
-
-# 2. 训练 embedding-only（~30 min）
 python scripts/run_pretrain.py \
     --model_path models/Qwen3-VL-4B-Thinking \
     --output_dir outputs/stage0_pretrain \
     --num_epochs 3
 ```
 
-**输出**: `outputs/stage0_pretrain/pretrain_state_dict.pt`（~740MB）
+**输出**: `outputs/stage0_pretrain/pretrain_state_dict.pt`
 
-> 💡 如果跳过 Pretrain 直接从 Stage 1 开始，不加 `--pretrain_embedding_path` 即可。
+### Stage 0.5: Visual Pretrain（视觉预训练）🆕
 
-### Stage 1: SFT Unified
-
-在 Pretrain 的 embedding 基础上，加入 **maze + path + thinking chain**，让模型学会将"坐标输出技能"整合到"推理思维"中。
+**在 COCO 图像上训练**，建立"视觉特征 → 坐标"的真实映射。不是随机猜坐标。
 
 ```bash
-python scripts/run_stage1_sft_unified.py \
-    --config configs/stage1_sft_unified.yaml \
+python scripts/run_stage0_5_visual_pretrain.py \
+    --model_path models/Qwen3-VL-4B-Thinking \
     --pretrain_embedding_path outputs/stage0_pretrain \
-    --coco_image_dir data/coco/train2017 \
-    --coco_ann_file data/coco/annotations/instances_train2017.json
+    --output_dir outputs/stage0_5_visual_pretrain \
+    --num_box 50000 --num_point 10000
 ```
 
-**输出**: `outputs/stage1_sft_unified/`
+**输出**: `outputs/stage0_5_visual_pretrain/`
 
-### Stage 2: GRPO
+### Merge Stage 0.5 LoRA
 
-使用 TRL 的 `GRPOTrainer` 进行在线强化学习。共 3 轮，每轮逐步收紧 Hard Negative 阈值，迫使模型输出更精确的坐标。
+**必须合并**！避免双层 LoRA 叠加。
 
 ```bash
-python scripts/run_stage2_grpo.py \
-    --config configs/stage2_grpo.yaml \
-    --model_path outputs/stage1_sft_unified \
-    --coco_image_dir data/coco/train2017 \
-    --coco_ann_file data/coco/annotations/instances_train2017.json \
-    --num_rounds 3
+python scripts/merge_stage0_5.py \
+    --base_model models/Qwen3-VL-4B-Thinking \
+    --adapter_path outputs/stage0_5_visual_pretrain \
+    --output_dir outputs/stage0_5_merged_base
 ```
 
-| 轮次 | IoU 阈值 | 点距阈值 (px) | 目标 |
-|-----|---------|--------------|------|
-| R1  | 0.3     | 20.0         | 学会基本对齐 |
-| R2  | 0.5     | 10.0         | 收紧精度要求 |
-| R3  | 0.7     | 5.0          | 输出高质量坐标 |
-
-**输出**: `outputs/stage2_grpo/round_1~3/`
-
-### Stage 3: RFT (Rejection Sampling Fine-Tuning)
-
-用 Stage 2 的最终模型对数据做 **5 次 rollout**，按 process reward 选出最优样本，再用 SFT 提纯。
+### Stage 1a: Box Expert SFT
 
 ```bash
-python scripts/run_stage3_rft.py \
-    --config configs/stage3_rft.yaml \
-    --model_path outputs/stage2_grpo/round_3 \
-    --coco_image_dir data/coco/train2017 \
-    --coco_ann_file data/coco/annotations/instances_train2017.json \
-    --accept_threshold 1.2
+python scripts/run_stage1a_sft_box.py \
+    --model_path outputs/stage0_5_merged_base \
+    --output_dir outputs/stage1a_sft_box
 ```
 
-**输出**: `outputs/stage3_rft/final_model/`
+### Stage 1b: Point Expert SFT
+
+```bash
+python scripts/run_stage1b_sft_point.py \
+    --model_path outputs/stage0_5_merged_base \
+    --output_dir outputs/stage1b_sft_point
+```
+
+### Stage 2a: Box Expert GRPO
+
+```bash
+python scripts/run_stage2a_grpo_box.py \
+    --model_path outputs/stage1a_sft_box \
+    --output_dir outputs/stage2a_grpo_box
+```
+
+### Stage 2b: Point Expert GRPO
+
+```bash
+python scripts/run_stage2b_grpo_point.py \
+    --model_path outputs/stage1b_sft_point \
+    --output_dir outputs/stage2b_grpo_point
+```
+
+### Stage 3: Unified RFT（专家生成 rollout）
+
+```bash
+python scripts/run_stage3_rft_unified.py \
+    --model_path outputs/stage0_5_merged_base \
+    --output_dir outputs/stage3_rft_unified
+```
+
+### Stage 4: OPD（反向 KL 蒸馏）
+
+```bash
+python scripts/run_stage4_opd.py \
+    --student_path outputs/stage3_rft_unified/final_model \
+    --output_dir outputs/stage4_opd
+```
+
+### 一键运行（推荐）
+
+```bash
+bash scripts/run_iterdpo_pipeline.sh
+```
 
 ---
 
@@ -180,7 +215,7 @@ python scripts/run_stage3_rft.py \
 from src.models.qwen_vl_loader import load_qlora_model
 from PIL import Image
 
-model, processor = load_qlora_model("outputs/stage3_rft/final_model")
+model, processor = load_qlora_model("outputs/stage4_opd")
 
 image = Image.open("example.jpg")
 messages = [
@@ -272,39 +307,49 @@ reward = process_reward(
 tvp-4b-5090d/
 ├── configs/                          # YAML 训练配置
 │   ├── stage0_pretrain.yaml
-│   ├── stage1_sft_unified.yaml
-│   ├── stage2_grpo.yaml
-│   └── stage3_rft.yaml
+│   ├── stage0_5_visual_pretrain.yaml
+│   ├── stage1a_sft_box.yaml
+│   ├── stage1b_sft_point.yaml
+│   ├── stage2a_grpo_box.yaml
+│   ├── stage2b_grpo_point.yaml
+│   ├── stage3_rft_unified.yaml
+│   └── stage4_opd.yaml
 ├── src/
 │   ├── models/
 │   │   ├── qwen_vl_loader.py         # Qwen3VL + QLoRA 加载器
-│   │   └── visual_primitive_parser.py # 视觉原语解析封装
+│   │   └── pretrain_loader.py        # Pretrain 模型加载 + embedding 注入
 │   ├── data/
 │   │   ├── datasets/
 │   │   │   ├── sft_dataset.py        # SFT 数据集（assistant-only loss mask）
 │   │   │   ├── grpo_dataset.py       # GRPO 数据集
 │   │   │   └── image_loader.py       # Lazy image loading（防 OOM）
 │   │   ├── generators/
-│   │   │   ├── coco_box_generator.py # COCO 标注 → box 训练样本
-│   │   │   ├── synthetic_maze.py     # 合成迷宫生成器
-│   │   │   └── synthetic_path.py     # 合成路径生成器
+│   │   │   ├── coco_box_generator.py # COCO → box/point 训练样本（3-step thinking）
+│   │   │   ├── synthetic_maze.py     # 合成迷宫生成器（3-step thinking）
+│   │   │   └── synthetic_path.py     # 合成路径生成器（暂未使用）
 │   │   └── formatters/
 │   │       └── primitive_formatter.py # 坐标标签格式化
 │   ├── training/
 │   │   ├── trainers/
 │   │   │   └── sft_trainer.py        # SFT Trainer 封装
+│   │   ├── opd_trainer.py            # OPD 反向 KL 蒸馏训练器
 │   │   ├── callbacks.py              # 训练回调（内存监控）
 │   │   └── memory_utils.py           # GPU 显存工具
 │   └── utils/
 │       ├── constants.py              # 特殊 token / 超参常量
-│       ├── metrics.py                # IoU / 撞墙 / 过程 reward
+│       ├── metrics.py                # Format RM + Accuracy RM + 难度分级
 │       └── logging_utils.py          # 日志初始化
 ├── scripts/                          # 阶段入口脚本
-│   ├── run_stage0_pretrain.py
-│   ├── run_stage1_sft_unified.py
-│   ├── run_stage2_grpo.py
-│   ├── run_stage3_rft.py
-│   └── run_full_pipeline.sh          # 全流水线
+│   ├── run_pretrain.py               # Stage 0: Text Pretrain
+│   ├── run_stage0_5_visual_pretrain.py  # Stage 0.5: Visual Pretrain
+│   ├── merge_stage0_5.py             # Stage 0.5 LoRA Merge
+│   ├── run_stage1a_sft_box.py        # Stage 1a: Box Expert SFT
+│   ├── run_stage1b_sft_point.py      # Stage 1b: Point Expert SFT
+│   ├── run_stage2a_grpo_box.py       # Stage 2a: Box Expert GRPO
+│   ├── run_stage2b_grpo_point.py     # Stage 2b: Point Expert GRPO
+│   ├── run_stage3_rft_unified.py     # Stage 3: Unified RFT
+│   ├── run_stage4_opd.py             # Stage 4: OPD
+│   └── run_iterdpo_pipeline.sh       # Master Pipeline 一键运行
 ├── tests/
 │   ├── test_primitive_parser.py      # 坐标解析单元测试
 │   ├── test_metrics.py               # 奖励函数与几何工具测试
@@ -374,16 +419,20 @@ MIT
 
 ---
 
-## 🤗 模型权重
+## 🤗 模型权重（训练完成后计划上传）
 
-训练完成后的**完整模型权重**（含基座 + LoRA 合并后的全量参数）将上传至 **ModelScope**，开箱即用，无需额外加载基座模型：
+**⚠️ 当前状态：训练进行中，权重尚未上传。**
+
+训练完成后，**完整模型权重**（基座 + LoRA 合并后的全量 bf16 参数）将上传至 **ModelScope**，开箱即用，无需额外加载基座模型。
+
+计划上传地址：
 
 ```bash
-# 即将上线
+# 未来可用（当前不可用）
 modelscope download Edmund724/tvp-4b-5090d-qwen3-vl-4b --local_dir ./weights
 ```
 
-使用方式：
+上线后的使用方式：
 ```python
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
@@ -396,4 +445,4 @@ model = Qwen3VLForConditionalGeneration.from_pretrained(
 processor = AutoProcessor.from_pretrained("./weights", trust_remote_code=True)
 ```
 
-> 完整权重约 8-9GB（bf16），支持直接推理与继续微调。
+> 预计完整权重约 8-9GB（bf16），支持直接推理与继续微调。上线后会在此处更新实际下载链接。

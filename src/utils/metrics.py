@@ -359,3 +359,217 @@ def process_reward(
             result["backtracking_missing"] = check_backtracking_missing(pred_text, gt_text)
 
     return result
+
+
+def format_reward(text: str) -> dict:
+    """Format Reward Model (Format RM).
+
+    Checks:
+        1. <think>...</think> tags exist and are paired
+        2. Special token syntax is valid (paired open/close)
+        3. Coordinates are within [0, 999]
+        4. No duplicate special tokens (e.g., nested boxes)
+
+    Returns:
+        Dict with individual check results and total score (0.0~0.8).
+    """
+    from .constants import BOX_OPEN, BOX_CLOSE, POINT_OPEN, POINT_CLOSE
+
+    score = 0.0
+    details = {}
+
+    # 1. Check <think> tags
+    think_open = text.count("<think>")
+    think_close = text.count("</think>")
+    has_think = think_open == 1 and think_close == 1
+    details["has_think_tags"] = has_think
+    if has_think:
+        score += 0.2
+
+    # 2. Check special token pairing
+    box_open = text.count(BOX_OPEN)
+    box_close = text.count(BOX_CLOSE)
+    point_open = text.count(POINT_OPEN)
+    point_close = text.count(POINT_CLOSE)
+    tokens_paired = (
+        box_open == box_close and point_open == point_close
+        and box_open >= 0 and point_open >= 0
+    )
+    details["tokens_paired"] = tokens_paired
+    if tokens_paired:
+        score += 0.2
+
+    # 3. Check coordinate range [0, 999]
+    coords_valid = True
+    for match in BOX_PATTERN.finditer(text):
+        coords_str = match.group(1)
+        try:
+            nums = [int(x) for x in re.findall(r"\d+", coords_str)]
+            for n in nums:
+                if n < 0 or n > 999:
+                    coords_valid = False
+                    break
+        except (ValueError, IndexError):
+            coords_valid = False
+        if not coords_valid:
+            break
+
+    for match in POINT_PATTERN.finditer(text):
+        coords_str = match.group(1)
+        try:
+            nums = [int(x) for x in re.findall(r"\d+", coords_str)]
+            for n in nums:
+                if n < 0 or n > 999:
+                    coords_valid = False
+                    break
+        except (ValueError, IndexError):
+            coords_valid = False
+        if not coords_valid:
+            break
+
+    details["coords_in_range"] = coords_valid
+    if coords_valid:
+        score += 0.2
+
+    # 4. Check no duplicate/nested special tokens
+    # Simple heuristic: each <|box|> should have exactly one matching <|/box|>
+    # and no nested boxes
+    no_duplicates = True
+    # Check for patterns like <|box|>...<|box|>...<|/box|>...<|/box|>
+    # which indicates nesting
+    box_segments = re.findall(
+        re.escape(BOX_OPEN) + r"(.*?)" + re.escape(BOX_CLOSE), text, re.DOTALL
+    )
+    for seg in box_segments:
+        if BOX_OPEN in seg or BOX_CLOSE in seg:
+            no_duplicates = False
+            break
+
+    point_segments = re.findall(
+        re.escape(POINT_OPEN) + r"(.*?)" + re.escape(POINT_CLOSE), text, re.DOTALL
+    )
+    for seg in point_segments:
+        if POINT_OPEN in seg or POINT_CLOSE in seg:
+            no_duplicates = False
+            break
+
+    details["no_nested_tokens"] = no_duplicates
+    if no_duplicates:
+        score += 0.2
+
+    details["total_format_score"] = round(score, 2)
+    return details
+
+
+def counting_reward(pred_count: int, gt_count: int) -> float:
+    """Counting accuracy reward with smooth exponential decay.
+
+    Formula from paper: R = 0.7 * exp(-3 * |y_hat - y| / (|y| + 1))
+
+    Args:
+        pred_count: Predicted count.
+        gt_count: Ground truth count.
+
+    Returns:
+        Reward score in [0, 0.7].
+    """
+    if gt_count == 0:
+        # Avoid division by zero; if GT is 0, reward is 0.7 only if pred is also 0
+        return 0.7 if pred_count == 0 else 0.0
+
+    abs_error = abs(pred_count - gt_count)
+    reward = 0.7 * np.exp(-3 * abs_error / (gt_count + 1))
+    return float(reward)
+
+
+def compute_total_reward(
+    pred_text: str,
+    gt_text: str,
+    task_type: str = "box",
+    iou_threshold: float = 0.5,
+    point_dist_threshold: float = 10.0,
+    maze_grid: np.ndarray | None = None,
+) -> dict:
+    """Compute total reward = Format RM + Accuracy RM for GRPO training.
+
+    Returns dict with:
+        - total_reward: scalar for GRPO
+        - format_reward: Format RM score (0~0.8)
+        - accuracy_reward: Accuracy RM score (0~1.0+)
+        - difficulty: "easy" / "normal" / "hard" (for difficulty grading)
+    """
+    # Format RM
+    fmt = format_reward(pred_text)
+    format_score = fmt["total_format_score"]
+
+    # Process reward (Accuracy RM base)
+    proc = process_reward(
+        pred_text, gt_text, task_type,
+        iou_threshold, point_dist_threshold, maze_grid,
+    )
+
+    accuracy_score = 0.0
+
+    if task_type == "box":
+        # Box: IoU + counting support
+        avg_iou = proc.get("box_avg_iou", 0.0)
+        num_pred = proc.get("box_num_pred", 0)
+        num_gt = proc.get("box_num_gt", 0)
+
+        # Try to get counts for counting reward
+        pred_answer = extract_answer(pred_text)
+        gt_answer = extract_answer(gt_text)
+        if pred_answer is not None and gt_answer is not None:
+            try:
+                pred_count = int(pred_answer)
+                gt_count = int(gt_answer)
+                count_r = counting_reward(pred_count, gt_count)
+            except ValueError:
+                count_r = 0.0
+        else:
+            count_r = 0.0
+
+        # If counts match perfectly, use IoU; otherwise use counting reward
+        if count_r >= 0.7 * 0.99:  # Almost perfect count match
+            accuracy_score = avg_iou + 0.3  # Bonus for correct count
+        else:
+            accuracy_score = count_r + avg_iou * 0.3  # Weighted mix
+
+    elif task_type == "point":
+        # Point: distance-based
+        avg_dist = proc.get("point_avg_dist", float("inf"))
+        if avg_dist != float("inf"):
+            accuracy_score = max(0, 1.0 - min(avg_dist, 100.0) / 100.0)
+
+    elif task_type == "maze":
+        # Maze: path validity + wall collision + answer correctness
+        if proc.get("answer_correct", False):
+            accuracy_score += 0.5
+        wall_collisions = proc.get("wall_collision_count", 0)
+        if wall_collisions == 0:
+            accuracy_score += 0.3
+        if not proc.get("backtracking_missing", False):
+            accuracy_score += 0.2
+
+    # Total reward
+    total = format_score + accuracy_score
+
+    # Difficulty grading
+    # Easy: total >= 1.5 (both format and accuracy are good)
+    # Normal: 0.5 <= total < 1.5 (partially correct)
+    # Hard: total < 0.5 (mostly wrong)
+    if total >= 1.5:
+        difficulty = "easy"
+    elif total >= 0.5:
+        difficulty = "normal"
+    else:
+        difficulty = "hard"
+
+    return {
+        "total_reward": round(total, 4),
+        "format_reward": round(format_score, 4),
+        "accuracy_reward": round(accuracy_score, 4),
+        "difficulty": difficulty,
+        "process_metrics": proc,
+        "format_details": fmt,
+    }

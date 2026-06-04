@@ -1,4 +1,4 @@
-"""Maze dataset generator with DFS exploration logs and 50% unsolvable mazes."""
+"""Maze dataset generator with DFS exploration logs, 50% unsolvable mazes, and 3-step thinking protocol."""
 
 import random
 from typing import Dict, List, Tuple
@@ -16,18 +16,15 @@ def generate_maze_grid(rows: int, cols: int) -> np.ndarray:
     Returns:
         Grid where 1 = path, 0 = wall.
     """
-    # Initialize grid with walls (0)
-    # Use odd dimensions for walls between cells
     grid = np.zeros((rows * 2 + 1, cols * 2 + 1), dtype=np.uint8)
 
     def carve(r: int, c: int):
-        grid[r * 2 + 1, c * 2 + 1] = 1  # Mark cell as path
+        grid[r * 2 + 1, c * 2 + 1] = 1
         directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
         random.shuffle(directions)
         for dr, dc in directions:
             nr, nc = r + dr, c + dc
             if 0 <= nr < rows and 0 <= nc < cols and grid[nr * 2 + 1, nc * 2 + 1] == 0:
-                # Carve wall between current and next cell
                 grid[r * 2 + 1 + dr, c * 2 + 1 + dc] = 1
                 carve(nr, nc)
 
@@ -38,7 +35,6 @@ def generate_maze_grid(rows: int, cols: int) -> np.ndarray:
 def find_start_end(maze_grid: np.ndarray) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """Find start (top-left path cell) and end (bottom-right path cell)."""
     h, w = maze_grid.shape
-    # Find top-leftmost path cell
     start = None
     for y in range(h):
         for x in range(w):
@@ -48,7 +44,6 @@ def find_start_end(maze_grid: np.ndarray) -> Tuple[Tuple[int, int], Tuple[int, i
         if start:
             break
 
-    # Find bottom-rightmost path cell
     end = None
     for y in range(h - 1, -1, -1):
         for x in range(w - 1, -1, -1):
@@ -84,7 +79,7 @@ def solve_maze_dfs(
             if 0 <= nx < w and 0 <= ny < h and maze_grid[ny, nx] == 1 and (nx, ny) not in visited:
                 stack.append(((nx, ny), path + [(nx, ny)]))
 
-    return []  # No solution
+    return []
 
 
 def break_path_middle(
@@ -98,7 +93,6 @@ def break_path_middle(
         return new_grid
 
     mid_idx = len(solution_path) // 2
-    # Break a few cells around the middle
     for i in range(max(0, mid_idx - num_walls // 2), min(len(solution_path), mid_idx + num_walls // 2 + 1)):
         x, y = solution_path[i]
         new_grid[y, x] = 0
@@ -241,17 +235,37 @@ def render_maze_image(
     return img
 
 
+def _build_maze_thinking_3step(grounding_log: str, solvable: bool) -> str:
+    """Wrap maze DFS log in 3-step thinking protocol."""
+    intent = (
+        "I need to determine if there is a path from the green circle "
+        "(start) to the red square (end) in the maze."
+    )
+    summarization = (
+        "A path exists from start to end."
+        if solvable else
+        "No path to the destination exists."
+    )
+    return (
+        f"<think>\n"
+        f"Intent Analysis: {intent}\n"
+        f"Grounding: {grounding_log}\n"
+        f"Summarization: {summarization}\n"
+        f"</think>"
+    )
+
+
 def generate_maze_dataset(
     n: int = 100000, seed: int = 42, cache_dir: str = "data/cache/maze"
 ) -> List[Dict]:
-    """Generate maze dataset with 50% solvable / 50% unsolvable.
+    """Generate maze dataset with 50% solvable / 50% unsolvable and 3-step thinking.
 
     Images are saved to disk and image_path is returned to avoid OOM.
 
     Returns list of dicts with keys:
         image: str (path to saved image)
         prompt: str
-        thinking: str
+        reasoning: str (3-step thinking)
         answer: str
         maze_grid: np.ndarray
         task_type: str = "maze"
@@ -277,14 +291,16 @@ def generate_maze_dataset(
 
         if random.random() < MAZE_SOLVABLE_RATIO:
             # Solvable maze
-            thinking = dfs_exploration_with_backtracking(maze_grid, start, end)
+            grounding = dfs_exploration_with_backtracking(maze_grid, start, end)
+            thinking = _build_maze_thinking_3step(grounding, solvable=True)
             answer = r"\boxed{True}"
         else:
             # Unsolvable: break path in middle
             solution = solve_maze_dfs(maze_grid, start, end)
             if solution:
                 maze_grid = break_path_middle(maze_grid, solution)
-            thinking = dfs_exhaustive_search_proving_unreachable(maze_grid, start)
+            grounding = dfs_exhaustive_search_proving_unreachable(maze_grid, start)
+            thinking = _build_maze_thinking_3step(grounding, solvable=False)
             answer = r"\boxed{False}"
 
         data.append({

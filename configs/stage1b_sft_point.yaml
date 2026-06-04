@@ -1,0 +1,21 @@
+# Stage 1b: Specialized SFT — Point Expert
+stage0_5_merged_base: outputs/stage0_5_merged_base
+output_dir: outputs/stage1b_sft_point
+max_seq_length: 2048
+per_device_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-4
+num_train_epochs: 1
+lora_r: 256
+lora_alpha: 512
+lora_dropout: 0.05
+optimizer: paged_adamw_8bit
+bf16: true
+warmup_steps: 100
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+gradient_checkpointing: true
+report_to: none
+num_point: 10000
+num_maze: 50000

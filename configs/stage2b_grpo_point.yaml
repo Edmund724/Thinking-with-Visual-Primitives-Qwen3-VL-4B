@@ -1,0 +1,26 @@
+# Stage 2b: Specialized GRPO — Point Expert
+stage1b_checkpoint: outputs/stage1b_sft_point
+output_dir: outputs/stage2b_grpo_point
+max_completion_length: 1024
+per_device_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-6
+num_train_epochs: 1
+lora_r: 256
+lora_alpha: 512
+lora_dropout: 0.05
+optimizer: paged_adamw_8bit
+bf16: true
+warmup_steps: 50
+logging_steps: 5
+save_steps: 200
+save_total_limit: 2
+gradient_checkpointing: true
+report_to: none
+num_point: 2000
+num_maze: 5000
+num_rounds: 3
+num_generations: 5
+beta: 0.04
+temperature: 1.0
+point_dist_thresholds: [20.0, 10.0, 5.0]

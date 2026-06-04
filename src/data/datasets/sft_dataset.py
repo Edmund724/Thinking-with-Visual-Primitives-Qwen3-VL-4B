@@ -43,13 +43,19 @@ class SFTDataset(Dataset):
     def _build_messages(self, sample: Dict[str, Any]) -> tuple:
         """Build prompt-only and full conversation messages.
 
+        Handles both image-based and text-only samples.
         Returns:
             (prompt_messages, full_messages)
         """
-        user_content = [
-            {"type": "image", "image": sample["image"]},
-            {"type": "text", "text": sample["prompt"]},
-        ]
+        has_image = "image" in sample and sample["image"] is not None
+
+        if has_image:
+            user_content = [
+                {"type": "image", "image": sample["image"]},
+                {"type": "text", "text": sample["prompt"]},
+            ]
+        else:
+            user_content = sample["prompt"]
 
         prompt_messages = [
             {
@@ -108,12 +114,19 @@ class SFTDataset(Dataset):
             return labels
 
         # Process prompt with same image (no padding) to get actual token count
-        prompt_inputs = self.processor(
-            text=[prompt_text],
-            images=[image],
-            return_tensors="pt",
-            padding=False,
-        )
+        if image is not None:
+            prompt_inputs = self.processor(
+                text=[prompt_text],
+                images=[image],
+                return_tensors="pt",
+                padding=False,
+            )
+        else:
+            prompt_inputs = self.processor(
+                text=[prompt_text],
+                return_tensors="pt",
+                padding=False,
+            )
         prompt_len = prompt_inputs["input_ids"].shape[1]
 
         # Full sequence length (after padding)
@@ -134,7 +147,7 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.data[idx]
-        image = load_image(sample["image"])
+        image = load_image(sample["image"]) if "image" in sample and sample["image"] else None
 
         prompt_messages, full_messages = self._build_messages(sample)
 
@@ -145,14 +158,23 @@ class SFTDataset(Dataset):
             add_generation_prompt=False,
         )
 
-        inputs = self.processor(
-            text=[full_text],
-            images=[image],
-            return_tensors="pt",
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-        )
+        if image is not None:
+            inputs = self.processor(
+                text=[full_text],
+                images=[image],
+                return_tensors="pt",
+                padding="max_length",
+                max_length=self.max_length,
+                truncation=True,
+            )
+        else:
+            inputs = self.processor(
+                text=[full_text],
+                return_tensors="pt",
+                padding="max_length",
+                max_length=self.max_length,
+                truncation=True,
+            )
 
         # Remove batch dimension
         inputs = {k: v.squeeze(0) for k, v in inputs.items()}

@@ -1,0 +1,18 @@
+# Stage 4: OPD (Reverse KL Distillation)
+student_path: outputs/stage3_rft_unified/final_model
+box_expert_path: outputs/stage2a_grpo_box
+point_expert_path: outputs/stage2b_grpo_point
+output_dir: outputs/stage4_opd
+learning_rate: 1.0e-6
+num_epochs: 2
+batch_size: 1
+lora_r: 256
+lora_alpha: 512
+lora_dropout: 0.05
+max_new_tokens: 512
+temperature: 1.0
+warmup_steps: 100
+logging_steps: 20
+num_box: 3000
+num_point: 2000
+num_maze: 2000

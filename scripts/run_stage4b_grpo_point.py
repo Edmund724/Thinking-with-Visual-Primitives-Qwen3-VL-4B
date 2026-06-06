@@ -64,7 +64,7 @@ def main(args):
 
     torch.cuda.empty_cache()
 
-    # 1. Load Point Expert from Stage 1b
+    # 1. Load Point Expert from Stage 3b
     policy_path = args.model_path
     logger.info(f"Loading Point Expert from {policy_path}...")
     policy_model, processor = load_qlora_model(

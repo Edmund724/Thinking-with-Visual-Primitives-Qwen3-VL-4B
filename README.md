@@ -94,17 +94,17 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + OPD）
 
 ```
-Stage 1:  Text Pretrain          文本-only embedding 初始化               ~0.5h
-Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~15h
-Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~5min
-Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~4h
-Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~4h
-Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h
-Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h
-Stage 5:  Unified RFT            专家生成 rollout → Unified 学习         ~5h
-Stage 6:  OPD                    反向 KL 蒸馏 (D_KL(student || expert))   ~7h
+Stage 1:  Text Pretrain          文本-only embedding 初始化               ~1.5h  ✅
+Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~14h   ✅
+Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~18s   ✅
+Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~10h   🔄 进行中
+Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~30h   (预计)
+Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
+Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
+Stage 5:  Unified RFT            专家生成 rollout → Unified 学习         ~5h    (预计)
+Stage 6:  OPD                    反向 KL 蒸馏 (D_KL(student || expert))   ~7h    (预计)
                               ──────────────────────────────────────────────
-                              Total:                                     ~48h
+                              Total:                                     ~80h
 ```
 
 **核心设计**：
@@ -119,6 +119,8 @@ Stage 6:  OPD                    反向 KL 蒸馏 (D_KL(student || expert))   ~7
 
 **纯文本训练，无图像**。只训练 `embed_tokens` 层。25K 条程序化生成样本，3 epochs。
 
+> **实测数据**: 25K 样本，3 epochs，18750 步 (batch_size=4, lr=2e-4)，Epoch 1/2/3 Avg Loss: 1.0399 / 0.9944 / 0.9899，耗时 **~1h25min**。
+
 ```bash
 python scripts/run_stage1_pretrain.py \
     --model_path models/Qwen3-VL-4B-Thinking \
@@ -128,9 +130,13 @@ python scripts/run_stage1_pretrain.py \
 
 **输出**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
 
-### Stage 2: Visual Pretrain（视觉预训练）
+---
+
+### Stage 2: Visual Pretrain（视觉预训练）✅
 
 **在 COCO 图像上训练**，建立"视觉特征 → 坐标"的真实映射。不是随机猜坐标。
+
+> **实测数据**: 60000 样本 (50K box + 10K point)，1 epoch，batch_size=2, grad_accum=2 (有效 batch=4)，耗时 **~14h**。
 
 ```bash
 python scripts/run_stage2_visual_pretrain.py \
@@ -143,9 +149,13 @@ python scripts/run_stage2_visual_pretrain.py \
 
 **输出**: `outputs/stage2_visual_pretrain/`
 
+---
+
 ### Merge Stage 2 LoRA
 
 **必须合并**！避免双层 LoRA 叠加。
+
+> **实测耗时**: **~18s**。
 
 ```bash
 python scripts/merge_stage2.py \
@@ -154,20 +164,28 @@ python scripts/merge_stage2.py \
     --output_dir outputs/stage2_merged_base
 ```
 
-### Stage 3a: Box Expert SFT
+### Stage 3a: Box Expert SFT 🔄
+
+> **实测数据**: 40000 样本 (25K general + 15K box)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5000 步，~7.07s/step，耗时 **~10h**。
 
 ```bash
 python scripts/run_stage3a_sft_box.py \
     --model_path outputs/stage2_merged_base \
-    --output_dir outputs/stage3a_sft_box
+    --output_dir outputs/stage3a_sft_box \
+    --num_box 15000 --num_epochs 1 --learning_rate 1e-4
 ```
 
 ### Stage 3b: Point Expert SFT
 
+> 尚未开始。推荐参数: batch_size=4, grad_accum=2, lr=1e-4 (85K 样本，有效 batch=8，10625 步，预计 **~30h**)。
+
 ```bash
 python scripts/run_stage3b_sft_point.py \
     --model_path outputs/stage2_merged_base \
-    --output_dir outputs/stage3b_sft_point
+    --output_dir outputs/stage3b_sft_point \
+    --num_point 10000 --num_maze 50000 \
+    --num_epochs 1 --learning_rate 1e-4 \
+    --batch_size 4 --gradient_accumulation_steps 2
 ```
 
 ### Stage 4a: Box Expert GRPO（默认 3 轮循环）
@@ -392,24 +410,13 @@ pytest tests/ -v
 
 ## 📚 引用
 
-如果你使用了本代码，请引用原始论文：
+如果你使用了本代码，请引用 Qwen3-VL：
 
 ```bibtex
-@article{deepseek2026thinking,
-  title={Thinking with Visual Primitives},
-  author={DeepSeek-AI},
-  year={2026},
-  note={Preprint. arXiv}
-}
-```
-
-以及 Qwen3-VL：
-
-```bibtex
-@article{qwen3vl2025,
-  title={Qwen3-VL: Advancing Multimodal Understanding and Agentic Ability},
-  author={Qwen Team},
-  journal={arXiv preprint arXiv:2504.01955},
+@article{bai2025qwen3vl,
+  title={Qwen3-VL Technical Report},
+  author={Bai, Shuai and Cai, Yuxuan and Chen, Ruizhe and others},
+  journal={arXiv preprint arXiv:2511.21631},
   year={2025}
 }
 ```
@@ -419,6 +426,8 @@ pytest tests/ -v
 ```bibtex
 @misc{tvp4b5090d2026,
   title={TVP-4B-5090D: Thinking with Visual Primitives on Qwen3-VL-4B},
+  author={Edmund724},
+  howpublished={\url{https://github.com/Edmund724/Thinking-with-Visual-Primitives-Qwen3-VL-4B}},
   note={Single-GPU reproduction with QLoRA + TRL GRPO + RFT},
   year={2026}
 }

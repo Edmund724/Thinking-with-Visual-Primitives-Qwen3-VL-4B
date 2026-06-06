@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stage 0: Pretrain — Initialize visual primitive token embeddings.
+"""Stage 1: Text Pretrain — Initialize visual primitive token embeddings.
 
 Following the paper's curriculum:
-  Stage 0: Learn "hand movement" (stable embedding for new tokens)
-  Stage 1: Learn "when and how to think" (integrate into Chain-of-Thought)
+  Stage 1: Learn "hand movement" (stable embedding for new tokens)
+  Stage 2+: Learn "when and how to think" (integrate into Chain-of-Thought)
 
 Pure text-only training. No images. No QLoRA.
 Only embed_tokens (and lm_head if not tied) are trained.
@@ -33,7 +33,7 @@ logger = setup_logging(log_file="logs/stage1_pretrain.log")
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 0: Pretrain — Embedding-only Text Training")
+    logger.info("Stage 1: Text Pretrain — Embedding-only Training")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
@@ -93,13 +93,13 @@ def main(args):
     )
 
     logger.info("=" * 60)
-    logger.info(f"Stage 0 complete. State saved to {args.output_dir}/")
-    logger.info(f"Next: run Stage 1 with --pretrain_embedding_path {args.output_dir}")
+    logger.info(f"Stage 1 complete. State saved to {args.output_dir}/")
+    logger.info(f"Next: run Stage 2 with --pretrain_embedding_path {args.output_dir}")
     logger.info("=" * 60)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 0: Embedding Pretrain")
+    parser = argparse.ArgumentParser(description="Stage 1: Text Pretrain (Embedding)")
     parser.add_argument("--model_path", type=str, default="models/Qwen3-VL-4B-Thinking")
     parser.add_argument("--data_path", type=str, default="data/pretrain/pretrain_data.json")
     parser.add_argument("--output_dir", type=str, default="outputs/stage1_pretrain")

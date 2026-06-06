@@ -266,6 +266,199 @@ def check_wall_collision(
     return collisions
 
 
+def maze_causal_exploration_progress(
+    pred_points: List[Tuple[int, int]],
+    maze_grid: np.ndarray,
+    start: Tuple[int, int] | None = None,
+    end: Tuple[int, int] | None = None,
+) -> float:
+    """Causal exploration progress for solvable mazes.
+
+    After the FIRST wall violation, all subsequent exploration is invalid
+    (causal chain broken). Measures distance from the last causally-valid
+    point to the end point.
+
+    Returns:
+        Score in [0, 1]: 1 = reached end, 0 = no valid exploration.
+    """
+    if maze_grid is None or len(pred_points) < 2:
+        return 0.0
+
+    h, w = maze_grid.shape
+
+    # Find first wall violation
+    first_violation = -1
+    for i in range(len(pred_points) - 1):
+        x1, y1 = pred_points[i]
+        x2, y2 = pred_points[i + 1]
+        gx1, gy1 = int(x1 / 999 * (w - 1)), int(y1 / 999 * (h - 1))
+        gx2, gy2 = int(x2 / 999 * (w - 1)), int(y2 / 999 * (h - 1))
+        steps = max(abs(gx2 - gx1), abs(gy2 - gy1), 1)
+        violated = False
+        for t in range(steps + 1):
+            gx = int(gx1 + (gx2 - gx1) * t / steps)
+            gy = int(gy1 + (gy2 - gy1) * t / steps)
+            gx = np.clip(gx, 0, w - 1)
+            gy = np.clip(gy, 0, h - 1)
+            if maze_grid[gy, gx] == 0:
+                first_violation = i
+                violated = True
+                break
+        if violated:
+            break
+
+    if first_violation == -1:
+        # No violations — full exploration is valid
+        valid_points = pred_points
+    else:
+        # Truncate at first violation (exclusive)
+        valid_points = pred_points[:first_violation + 1]
+
+    if not valid_points:
+        return 0.0
+
+    # Score: how close did valid exploration get to the end?
+    if end is None:
+        return 0.0
+
+    ex, ey = end
+    # Normalize end to 0-999
+    nex, ney = int(ex / (w - 1) * 999) if w > 1 else 0, int(ey / (h - 1) * 999) if h > 1 else 0
+
+    last_point = valid_points[-1]
+    dist_to_end = point_distance(last_point, (nex, ney))
+    max_dist = np.sqrt(999 ** 2 + 999 ** 2)  # ~1413
+
+    return max(0.0, 1.0 - dist_to_end / max_dist)
+
+
+def maze_exploration_completeness(
+    pred_points: List[Tuple[int, int]],
+    maze_grid: np.ndarray,
+) -> float:
+    """Exploration completeness for unsolvable mazes.
+
+    Measures what fraction of all reachable cells were explored by the
+    exhaustive search.
+
+    Returns:
+        Score in [0, 1]: fraction of reachable cells visited.
+    """
+    if maze_grid is None or not pred_points:
+        return 0.0
+
+    h, w = maze_grid.shape
+
+    # Find all reachable cells from start via BFS
+    # Start is typically the first point's grid position
+    if not pred_points:
+        return 0.0
+    sx, sy = pred_points[0]
+    gsx, gsy = int(sx / 999 * (w - 1)), int(sy / 999 * (h - 1))
+    gsx, gsy = np.clip(gsx, 0, w - 1).item(), np.clip(gsy, 0, h - 1).item()
+
+    reachable = set()
+    from collections import deque
+    q = deque([(gsx, gsy)])
+    while q:
+        cx, cy = q.popleft()
+        if (cx, cy) in reachable:
+            continue
+        reachable.add((cx, cy))
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < w and 0 <= ny < h and maze_grid[ny, nx] == 1:
+                q.append((nx, ny))
+
+    if not reachable:
+        return 0.0
+
+    # Count how many unique grid cells the prediction visited
+    visited = set()
+    for px, py in pred_points:
+        gx, gy = int(px / 999 * (w - 1)), int(py / 999 * (h - 1))
+        gx, gy = np.clip(gx, 0, w - 1).item(), np.clip(gy, 0, h - 1).item()
+        visited.add((gx, gy))
+
+    return min(1.0, len(visited) / len(reachable))
+
+
+def maze_wall_violation_penalty(
+    pred_points: List[Tuple[int, int]],
+    maze_grid: np.ndarray,
+) -> float:
+    """Global wall violation penalty.
+
+    Measures ratio of steps that cross walls, independent of causal
+    truncation logic.
+
+    Returns:
+        Penalty in [0, 1]: 0 = no violations, 1 = all steps cross walls.
+    """
+    if maze_grid is None or len(pred_points) < 2:
+        return 0.0
+
+    collisions = check_wall_collision(pred_points, maze_grid)
+    total_steps = len(pred_points) - 1
+    violation_ratio = len(collisions) / total_steps if total_steps > 0 else 0.0
+
+    # Return penalty (1 - violation_ratio), but scaled
+    # 0 violations = score 1, all violations = score 0
+    return 1.0 - violation_ratio
+
+
+def maze_path_validity(
+    pred_points: List[Tuple[int, int]],
+    maze_grid: np.ndarray,
+) -> float:
+    """Final path validity for solvable mazes.
+
+    Checks if consecutive points are adjacent (Manhattan distance ≤ 1)
+    in grid space, AND not crossing walls.
+
+    Returns:
+        Score in [0, 1]: fraction of consecutive pairs that are valid.
+    """
+    if maze_grid is None or len(pred_points) < 2:
+        return 0.0
+
+    h, w = maze_grid.shape
+    valid_pairs = 0
+    total_pairs = len(pred_points) - 1
+
+    for i in range(total_pairs):
+        x1, y1 = pred_points[i]
+        x2, y2 = pred_points[i + 1]
+        gx1, gy1 = int(x1 / 999 * (w - 1)), int(y1 / 999 * (h - 1))
+        gx2, gy2 = int(x2 / 999 * (w - 1)), int(y2 / 999 * (h - 1))
+
+        # Check Manhattan adjacency
+        manhattan = abs(gx2 - gx1) + abs(gy2 - gy1)
+        if manhattan == 0:
+            continue  # Same cell, skip
+        if manhattan > 1:
+            continue  # Non-adjacent
+
+        # Check no wall crossing
+        if maze_grid[gy1, gx1] == 1 and maze_grid[gy2, gx2] == 1:
+            valid_pairs += 1
+
+    return valid_pairs / total_pairs if total_pairs > 0 else 0.0
+
+
+def maze_answer_correctness(pred_text: str, gt_text: str) -> float:
+    """Binary check: did the model correctly determine solvability?
+
+    Extracts \\boxed{True} or \\boxed{False} and compares.
+
+    Returns:
+        1.0 if correct, 0.0 otherwise.
+    """
+    pred_answer = extract_answer(pred_text)
+    gt_answer = extract_answer(gt_text)
+    return 1.0 if (pred_answer is not None and pred_answer == gt_answer) else 0.0
+
+
 def check_backtracking_missing(
     pred_text: str,
     gt_text: str,
@@ -542,14 +735,43 @@ def compute_total_reward(
             accuracy_score = max(0, 1.0 - min(avg_dist, 100.0) / 100.0)
 
     elif task_type == "maze":
-        # Maze: path validity + wall collision + answer correctness
-        if proc.get("answer_correct", False):
-            accuracy_score += 0.5
-        wall_collisions = proc.get("wall_collision_count", 0)
-        if wall_collisions == 0:
-            accuracy_score += 0.3
-        if not proc.get("backtracking_missing", False):
-            accuracy_score += 0.2
+        # 5-component Maze Accuracy RM (paper-aligned):
+        # 1. Causal exploration progress (solvable) — how far before first wall hit
+        # 2. Exploration completeness (unsolvable) — fraction of reachable cells
+        # 3. Wall violation penalty — global ratio (both solvable/unsolvable)
+        # 4. Path validity (solvable) — adjacency + no-wall for final path
+        # 5. Answer correctness — binary solvability judgment
+        pred_points = parse_points(extract_reasoning(pred_text))
+        gt_points = parse_points(extract_reasoning(gt_text))
+        maze_grid_data = maze_grid
+
+        answer_correct = maze_answer_correctness(pred_text, gt_text)
+
+        if answer_correct > 0.5:
+            # Solvable maze — use components 1, 3, 4, 5
+            causal_progress = maze_causal_exploration_progress(
+                pred_points, maze_grid_data)
+            wall_penalty = maze_wall_violation_penalty(
+                pred_points, maze_grid_data)
+            path_valid = maze_path_validity(
+                pred_points, maze_grid_data)
+            accuracy_score = (
+                0.25 * causal_progress +
+                0.15 * wall_penalty +
+                0.20 * path_valid +
+                0.40 * answer_correct
+            )
+        else:
+            # Unsolvable maze — use components 2, 3, 5
+            exploration_comp = maze_exploration_completeness(
+                pred_points, maze_grid_data)
+            wall_penalty = maze_wall_violation_penalty(
+                pred_points, maze_grid_data)
+            accuracy_score = (
+                0.30 * exploration_comp +
+                0.20 * wall_penalty +
+                0.50 * answer_correct
+            )
 
     # Total reward
     total = format_score + accuracy_score

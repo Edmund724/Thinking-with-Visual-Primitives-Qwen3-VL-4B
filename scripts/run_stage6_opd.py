@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage 4: OPD (Offline Preference Distillation) — Reverse KL Distillation.
+"""Stage 6: OPD (Offline Preference Distillation) — Reverse KL Distillation.
 
-Student = Unified RFT model (Stage 3 output)
-Experts = Box Expert + Point Expert (Stage 2 output, frozen teachers)
+Student = Unified RFT model (Stage 5 output)
+Experts = Box Expert + Point Expert (Stage 4 output, frozen teachers)
 
 For each sample:
   1. Student generates response (on-policy)
@@ -30,12 +30,12 @@ from src.training.opd_trainer import train_opd
 from src.training.memory_utils import log_memory_status
 from src.utils.logging_utils import setup_logging
 
-logger = setup_logging(log_file="logs/stage4_opd.log")
+logger = setup_logging(log_file="logs/stage6_opd.log")
 
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 4: OPD (Offline Preference Distillation)")
+    logger.info("Stage 6: OPD (Offline Preference Distillation)")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
@@ -126,16 +126,16 @@ def main(args):
     student_model.save_pretrained(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
-    logger.info(f"Stage 4 complete. Final model saved to {args.output_dir}")
-    log_memory_status("Stage 4 complete:")
+    logger.info(f"Stage 6 complete. Final model saved to {args.output_dir}")
+    log_memory_status("Stage 6 complete:")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 4: OPD")
-    parser.add_argument("--student_path", type=str, default="outputs/stage3_rft_unified/final_model")
-    parser.add_argument("--box_expert_path", type=str, default="outputs/stage2a_grpo_box")
-    parser.add_argument("--point_expert_path", type=str, default="outputs/stage2b_grpo_point")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage4_opd")
+    parser = argparse.ArgumentParser(description="Stage 6: OPD")
+    parser.add_argument("--student_path", type=str, default="outputs/stage5_rft_unified/final_model")
+    parser.add_argument("--box_expert_path", type=str, default="outputs/stage4a_grpo_box")
+    parser.add_argument("--point_expert_path", type=str, default="outputs/stage4b_grpo_point")
+    parser.add_argument("--output_dir", type=str, default="outputs/stage6_opd")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")

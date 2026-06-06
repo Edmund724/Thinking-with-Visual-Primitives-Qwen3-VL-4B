@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage 1b: Specialized SFT — Point Expert.
+"""Stage 3b: Specialized SFT — Point Expert.
 
 Trains a LoRA adapter specialized for point-type tasks (point grounding + maze navigation).
-Loads from merged Stage 0.5 base.
+Loads from merged Stage 2 base.
 
 Data ratio: 70% general + 30% visual primitives (20% maze + 10% point).
 """
@@ -25,17 +25,17 @@ from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
 from src.utils.logging_utils import setup_logging
 
-logger = setup_logging(log_file="logs/stage1b_sft_point.log")
+logger = setup_logging(log_file="logs/stage3b_sft_point.log")
 
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 1b: Specialized SFT — Point Expert")
+    logger.info("Stage 3b: Specialized SFT — Point Expert")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
 
-    # 1. Load from merged Stage 0.5 base
+    # 1. Load from merged Stage 2 base
     logger.info(f"Loading from merged base: {args.model_path}")
     model, processor = load_qlora_model(
         model_name=args.model_path,
@@ -71,16 +71,24 @@ def main(args):
     if os.path.exists(args.general_data_path):
         import json
         with open(args.general_data_path, "r") as f:
-            general_data = json.load(f)
+            raw_general = json.load(f)
+        # Convert from conversations format to SFT format
+        for item in raw_general:
+            convs = item.get("conversations", [])
+            user_msg = next((c["content"] for c in convs if c["role"] == "user"), "")
+            asst_msg = next((c["content"] for c in convs if c["role"] == "assistant"), "")
+            general_data.append({
+                "prompt": user_msg,
+                "reasoning": "",
+                "answer": asst_msg,
+                "image": item.get("image", None),
+                "task_type": "general",
+            })
         # 70% of total = general, 30% = visual primitives
         visual_count = len(point_data) + len(maze_data)
         target_general = int(visual_count * 7 / 3)
         if len(general_data) > target_general:
             general_data = general_data[:target_general]
-        for d in general_data:
-            d["task_type"] = "general"
-            if "image" not in d:
-                d["image"] = None
         logger.info(f"  General samples: {len(general_data)}")
     else:
         logger.warning(f"General data not found at {args.general_data_path}, using 100% visual")
@@ -111,14 +119,14 @@ def main(args):
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
-    logger.info(f"Stage 1b complete. Model saved to {args.output_dir}")
-    log_memory_status("Stage 1b complete:")
+    logger.info(f"Stage 3b complete. Model saved to {args.output_dir}")
+    log_memory_status("Stage 3b complete:")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 1b: Point Expert SFT")
-    parser.add_argument("--model_path", type=str, default="outputs/stage0_5_merged_base")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage1b_sft_point")
+    parser = argparse.ArgumentParser(description="Stage 3b: Point Expert SFT")
+    parser.add_argument("--model_path", type=str, default="outputs/stage2_merged_base")
+    parser.add_argument("--output_dir", type=str, default="outputs/stage3b_sft_point")
     parser.add_argument("--general_data_path", type=str, default="data/pretrain/pretrain_data.json")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,

@@ -28,7 +28,7 @@ from src.models.pretrain_loader import (
 from src.training.pretrain_trainer import train_pretrain
 from src.utils.logging_utils import setup_logging
 
-logger = setup_logging(log_file="logs/stage0_pretrain.log")
+logger = setup_logging(log_file="logs/stage1_pretrain.log")
 
 
 def main(args):
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 0: Embedding Pretrain")
     parser.add_argument("--model_path", type=str, default="models/Qwen3-VL-4B-Thinking")
     parser.add_argument("--data_path", type=str, default="data/pretrain/pretrain_data.json")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage0_pretrain")
+    parser.add_argument("--output_dir", type=str, default="outputs/stage1_pretrain")
     parser.add_argument("--num_samples", type=int, default=25000)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=2e-4)

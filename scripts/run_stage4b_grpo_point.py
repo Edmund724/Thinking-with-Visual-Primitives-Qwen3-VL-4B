@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 2b: Specialized GRPO — Point Expert.
+"""Stage 4b: Specialized GRPO — Point Expert.
 
 Continues training the Point Expert LoRA adapter with GRPO on point+maze data.
 Uses Format RM + Accuracy RM with difficulty grading (Normal only).
@@ -24,7 +24,7 @@ from src.training.memory_utils import log_memory_status
 from src.utils.logging_utils import setup_logging
 from src.utils.metrics import compute_total_reward
 
-logger = setup_logging(log_file="logs/stage2b_grpo_point.log")
+logger = setup_logging(log_file="logs/stage4b_grpo_point.log")
 
 
 def make_point_reward_fn(point_dist_threshold: float):
@@ -59,7 +59,7 @@ def make_point_reward_fn(point_dist_threshold: float):
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 2b: Specialized GRPO — Point Expert")
+    logger.info("Stage 4b: Specialized GRPO — Point Expert")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
@@ -166,13 +166,13 @@ def main(args):
         except Exception as e:
             logger.warning(f"Could not reload: {e}, continuing")
 
-    logger.info(f"Stage 2b complete. Checkpoints in {args.output_dir}/")
+    logger.info(f"Stage 4b complete. Checkpoints in {args.output_dir}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 2b: Point Expert GRPO")
-    parser.add_argument("--model_path", type=str, default="outputs/stage1b_sft_point")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage2b_grpo_point")
+    parser = argparse.ArgumentParser(description="Stage 4b: Point Expert GRPO")
+    parser.add_argument("--model_path", type=str, default="outputs/stage3b_sft_point")
+    parser.add_argument("--output_dir", type=str, default="outputs/stage4b_grpo_point")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")

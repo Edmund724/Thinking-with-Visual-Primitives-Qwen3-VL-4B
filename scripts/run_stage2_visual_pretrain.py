@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage 0.5: Visual Pretrain — Establish visual feature → coordinate mapping.
+"""Stage 2: Visual Pretrain — Establish visual feature → coordinate mapping.
 
 Uses COCO images + box/point annotations to teach the model real visual
-grounding, not just token syntax (which Stage 0 already handled).
+grounding, not just token syntax (which Stage 1 already handled).
 
 Trainable:
   - ViT: FROZEN
@@ -15,7 +15,7 @@ Data:
   - Point: COCO object centers, ~10K samples
   - Total: ~60K samples
 
-After training: run scripts/merge_stage0_5.py to merge LoRA into base.
+After training: run scripts/merge_stage2.py to merge LoRA into base.
 """
 
 import argparse
@@ -39,17 +39,17 @@ from src.training.memory_utils import log_memory_status
 from src.utils.logging_utils import setup_logging
 from src.utils.constants import BASE_VOCAB_SIZE
 
-logger = setup_logging(log_file="logs/stage0_5_visual_pretrain.log")
+logger = setup_logging(log_file="logs/stage2_visual_pretrain.log")
 
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 0.5: Visual Pretrain")
+    logger.info("Stage 2: Visual Pretrain")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
 
-    # 1. Load base model + inject Stage 0 pretrain embeddings
+    # 1. Load base model + inject Stage 1 pretrain embeddings
     base_model = args.model_path
     pretrain_path = args.pretrain_embedding_path
 
@@ -119,16 +119,16 @@ def main(args):
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
-    logger.info(f"Stage 0.5 complete. Model saved to {args.output_dir}")
-    logger.info(f"Next: merge LoRA into base with scripts/merge_stage0_5.py")
-    log_memory_status("Stage 0.5 complete:")
+    logger.info(f"Stage 2 complete. Model saved to {args.output_dir}")
+    logger.info(f"Next: merge LoRA into base with scripts/merge_stage2.py")
+    log_memory_status("Stage 2 complete:")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 0.5: Visual Pretrain")
+    parser = argparse.ArgumentParser(description="Stage 2: Visual Pretrain")
     parser.add_argument("--model_path", type=str, default="models/Qwen3-VL-4B-Thinking")
-    parser.add_argument("--pretrain_embedding_path", type=str, default="outputs/stage0_pretrain")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage0_5_visual_pretrain")
+    parser.add_argument("--pretrain_embedding_path", type=str, default="outputs/stage1_pretrain")
+    parser.add_argument("--output_dir", type=str, default="outputs/stage2_visual_pretrain")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")

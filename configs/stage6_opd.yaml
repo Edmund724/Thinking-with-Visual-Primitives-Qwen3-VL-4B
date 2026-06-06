@@ -1,8 +1,8 @@
-# Stage 4: OPD (Reverse KL Distillation)
-student_path: outputs/stage3_rft_unified/final_model
-box_expert_path: outputs/stage2a_grpo_box
-point_expert_path: outputs/stage2b_grpo_point
-output_dir: outputs/stage4_opd
+# Stage 6: OPD (Reverse KL Distillation)
+student_path: outputs/stage5_rft_unified/final_model
+box_expert_path: outputs/stage4a_grpo_box
+point_expert_path: outputs/stage4b_grpo_point
+output_dir: outputs/stage6_opd
 learning_rate: 1.0e-6
 num_epochs: 2
 batch_size: 1

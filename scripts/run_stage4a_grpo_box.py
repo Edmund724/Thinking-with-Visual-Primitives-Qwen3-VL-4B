@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 2a: Specialized GRPO — Box Expert.
+"""Stage 4a: Specialized GRPO — Box Expert.
 
 Continues training the Box Expert LoRA adapter with GRPO on box-only data.
 Uses Format RM + Accuracy RM with difficulty grading (Normal only).
@@ -23,7 +23,7 @@ from src.training.memory_utils import log_memory_status
 from src.utils.logging_utils import setup_logging
 from src.utils.metrics import compute_total_reward
 
-logger = setup_logging(log_file="logs/stage2a_grpo_box.log")
+logger = setup_logging(log_file="logs/stage4a_grpo_box.log")
 
 
 def make_box_reward_fn(iou_threshold: float):
@@ -59,7 +59,7 @@ def make_box_reward_fn(iou_threshold: float):
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 2a: Specialized GRPO — Box Expert")
+    logger.info("Stage 4a: Specialized GRPO — Box Expert")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
@@ -158,13 +158,13 @@ def main(args):
         except Exception as e:
             logger.warning(f"Could not reload: {e}, continuing")
 
-    logger.info(f"Stage 2a complete. Checkpoints in {args.output_dir}/")
+    logger.info(f"Stage 4a complete. Checkpoints in {args.output_dir}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 2a: Box Expert GRPO")
-    parser.add_argument("--model_path", type=str, default="outputs/stage1a_sft_box")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage2a_grpo_box")
+    parser = argparse.ArgumentParser(description="Stage 4a: Box Expert GRPO")
+    parser.add_argument("--model_path", type=str, default="outputs/stage3a_sft_box")
+    parser.add_argument("--output_dir", type=str, default="outputs/stage4a_grpo_box")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")

@@ -1,7 +1,7 @@
-# Stage 0.5: Visual Pretrain
+# Stage 2: Visual Pretrain
 base_model: models/Qwen3-VL-4B-Thinking
-stage0_pretrain: outputs/stage0_pretrain
-output_dir: outputs/stage0_5_visual_pretrain
+stage1_pretrain: outputs/stage1_pretrain
+output_dir: outputs/stage2_visual_pretrain
 max_seq_length: 2048
 per_device_batch_size: 1
 gradient_accumulation_steps: 4

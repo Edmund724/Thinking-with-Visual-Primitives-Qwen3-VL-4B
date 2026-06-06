@@ -25,6 +25,30 @@ from ..utils.constants import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_local_path(model_name: str) -> str:
+    """Resolve relative paths to absolute to prevent HuggingFace Hub fallback.
+
+    Strategy:
+      - If path exists locally -> use absolute version.
+      - If path contains '/' and starts with a common local dir prefix
+        (outputs/, models/, data/, ./, ../, /) -> treat as local, error if missing.
+      - Otherwise -> assume HuggingFace Hub ID, pass through.
+    """
+    if os.path.exists(model_name):
+        return os.path.abspath(model_name)
+
+    # Check if it looks like a local path (not a Hub ID like "org/model")
+    local_prefixes = ("./", "../", "/", "outputs/", "models/", "data/", "checkpoints/")
+    if any(model_name.startswith(p) for p in local_prefixes):
+        resolved = os.path.abspath(model_name)
+        raise FileNotFoundError(
+            f"Local model path does not exist: {model_name} (resolved to {resolved}). "
+            f"Please check the path or run the preceding pipeline stage first."
+        )
+
+    return model_name
+
+
 def _is_adapter_checkpoint(path: str) -> bool:
     """Check if path contains a saved PEFT adapter."""
     return os.path.isdir(path) and (
@@ -87,6 +111,9 @@ def load_qlora_model(
     """
     logger.info(f"Loading model: {model_name}")
 
+    # Resolve relative paths to absolute to avoid HuggingFace Hub fallback
+    model_name = _resolve_local_path(model_name)
+
     # Detect if model_name itself is an adapter checkpoint
     is_adapter = _is_adapter_checkpoint(model_name)
     base_model_path = model_name
@@ -97,6 +124,7 @@ def load_qlora_model(
         with open(adapter_config_path, "r") as f:
             adapter_config = json.load(f)
         base_model_path = adapter_config.get("base_model_name_or_path", BASE_MODEL_NAME)
+        base_model_path = _resolve_local_path(base_model_path)
         logger.info(
             f"Detected adapter checkpoint. Base model: {base_model_path}"
         )
@@ -215,6 +243,11 @@ def load_reference_model(
     """
     logger.info(f"Loading reference model from {model_path}")
 
+    # Resolve relative paths to absolute to avoid HuggingFace Hub fallback
+    model_path = _resolve_local_path(model_path)
+    if adapter_path is not None:
+        adapter_path = _resolve_local_path(adapter_path)
+
     try:
         import flash_attn  # noqa: F401
         attn_impl = "flash_attention_2"
@@ -239,6 +272,7 @@ def load_reference_model(
         base_model_path = adapter_config.get(
             "base_model_name_or_path", BASE_MODEL_NAME
         )
+        base_model_path = _resolve_local_path(base_model_path)
         logger.info(
             f"Reference: detected adapter. Base: {base_model_path}"
         )

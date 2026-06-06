@@ -1,6 +1,6 @@
-# Stage 1a: Specialized SFT — Box Expert
-stage0_5_merged_base: outputs/stage0_5_merged_base
-output_dir: outputs/stage1a_sft_box
+# Stage 3a: Specialized SFT — Box Expert
+stage2_merged_base: outputs/stage2_merged_base
+output_dir: outputs/stage3a_sft_box
 max_seq_length: 2048
 per_device_batch_size: 1
 gradient_accumulation_steps: 8

@@ -1,8 +1,8 @@
-# Stage 3: Unified RFT (Experts as Generators)
-stage0_5_merged_base: outputs/stage0_5_merged_base
-box_expert_path: outputs/stage2a_grpo_box
-point_expert_path: outputs/stage2b_grpo_point
-output_dir: outputs/stage3_rft_unified
+# Stage 5: Unified RFT (Experts as Generators)
+stage2_merged_base: outputs/stage2_merged_base
+box_expert_path: outputs/stage4a_grpo_box
+point_expert_path: outputs/stage4b_grpo_point
+output_dir: outputs/stage5_rft_unified
 max_seq_length: 2048
 per_device_batch_size: 1
 gradient_accumulation_steps: 8

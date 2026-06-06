@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Stage 3: Unified RFT — Experts as Generators, Unified as Learner.
+"""Stage 5: Unified RFT — Experts as Generators, Unified as Learner.
 
 Key design (corrected per paper):
   - EXPERTS generate rollouts (not Unified model)
   - Box Expert generates for box prompts
   - Point Expert generates for point/maze prompts
   - Difficulty grading: Easy/Normal/Hard → only Normal used
-  - Unified model (re-init from merged Stage 0.5 base) SFTs on filtered data
+  - Unified model (re-init from merged Stage 2 base) SFTs on filtered data
 """
 
 import argparse
@@ -32,7 +32,7 @@ from src.training.memory_utils import log_memory_status
 from src.utils.logging_utils import setup_logging
 from src.utils.metrics import compute_total_reward, extract_answer
 
-logger = setup_logging(log_file="logs/stage3_rft_unified.log")
+logger = setup_logging(log_file="logs/stage5_rft_unified.log")
 
 
 def generate_with_expert(expert_model, processor, sample, num_rollouts, max_new_tokens):
@@ -122,12 +122,12 @@ def difficulty_grading(rollouts, gt_text, task_type, maze_grid, iou_threshold, d
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 3: Unified RFT (Experts as Generators)")
+    logger.info("Stage 5: Unified RFT (Experts as Generators)")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
 
-    # 1. Load Unified model from merged Stage 0.5 base (fresh LoRA)
+    # 1. Load Unified model from merged Stage 2 base (fresh LoRA)
     logger.info(f"Loading Unified model from merged base: {args.model_path}")
     unified_model, processor = load_qlora_model(
         model_name=args.model_path,
@@ -265,16 +265,16 @@ def main(args):
     trainer.save_model(final_dir)
     processor.save_pretrained(final_dir)
 
-    logger.info(f"Stage 3 complete. Final model saved to {final_dir}")
-    log_memory_status("Stage 3 complete:")
+    logger.info(f"Stage 5 complete. Final model saved to {final_dir}")
+    log_memory_status("Stage 5 complete:")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 3: Unified RFT")
-    parser.add_argument("--model_path", type=str, default="outputs/stage0_5_merged_base")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage3_rft_unified")
-    parser.add_argument("--box_expert_path", type=str, default="outputs/stage2a_grpo_box")
-    parser.add_argument("--point_expert_path", type=str, default="outputs/stage2b_grpo_point")
+    parser = argparse.ArgumentParser(description="Stage 5: Unified RFT")
+    parser.add_argument("--model_path", type=str, default="outputs/stage2_merged_base")
+    parser.add_argument("--output_dir", type=str, default="outputs/stage5_rft_unified")
+    parser.add_argument("--box_expert_path", type=str, default="outputs/stage4a_grpo_box")
+    parser.add_argument("--point_expert_path", type=str, default="outputs/stage4b_grpo_point")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")

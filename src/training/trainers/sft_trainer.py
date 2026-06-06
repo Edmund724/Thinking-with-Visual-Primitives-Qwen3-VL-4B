@@ -83,14 +83,21 @@ def create_sft_trainer(
 
 
 def _collate_sft(features: list) -> Dict[str, torch.Tensor]:
-    """Collate SFT batch with image tensors."""
+    """Collate SFT batch with variable-size image tensors (Qwen3-VL).
+
+    Qwen3-VL expects pixel_values concatenated along the patch dimension
+    (not stacked), with image_grid_thw indicating the grid size per image.
+    """
     batch = {}
     keys = features[0].keys()
     for key in keys:
         if key == "pixel_values":
-            batch[key] = torch.stack([f[key] for f in features], dim=0)
+            # Different images → different num_patches; concatenate along dim 0
+            batch[key] = torch.cat([f[key] for f in features], dim=0)
         elif key == "image_grid_thw":
+            # Stack to [batch_size, 3]
             batch[key] = torch.stack([f[key] for f in features], dim=0)
         else:
+            # input_ids, attention_mask, labels: already padded to max_length
             batch[key] = torch.stack([f[key] for f in features], dim=0)
     return batch

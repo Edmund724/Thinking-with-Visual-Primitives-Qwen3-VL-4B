@@ -1,6 +1,6 @@
-# Stage 1b: Specialized SFT — Point Expert
-stage0_5_merged_base: outputs/stage0_5_merged_base
-output_dir: outputs/stage1b_sft_point
+# Stage 3b: Specialized SFT — Point Expert
+stage2_merged_base: outputs/stage2_merged_base
+output_dir: outputs/stage3b_sft_point
 max_seq_length: 2048
 per_device_batch_size: 1
 gradient_accumulation_steps: 8

@@ -1,6 +1,6 @@
-# Stage 2b: Specialized GRPO — Point Expert
-stage1b_checkpoint: outputs/stage1b_sft_point
-output_dir: outputs/stage2b_grpo_point
+# Stage 4b: Specialized GRPO — Point Expert
+stage3b_checkpoint: outputs/stage3b_sft_point
+output_dir: outputs/stage4b_grpo_point
 max_completion_length: 1024
 per_device_batch_size: 1
 gradient_accumulation_steps: 4

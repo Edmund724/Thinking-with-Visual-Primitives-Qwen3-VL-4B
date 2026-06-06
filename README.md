@@ -25,7 +25,7 @@
 
 由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级 Separated Experts 架构 + OPD**，在保持核心思想不变的前提下，通过 **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
 
-> **⚠️ Pretrain Limitation**: 原论文的 Pretrain 是 **trillion-scale 多模态预训练**，模型在海量 web 数据上建立"视觉原语作为思维单元"的基础能力。由于算力限制，本项目的 Stage 0 仅做"格式预训练"（Format Pretraining）——让模型学会输出 `<|box|>`、`<|point|>` 等特殊 token 的语法格式。后续 Stage 0.5 视觉 Pretrain 在 COCO 图像上补偿视觉→坐标映射能力。
+> **⚠️ Pretrain Limitation**: 原论文的 Pretrain 是 **trillion-scale 多模态预训练**，模型在海量 web 数据上建立"视觉原语作为思维单元"的基础能力。由于算力限制，本项目的 Stage 1 仅做"格式预训练"（Format Pretraining）——让模型学会输出 `<|box|>`、`<|point|>` 等特殊 token 的语法格式。后续 Stage 2 视觉 Pretrain 在 COCO 图像上补偿视觉→坐标映射能力。
 
 ---
 
@@ -94,117 +94,120 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + OPD）
 
 ```
-Stage 0:  Text Pretrain          文本-only embedding 初始化               ~2.5h
-Stage 0.5:Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~8-12h
-Stage 0.5M:Merge LoRA            将视觉预训练 LoRA 合并入基座模型          ~5min
-Stage 1a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~5-8h
-Stage 1b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8-12h
-Stage 2a: Box Expert GRPO        Box 专家 GRPO (3 轮，难度分级)          ~6-10h
-Stage 2b: Point Expert GRPO      Point 专家 GRPO (3 轮，难度分级)        ~8-12h
-Stage 3:  Unified RFT            专家生成 rollout → Unified 学习         ~4-6h
-Stage 4:  OPD                    反向 KL 蒸馏 (D_KL(student || expert))   ~3-5h
+Stage 1:  Text Pretrain          文本-only embedding 初始化               ~0.5h
+Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~15h
+Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~5min
+Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~4h
+Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~4h
+Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h
+Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h
+Stage 5:  Unified RFT            专家生成 rollout → Unified 学习         ~5h
+Stage 6:  OPD                    反向 KL 蒸馏 (D_KL(student || expert))   ~7h
                               ──────────────────────────────────────────────
-                              Total:                                     ~50-70h
+                              Total:                                     ~48h
 ```
 
 **核心设计**：
 - **分离专家**：Box Expert 和 Point Expert 共享同一个 4-bit 基座模型但各带独立的 LoRA adapter
-- **专家固定**：两个专家在 Stage 2 训好后不再更新，作为固定的 Teacher
-- **专家生成**：Stage 3 RFT 中，专家负责生成 rollout（generator），Unified 模型学习（learner）
+- **专家固定**：两个专家在 Stage 3 训好后不再更新，作为固定的 Teacher
+- **专家生成**：Stage 5 RFT 中，专家负责生成 rollout（generator），Unified 模型学习（learner）
 - **难度分级**：Easy/Normal/Hard 三级，仅 Normal 级样本用于训练
 - **反向 KL 蒸馏**：OPD 用 D_KL(student || expert) 让 Unified 模型学习专家的分布
 - **三步 Thinking**：Intent Analysis → Grounding → Summarization
 
-### Stage 0: Text Pretrain（格式预训练）✅
+### Stage 1: Text Pretrain（格式预训练）✅
 
 **纯文本训练，无图像**。只训练 `embed_tokens` 层。25K 条程序化生成样本，3 epochs。
 
 ```bash
-python scripts/run_pretrain.py \
+python scripts/run_stage1_pretrain.py \
     --model_path models/Qwen3-VL-4B-Thinking \
-    --output_dir outputs/stage0_pretrain \
+    --output_dir outputs/stage1_pretrain \
     --num_epochs 3
 ```
 
-**输出**: `outputs/stage0_pretrain/pretrain_state_dict.pt`
+**输出**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
 
-### Stage 0.5: Visual Pretrain（视觉预训练）🆕
+### Stage 2: Visual Pretrain（视觉预训练）
 
 **在 COCO 图像上训练**，建立"视觉特征 → 坐标"的真实映射。不是随机猜坐标。
 
 ```bash
-python scripts/run_stage0_5_visual_pretrain.py \
+python scripts/run_stage2_visual_pretrain.py \
     --model_path models/Qwen3-VL-4B-Thinking \
-    --pretrain_embedding_path outputs/stage0_pretrain \
-    --output_dir outputs/stage0_5_visual_pretrain \
-    --num_box 50000 --num_point 10000
+    --pretrain_embedding_path outputs/stage1_pretrain \
+    --output_dir outputs/stage2_visual_pretrain \
+    --num_box 50000 --num_point 10000 \
+    --num_epochs 1 --batch_size 2 --gradient_accumulation_steps 2
 ```
 
-**输出**: `outputs/stage0_5_visual_pretrain/`
+**输出**: `outputs/stage2_visual_pretrain/`
 
-### Merge Stage 0.5 LoRA
+### Merge Stage 2 LoRA
 
 **必须合并**！避免双层 LoRA 叠加。
 
 ```bash
-python scripts/merge_stage0_5.py \
+python scripts/merge_stage2.py \
     --base_model models/Qwen3-VL-4B-Thinking \
-    --adapter_path outputs/stage0_5_visual_pretrain \
-    --output_dir outputs/stage0_5_merged_base
+    --adapter_path outputs/stage2_visual_pretrain \
+    --output_dir outputs/stage2_merged_base
 ```
 
-### Stage 1a: Box Expert SFT
+### Stage 3a: Box Expert SFT
 
 ```bash
-python scripts/run_stage1a_sft_box.py \
-    --model_path outputs/stage0_5_merged_base \
-    --output_dir outputs/stage1a_sft_box
+python scripts/run_stage3a_sft_box.py \
+    --model_path outputs/stage2_merged_base \
+    --output_dir outputs/stage3a_sft_box
 ```
 
-### Stage 1b: Point Expert SFT
+### Stage 3b: Point Expert SFT
 
 ```bash
-python scripts/run_stage1b_sft_point.py \
-    --model_path outputs/stage0_5_merged_base \
-    --output_dir outputs/stage1b_sft_point
+python scripts/run_stage3b_sft_point.py \
+    --model_path outputs/stage2_merged_base \
+    --output_dir outputs/stage3b_sft_point
 ```
 
-### Stage 2a: Box Expert GRPO
+### Stage 4a: Box Expert GRPO（默认 3 轮循环）
 
 ```bash
-python scripts/run_stage2a_grpo_box.py \
-    --model_path outputs/stage1a_sft_box \
-    --output_dir outputs/stage2a_grpo_box
+python scripts/run_stage4a_grpo_box.py \
+    --model_path outputs/stage3a_sft_box \
+    --output_dir outputs/stage4a_grpo_box \
+    --num_samples 5000
 ```
 
-### Stage 2b: Point Expert GRPO
+### Stage 4b: Point Expert GRPO（默认 3 轮循环）
 
 ```bash
-python scripts/run_stage2b_grpo_point.py \
-    --model_path outputs/stage1b_sft_point \
-    --output_dir outputs/stage2b_grpo_point
+python scripts/run_stage4b_grpo_point.py \
+    --model_path outputs/stage3b_sft_point \
+    --output_dir outputs/stage4b_grpo_point \
+    --num_point 2000 --num_maze 5000
 ```
 
-### Stage 3: Unified RFT（专家生成 rollout）
+### Stage 5: Unified RFT（专家生成 rollout）
 
 ```bash
-python scripts/run_stage3_rft_unified.py \
-    --model_path outputs/stage0_5_merged_base \
-    --output_dir outputs/stage3_rft_unified
+python scripts/run_stage5_rft_unified.py \
+    --model_path outputs/stage2_merged_base \
+    --output_dir outputs/stage5_rft_unified
 ```
 
-### Stage 4: OPD（反向 KL 蒸馏）
+### Stage 6: OPD（反向 KL 蒸馏）
 
 ```bash
-python scripts/run_stage4_opd.py \
-    --student_path outputs/stage3_rft_unified/final_model \
-    --output_dir outputs/stage4_opd
+python scripts/run_stage6_opd.py \
+    --student_path outputs/stage5_rft_unified/final_model \
+    --output_dir outputs/stage6_opd
 ```
 
 ### 一键运行（推荐）
 
 ```bash
-bash scripts/run_iterdpo_pipeline.sh
+bash scripts/run_pipeline.sh
 ```
 
 ---
@@ -215,7 +218,7 @@ bash scripts/run_iterdpo_pipeline.sh
 from src.models.qwen_vl_loader import load_qlora_model
 from PIL import Image
 
-model, processor = load_qlora_model("outputs/stage4_opd")
+model, processor = load_qlora_model("outputs/stage6_opd")
 
 image = Image.open("example.jpg")
 messages = [
@@ -306,18 +309,18 @@ reward = process_reward(
 ```
 tvp-4b-5090d/
 ├── configs/                          # YAML 训练配置
-│   ├── stage0_pretrain.yaml
-│   ├── stage0_5_visual_pretrain.yaml
-│   ├── stage1a_sft_box.yaml
-│   ├── stage1b_sft_point.yaml
-│   ├── stage2a_grpo_box.yaml
-│   ├── stage2b_grpo_point.yaml
-│   ├── stage3_rft_unified.yaml
-│   └── stage4_opd.yaml
+│   ├── stage2_visual_pretrain.yaml
+│   ├── stage3a_sft_box.yaml
+│   ├── stage3b_sft_point.yaml
+│   ├── stage4a_grpo_box.yaml
+│   ├── stage4b_grpo_point.yaml
+│   ├── stage5_rft_unified.yaml
+│   └── stage6_opd.yaml
 ├── src/
 │   ├── models/
 │   │   ├── qwen_vl_loader.py         # Qwen3VL + QLoRA 加载器
-│   │   └── pretrain_loader.py        # Pretrain 模型加载 + embedding 注入
+│   │   ├── pretrain_loader.py        # Pretrain 模型加载 + embedding 注入
+│   │   └── visual_primitive_parser.py # 视觉原语解析器
 │   ├── data/
 │   │   ├── datasets/
 │   │   │   ├── sft_dataset.py        # SFT 数据集（assistant-only loss mask）
@@ -332,6 +335,7 @@ tvp-4b-5090d/
 │   ├── training/
 │   │   ├── trainers/
 │   │   │   └── sft_trainer.py        # SFT Trainer 封装
+│   │   ├── pretrain_trainer.py       # Pretrain Trainer（仅训练 embedding）
 │   │   ├── opd_trainer.py            # OPD 反向 KL 蒸馏训练器
 │   │   ├── callbacks.py              # 训练回调（内存监控）
 │   │   └── memory_utils.py           # GPU 显存工具
@@ -340,20 +344,38 @@ tvp-4b-5090d/
 │       ├── metrics.py                # Format RM + Accuracy RM + 难度分级
 │       └── logging_utils.py          # 日志初始化
 ├── scripts/                          # 阶段入口脚本
-│   ├── run_pretrain.py               # Stage 0: Text Pretrain
-│   ├── run_stage0_5_visual_pretrain.py  # Stage 0.5: Visual Pretrain
-│   ├── merge_stage0_5.py             # Stage 0.5 LoRA Merge
-│   ├── run_stage1a_sft_box.py        # Stage 1a: Box Expert SFT
-│   ├── run_stage1b_sft_point.py      # Stage 1b: Point Expert SFT
-│   ├── run_stage2a_grpo_box.py       # Stage 2a: Box Expert GRPO
-│   ├── run_stage2b_grpo_point.py     # Stage 2b: Point Expert GRPO
-│   ├── run_stage3_rft_unified.py     # Stage 3: Unified RFT
-│   ├── run_stage4_opd.py             # Stage 4: OPD
-│   └── run_iterdpo_pipeline.sh       # Master Pipeline 一键运行
+│   ├── generate_pretrain_data.py     # 预训练数据生成器
+│   ├── run_stage1_pretrain.py        # Stage 1: Text Pretrain
+│   ├── run_stage2_visual_pretrain.py # Stage 2: Visual Pretrain
+│   ├── merge_stage2.py               # Stage 2 LoRA Merge
+│   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
+│   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
+│   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
+│   ├── run_stage4b_grpo_point.py     # Stage 4b: Point Expert GRPO
+│   ├── run_stage5_rft_unified.py     # Stage 5: Unified RFT
+│   ├── run_stage6_opd.py             # Stage 6: OPD
+│   └── run_pipeline.sh               # Master Pipeline 一键运行
 ├── tests/
 │   ├── test_primitive_parser.py      # 坐标解析单元测试
 │   ├── test_metrics.py               # 奖励函数与几何工具测试
+│   ├── test_pretrain_format.py       # 预训练格式测试
 │   └── test_logging_utils.py         # 日志工具测试
+├── outputs/                          # 训练产物（按 stage 组织）
+│   ├── stage1_pretrain/              # embedding state_dict
+│   ├── stage2_visual_pretrain/       # LoRA adapter + checkpoints
+│   ├── stage2_merged_base/           # merge 后的完整模型
+│   ├── stage3a_sft_box/              # Box Expert SFT adapter
+│   ├── stage3b_sft_point/            # Point Expert SFT adapter
+│   ├── stage4a_grpo_box/             # Box Expert GRPO adapter
+│   ├── stage4b_grpo_point/           # Point Expert GRPO adapter
+│   ├── stage5_rft_unified/           # Unified RFT adapter
+│   └── stage6_opd/                   # OPD 蒸馏产物
+├── logs/                             # 各 stage 训练日志
+├── data/
+│   ├── pretrain/pretrain_data.json   # 格式预训练数据
+│   ├── coco/                         # COCO 数据集（需手动下载）
+│   └── cache/maze/                   # 迷宫图片缓存
+├── models/Qwen3-VL-4B-Thinking/     # 基座模型（需手动下载）
 ├── requirements.txt
 └── README.md
 ```

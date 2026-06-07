@@ -115,7 +115,7 @@ def main(args):
     )
 
     logger.info("Starting Point Expert SFT training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
@@ -143,5 +143,7 @@ if __name__ == "__main__":
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint dir to resume from, e.g. outputs/stage3b_sft_point/checkpoint-500")
     args = parser.parse_args()
     main(args)

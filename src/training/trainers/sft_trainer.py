@@ -87,17 +87,29 @@ def _collate_sft(features: list) -> Dict[str, torch.Tensor]:
 
     Qwen3-VL expects pixel_values concatenated along the patch dimension
     (not stacked), with image_grid_thw indicating the grid size per image.
+
+    Handles mixed batches of text-only and image samples:
+    - pixel_values / image_grid_thw are only collected from samples that have them.
+    - If no sample in the batch has images, these keys are omitted.
     """
     batch = {}
-    keys = features[0].keys()
-    for key in keys:
+    # Union of all keys across samples (not just features[0])
+    all_keys = set()
+    for f in features:
+        all_keys.update(f.keys())
+
+    for key in all_keys:
         if key == "pixel_values":
-            # Different images → different num_patches; concatenate along dim 0
-            batch[key] = torch.cat([f[key] for f in features], dim=0)
+            # Only image samples have this; concatenate along patch dim
+            present = [f[key] for f in features if key in f]
+            if present:
+                batch[key] = torch.cat(present, dim=0)
         elif key == "image_grid_thw":
-            # Stack to [batch_size, 3]
-            batch[key] = torch.stack([f[key] for f in features], dim=0)
+            # Only image samples have this; stack to [n_images, 3]
+            present = [f[key] for f in features if key in f]
+            if present:
+                batch[key] = torch.stack(present, dim=0)
         else:
-            # input_ids, attention_mask, labels: already padded to max_length
+            # input_ids, attention_mask, labels: present in all samples
             batch[key] = torch.stack([f[key] for f in features], dim=0)
     return batch

@@ -97,7 +97,7 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 Stage 1:  Text Pretrain          文本-only embedding 初始化               ~1.5h  ✅
 Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~14h   ✅
 Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~18s   ✅
-Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~10h   🔄 进行中
+Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~9.5h  ✅
 Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~30h   (预计)
 Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
 Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
@@ -164,9 +164,9 @@ python scripts/merge_stage2.py \
     --output_dir outputs/stage2_merged_base
 ```
 
-### Stage 3a: Box Expert SFT 🔄
+### Stage 3a: Box Expert SFT ✅
 
-> **实测数据**: 40000 样本 (25K general + 15K box)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5000 步，~7.07s/step，耗时 **~10h**。
+> **实测数据**: 40000 样本 (25K general + 15K box)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5000 步，~7.07s/step，耗时 **~9h37min**。
 
 ```bash
 python scripts/run_stage3a_sft_box.py \
@@ -272,6 +272,87 @@ I can see two cats in the image. Let me mark them.
 The answer is 2.
 ```
 
+### 批量推理
+
+支持对 JSONL 文件批量推理，适用于评估或大规模处理：
+
+```python
+import json
+from pathlib import Path
+from src.models.qwen_vl_loader import load_qlora_model
+from src.utils.metrics import process_reward
+from PIL import Image
+
+model, processor = load_qlora_model("outputs/stage6_opd")
+
+results = []
+with open("eval_data.jsonl") as f:
+    for line in f:
+        item = json.loads(line)
+        image = Image.open(item["image_path"]).convert("RGB")
+        messages = [
+            {"role": "system", "content": "You are a helpful visual reasoning assistant. Think step by step."},
+            {"role": "user", "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": item["question"]},
+            ]},
+        ]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image], return_tensors="pt")
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        outputs = model.generate(**inputs, max_new_tokens=1024, temperature=0.7, do_sample=True)
+        pred = processor.tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+        # 计算过程奖励（可选）
+        reward = process_reward(pred, item["answer"], task_type=item.get("task_type", "box"))
+        results.append({"pred": pred, "reward": reward, "gt": item["answer"]})
+
+with open("eval_results.jsonl", "w") as f:
+    for r in results:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+```
+
+### 跨 Stage 模型对比评估
+
+对比不同训练阶段的输出质量，验证各阶段效果演进：
+
+```python
+from src.models.qwen_vl_loader import load_qlora_model
+from PIL import Image
+
+# 加载各阶段模型
+stages = {
+    "Stage 2 (Pretrain)": "outputs/stage2_merged_base",
+    "Stage 3a (Box SFT)": "outputs/stage3a_sft_box",
+    "Stage 6 (OPD)":      "outputs/stage6_opd",
+}
+
+image = Image.open("test_image.jpg")
+prompt = "Locate the dog in the image."
+
+for name, path in stages.items():
+    model, processor = load_qlora_model(path)
+    messages = [
+        {"role": "system", "content": "You are a helpful visual reasoning assistant."},
+        {"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": prompt},
+        ]},
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[image], return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    outputs = model.generate(**inputs, max_new_tokens=512, do_sample=False)
+    print(f"=== {name} ===")
+    print(processor.tokenizer.decode(outputs[0], skip_special_tokens=False))
+    print()
+    del model  # 释放显存
+```
+
+> **预期行为**：Pretrain 阶段输出格式正确但框不准确；SFT Box 阶段结构化思考 + 精确框；OPD 阶段同时具备 Box 和 Point 能力。
+
 ---
 
 ## 🧠 关键技术设计
@@ -296,6 +377,22 @@ The answer is 2.
 | bf16 计算 | 速度 + 显存双赢 |
 
 单卡 24GB 可以同时容纳 **Policy 模型 + Reference 模型**（TRL 的 GRPOTrainer 对 PEFT 模型通过禁用 adapter 复用相同基座权重，峰值显存约 14-18GB，其中 KV cache 为最大支出）。
+
+### VRAM Guide 显存适配指南
+
+不同显存 GPU 的推荐配置：
+
+| GPU 显存 | batch_size | grad_accum | LoRA r | image_size | max_length | 备注 |
+|---------|-----------|-----------|--------|-----------|-----------|------|
+| **24GB** (5090D / 4090) | 2 | 2 | 256 | 448 | 2048 | 本项目默认配置 |
+| **16GB** (4080 / 4070 Ti Super) | 1 | 4 | 128 | 384 | 1536 | 降低 LoRA rank 以节省显存 |
+| **12GB** (4070 Ti / 3060 12G) | 1 | 8 | 64 | 336 | 1024 | 激进压缩，GRPO `num_generations=3` |
+| **80GB** (A100 / H100) | 4 | 1 | 256 | 448 | 4096 | 可跑全参数或更大 batch |
+
+> **提示**：
+> - 12GB 显卡建议在运行前设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 减少显存碎片。
+> - OPD 阶段需同时加载 3 个模型（student + 2 experts），教师模型自动使用 4-bit 量化，峰值显存约为单模型 SFT 的 1.8 倍。
+> - GRPO 阶段显存占用与 `num_generations` 正相关，12GB 下建议 `num_generations=3`，24GB 下可用 `num_generations=5`。
 
 ### 过程奖励函数 (Process Reward)
 
@@ -408,9 +505,42 @@ pytest tests/ -v
 
 ---
 
+## 🙏 致谢与参考
+
+本项目的实现参考了以下工作：
+
+- **论文**：*Thinking with Visual Primitives*（Lu et al., DeepSeek, 2026）—— 提出将 bounding box 和 point 作为多模态推理链中的"最小思维单元"，解决复杂视觉推理中的 Reference Gap。本项目的核心思想即来源于此论文。
+- **[vra/Thinking-with-Visual-Primitives-pytorch](https://github.com/vra/Thinking-with-Visual-Primitives-pytorch)**（作者：Yunfeng Wang）：基于 PyTorch 的非官方复现，采用 Qwen2-VL-2B + LoRA 在单卡 12GB+ 上实现了完整的 Pretrain → SFT → OPD 训练流程。本项目的整体训练流水线设计（分离专家 + OPD 蒸馏）、视觉原语格式定义、过程奖励函数设计等均从中获得了大量启发和参考。
+- **[ailuntx/Thinking-with-Visual-Primitives](https://github.com/ailuntx/Thinking-with-Visual-Primitives)**：原论文官方仓库被删除后的社区存档/镜像，保留了原始论文的技术报告、代码和说明，作为 DeepSeek 论文原始实现的替代参考来源。
+
+> **声明**：本项目是对上述工作的独立复现与扩展，在基座模型（Qwen3-VL-4B）、训练框架（TRL + QLoRA）、硬件约束（单卡 RTX 5090D 24GB）等方面做了不同的技术选型。如有任何问题或建议，欢迎提出 Issue。
+
+---
+
 ## 📚 引用
 
-如果你使用了本代码，请引用 Qwen3-VL：
+首先引用原始论文：
+
+```bibtex
+@article{lu2026think,
+  title={Thinking with Visual Primitives},
+  author={Lu, Ruijie and Ma, Yiyang and Chen, Xiaokang and Luo, Lingxiao and Wu, Zhiyu and Pan, Zizheng and Liu, Xingchao and Lin, Yutong and Li, Hao and Liu, Wen and Hao, Zhewen and Gao, Xi and Nie, Shaoheng and Wei, Yixuan and Xie, Zhenda and Chen, Ting and Zeng, Gang},
+  year={2026}
+}
+```
+
+以及参考的 PyTorch 复现：
+
+```bibtex
+@software{wang2026tvp_pytorch,
+  title={Thinking with Visual Primitives --- PyTorch Implementation},
+  author={Wang, Yunfeng},
+  url={https://github.com/vra/Thinking-with-Visual-Primitives-pytorch},
+  year={2026}
+}
+```
+
+如果你使用了本代码，也请引用 Qwen3-VL：
 
 ```bibtex
 @article{bai2025qwen3vl,

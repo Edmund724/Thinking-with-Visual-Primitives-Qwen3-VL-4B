@@ -255,8 +255,30 @@ def _build_maze_thinking_3step(grounding_log: str, solvable: bool) -> str:
     )
 
 
+def _limit_grounding_log(grounding: str, max_lines: int = 25) -> str:
+    """Limit DFS grounding log length while preserving structure.
+
+    Keeps the first and last portions of the exploration with a summary
+    line in between, so that:
+    - The initial exploration direction is preserved
+    - The final conclusion (e.g. "Reached destination") is kept
+    - The 3-step thinking structure remains intact after wrapping
+    """
+    lines = grounding.split("\n")
+    if len(lines) <= max_lines:
+        return grounding
+
+    keep = max_lines // 2
+    skipped = len(lines) - 2 * keep
+    head = lines[:keep]
+    tail = lines[-keep:]
+    summary = f"... (explored {skipped} more cells) ..."
+    return "\n".join(head + [summary] + tail)
+
+
 def generate_maze_dataset(
-    n: int = 100000, seed: int = 42, cache_dir: str = "data/cache/maze"
+    n: int = 100000, seed: int = 42, cache_dir: str = "data/cache/maze",
+    max_grounding_lines: int = 25,
 ) -> List[Dict]:
     """Generate maze dataset with 50% solvable / 50% unsolvable and 3-step thinking.
 
@@ -292,6 +314,7 @@ def generate_maze_dataset(
         if random.random() < MAZE_SOLVABLE_RATIO:
             # Solvable maze
             grounding = dfs_exploration_with_backtracking(maze_grid, start, end)
+            grounding = _limit_grounding_log(grounding, max_grounding_lines)
             thinking = _build_maze_thinking_3step(grounding, solvable=True)
             answer = r"\boxed{True}"
         else:
@@ -300,6 +323,7 @@ def generate_maze_dataset(
             if solution:
                 maze_grid = break_path_middle(maze_grid, solution)
             grounding = dfs_exhaustive_search_proving_unreachable(maze_grid, start)
+            grounding = _limit_grounding_log(grounding, max_grounding_lines)
             thinking = _build_maze_thinking_3step(grounding, solvable=False)
             answer = r"\boxed{False}"
 

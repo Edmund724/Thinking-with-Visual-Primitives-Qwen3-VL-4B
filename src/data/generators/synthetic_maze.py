@@ -264,6 +264,8 @@ def _limit_grounding_log(grounding: str, max_lines: int = 25) -> str:
     - The final conclusion (e.g. "Reached destination") is kept
     - The 3-step thinking structure remains intact after wrapping
     """
+    if max_lines < 2:
+        max_lines = 2  # need at least 1 head + 1 tail line
     lines = grounding.split("\n")
     if len(lines) <= max_lines:
         return grounding
@@ -332,7 +334,6 @@ def generate_maze_dataset(
             "prompt": "Is there a path from the green circle (start) to the red square (end)? Use <|point|> to show your exploration process step by step.",
             "reasoning": thinking,
             "answer": answer,
-            "maze_grid": maze_grid,
             "task_type": "maze",
         })
 

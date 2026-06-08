@@ -114,6 +114,7 @@ class SFTDataset(Dataset):
             return labels
 
         # Process prompt with same image (no padding) to get actual token count
+        # NOTE: must include image to get correct image token positions in prompt_len
         if image is not None:
             prompt_inputs = self.processor(
                 text=[prompt_text],
@@ -151,7 +152,7 @@ class SFTDataset(Dataset):
 
         prompt_messages, full_messages = self._build_messages(sample)
 
-        # Process full text with images (padded to max_length)
+        # Process full text with images (no padding; collator will pad per-batch)
         full_text = self.processor.apply_chat_template(
             full_messages,
             tokenize=False,
@@ -163,17 +164,17 @@ class SFTDataset(Dataset):
                 text=[full_text],
                 images=[image],
                 return_tensors="pt",
-                padding="max_length",
-                max_length=self.max_length,
+                padding=False,
                 truncation=True,
+                max_length=self.max_length,
             )
         else:
             inputs = self.processor(
                 text=[full_text],
                 return_tensors="pt",
-                padding="max_length",
-                max_length=self.max_length,
+                padding=False,
                 truncation=True,
+                max_length=self.max_length,
             )
 
         # Remove batch dimension

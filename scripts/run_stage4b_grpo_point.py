@@ -7,6 +7,7 @@ Uses Format RM + Accuracy RM with difficulty grading (Normal only).
 
 import argparse
 import logging
+import pickle
 import sys
 import os
 from pathlib import Path
@@ -74,30 +75,43 @@ def main(args):
     )
     log_memory_status("Policy loaded:")
 
-    # 2. Generate GRPO data (broader pool)
-    logger.info("Generating GRPO training data (point+maze)...")
-    all_data = []
+    # 2. Generate or load cached GRPO data
+    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
+    if os.path.exists(cache_path):
+        logger.info(f"Loading cached training data from {cache_path}")
+        with open(cache_path, "rb") as f:
+            all_data = pickle.load(f)
+        logger.info(f"  Loaded {len(all_data)} samples from cache")
+    else:
+        logger.info("Generating GRPO training data (point+maze)...")
+        all_data = []
 
-    point_data = generate_coco_point_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_point,
-    )
-    for d in point_data:
-        d["task_type"] = "point"
-    all_data.extend(point_data)
-    logger.info(f"  Point samples: {len(point_data)}")
+        point_data = generate_coco_point_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_point,
+        )
+        for d in point_data:
+            d["task_type"] = "point"
+        all_data.extend(point_data)
+        logger.info(f"  Point samples: {len(point_data)}")
 
-    maze_data = generate_maze_dataset(
-        n=args.num_maze,
-        seed=42,
-    )
-    for d in maze_data:
-        d["task_type"] = "maze"
-    all_data.extend(maze_data)
-    logger.info(f"  Maze samples: {len(maze_data)}")
+        maze_data = generate_maze_dataset(
+            n=args.num_maze,
+            seed=42,
+        )
+        for d in maze_data:
+            d["task_type"] = "maze"
+        all_data.extend(maze_data)
+        logger.info(f"  Maze samples: {len(maze_data)}")
 
-    logger.info(f"Total GRPO samples: {len(all_data)}")
+        logger.info(f"Total GRPO samples: {len(all_data)}")
+
+        # Save cache for future runs
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(all_data, f)
+        logger.info(f"Cached training data to {cache_path}")
 
     num_rounds = args.num_rounds
     dist_thresholds = [20.0, 10.0, 5.0]
@@ -105,6 +119,21 @@ def main(args):
     for round_idx in range(num_rounds):
         dist_th = dist_thresholds[round_idx] if round_idx < len(dist_thresholds) else 5.0
         round_dir = Path(args.output_dir) / f"round_{round_idx + 1}"
+
+        # Skip already-completed rounds
+        round_adapter = round_dir / "adapter_model.safetensors"
+        if round_adapter.exists():
+            logger.info(f"Round {round_idx + 1}/{num_rounds} already done ({round_adapter}), skipping.")
+            try:
+                policy_model, processor = load_qlora_model(
+                    model_name=str(round_dir),
+                    lora_r=args.lora_r,
+                    lora_alpha=args.lora_alpha,
+                )
+            except Exception as e:
+                logger.warning(f"Could not reload round {round_idx + 1}: {e}")
+            continue
+
         round_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"{'='*60}")

@@ -17,8 +17,9 @@ Key design (per paper):
 """
 
 import logging
+import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -78,6 +79,81 @@ class OPDDataset(Dataset):
         }
 
 
+def _save_opd_checkpoint(
+    student_model,
+    optimizer,
+    scheduler,
+    global_step: int,
+    epoch: int,
+    step_in_epoch: int,
+    output_dir: str,
+    logger: logging.Logger,
+):
+    """Save OPD training checkpoint."""
+    ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Save adapter weights
+    student_model.save_pretrained(ckpt_dir)
+
+    # Save optimizer + scheduler + training state
+    state = {
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "global_step": global_step,
+        "epoch": epoch,
+        "step_in_epoch": step_in_epoch,
+    }
+    torch.save(state, os.path.join(ckpt_dir, "opd_state.pt"))
+    logger.info(f"  Saved OPD checkpoint at step {global_step} -> {ckpt_dir}")
+
+    # Prune old checkpoints (keep latest 2)
+    import glob
+    import shutil
+    ckpt_dirs = sorted(glob.glob(os.path.join(output_dir, "checkpoint-*")),
+                       key=lambda d: int(d.split("-")[-1]))
+    while len(ckpt_dirs) > 2:
+        old_dir = ckpt_dirs.pop(0)
+        shutil.rmtree(old_dir, ignore_errors=True)
+        logger.info(f"  Removed old checkpoint: {old_dir}")
+
+
+def _load_opd_checkpoint(
+    student_model,
+    optimizer,
+    scheduler,
+    checkpoint_dir: str,
+    logger: logging.Logger,
+) -> tuple:
+    """Load OPD training checkpoint. Returns (global_step, epoch, step_in_epoch)."""
+    logger.info(f"Resuming OPD from checkpoint: {checkpoint_dir}")
+
+    # Load adapter weights
+    from peft import PeftModel
+    if isinstance(student_model, PeftModel):
+        student_model.load_adapter(checkpoint_dir, adapter_name="default", is_trainable=True)
+        student_model.set_adapter("default")
+    else:
+        state_dict = torch.load(os.path.join(checkpoint_dir, "adapter_model.bin"),
+                                map_location="cpu", weights_only=False)
+        student_model.load_state_dict(state_dict, strict=False)
+
+    # Load optimizer + scheduler + training state
+    state_path = os.path.join(checkpoint_dir, "opd_state.pt")
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+
+    global_step = state["global_step"]
+    epoch = state["epoch"]
+    step_in_epoch = state["step_in_epoch"]
+    logger.info(
+        f"  Resumed at global_step={global_step}, epoch={epoch+1}, "
+        f"step_in_epoch={step_in_epoch}"
+    )
+    return global_step, epoch, step_in_epoch
+
+
 def train_opd(
     student_model,
     box_expert,
@@ -92,6 +168,8 @@ def train_opd(
     temperature: float = 1.0,
     warmup_steps: int = 100,
     logging_steps: int = 20,
+    save_steps: int = 500,
+    resume_from_checkpoint: Optional[str] = None,
     logger: logging.Logger | None = None,
 ):
     """Run OPD training with reverse KL distillation.
@@ -140,13 +218,27 @@ def train_opd(
     eos_token_id = processor.tokenizer.eos_token_id
 
     global_step = 0
+    start_epoch = 0
+    start_step_in_epoch = 0
 
-    for epoch in range(num_epochs):
+    # Resume from checkpoint if provided
+    if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
+        global_step, start_epoch, start_step_in_epoch = _load_opd_checkpoint(
+            student_model, optimizer, scheduler, resume_from_checkpoint, logger,
+        )
+    elif resume_from_checkpoint:
+        logger.warning(f"Checkpoint not found: {resume_from_checkpoint}, starting from scratch")
+
+    for epoch in range(start_epoch, num_epochs):
         epoch_kl = 0.0
         epoch_t0 = time.time()
 
         pbar = tqdm(dataloader, desc=f"OPD Epoch {epoch+1}/{num_epochs}", unit="batch")
         for step, batch in enumerate(pbar):
+            # Skip already-processed steps when resuming within an epoch
+            if epoch == start_epoch and step < start_step_in_epoch:
+                continue
+
             global_step += 1
 
             # Warmup
@@ -229,6 +321,14 @@ def train_opd(
                 logger.info(
                     f"  Epoch {epoch+1}/{num_epochs} | Step {global_step} | "
                     f"KL: {kl_val:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+                )
+
+            # Save checkpoint
+            if global_step % save_steps == 0:
+                _save_opd_checkpoint(
+                    student_model, optimizer, scheduler,
+                    global_step, epoch, step + 1,
+                    output_dir, logger,
                 )
 
         avg_kl = epoch_kl / max(len(dataloader), 1)

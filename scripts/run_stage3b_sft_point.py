@@ -9,6 +9,7 @@ Data ratio: 70% general + 30% visual primitives (20% maze + 10% point).
 
 import argparse
 import logging
+import pickle
 import random
 import sys
 import os
@@ -44,58 +45,75 @@ def main(args):
     )
     log_memory_status("After model loading:")
 
-    # 2. Generate training data
-    logger.info("Generating training data (70% general + 30% point/maze)...")
-
-    # 10% point data (COCO object centers)
-    point_data = generate_coco_point_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_point,
-    )
-    for d in point_data:
-        d["task_type"] = "point"
-    logger.info(f"  Point samples: {len(point_data)}")
-
-    # 20% maze data
-    maze_data = generate_maze_dataset(
-        n=args.num_maze,
-        seed=42,
-    )
-    for d in maze_data:
-        d["task_type"] = "maze"
-    logger.info(f"  Maze samples: {len(maze_data)}")
-
-    # 70% general data (text-only pretrain data)
-    general_data = []
-    if os.path.exists(args.general_data_path):
-        import json
-        with open(args.general_data_path, "r") as f:
-            raw_general = json.load(f)
-        # Convert from conversations format to SFT format
-        for item in raw_general:
-            convs = item.get("conversations", [])
-            user_msg = next((c["content"] for c in convs if c["role"] == "user"), "")
-            asst_msg = next((c["content"] for c in convs if c["role"] == "assistant"), "")
-            general_data.append({
-                "prompt": user_msg,
-                "reasoning": "",
-                "answer": asst_msg,
-                "image": item.get("image", None),
-                "task_type": "general",
-            })
-        # 70% of total = general, 30% = visual primitives
-        visual_count = len(point_data) + len(maze_data)
-        target_general = int(visual_count * 7 / 3)
-        if len(general_data) > target_general:
-            general_data = general_data[:target_general]
-        logger.info(f"  General samples: {len(general_data)}")
+    # 2. Generate or load cached training data
+    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
+    if os.path.exists(cache_path):
+        logger.info(f"Loading cached training data from {cache_path}")
+        with open(cache_path, "rb") as f:
+            all_data = pickle.load(f)
+        logger.info(f"  Loaded {len(all_data)} samples from cache")
+        # Strip heavy unused fields to reduce RAM / pickle overhead
+        for d in all_data:
+            d.pop("maze_grid", None)
     else:
-        logger.warning(f"General data not found at {args.general_data_path}, using 100% visual")
+        logger.info("Generating training data (70% general + 30% point/maze)...")
 
-    all_data = general_data + point_data + maze_data
-    random.shuffle(all_data)
-    logger.info(f"Total training samples: {len(all_data)}")
+        # 10% point data (COCO object centers)
+        point_data = generate_coco_point_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_point,
+        )
+        for d in point_data:
+            d["task_type"] = "point"
+        logger.info(f"  Point samples: {len(point_data)}")
+
+        # 20% maze data
+        maze_data = generate_maze_dataset(
+            n=args.num_maze,
+            seed=42,
+        )
+        for d in maze_data:
+            d["task_type"] = "maze"
+        logger.info(f"  Maze samples: {len(maze_data)}")
+
+        # 70% general data (text-only pretrain data)
+        general_data = []
+        if os.path.exists(args.general_data_path):
+            import json
+            with open(args.general_data_path, "r") as f:
+                raw_general = json.load(f)
+            # Convert from conversations format to SFT format
+            for item in raw_general:
+                convs = item.get("conversations", [])
+                user_msg = next((c["content"] for c in convs if c["role"] == "user"), "")
+                asst_msg = next((c["content"] for c in convs if c["role"] == "assistant"), "")
+                general_data.append({
+                    "prompt": user_msg,
+                    "reasoning": "",
+                    "answer": asst_msg,
+                    "image": item.get("image", None),
+                    "task_type": "general",
+                })
+            # 70% of total = general, 30% = visual primitives
+            visual_count = len(point_data) + len(maze_data)
+            target_general = int(visual_count * 7 / 3)
+            if len(general_data) > target_general:
+                general_data = general_data[:target_general]
+            logger.info(f"  General samples: {len(general_data)}")
+        else:
+            logger.warning(f"General data not found at {args.general_data_path}, using 100% visual")
+
+        all_data = general_data + point_data + maze_data
+        random.seed(42)
+        random.shuffle(all_data)
+        logger.info(f"Total training samples: {len(all_data)}")
+
+        # Save cache for future runs
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(all_data, f)
+        logger.info(f"Cached training data to {cache_path}")
 
     # 3. Train
     trainer = create_sft_trainer(
@@ -115,6 +133,9 @@ def main(args):
     )
 
     logger.info("Starting Point Expert SFT training...")
+    if args.resume_from_checkpoint and not os.path.isdir(args.resume_from_checkpoint):
+        logger.error(f"Checkpoint not found: {args.resume_from_checkpoint}")
+        sys.exit(1)
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)

@@ -13,6 +13,7 @@ For each sample:
 
 import argparse
 import logging
+import pickle
 import sys
 import os
 
@@ -67,42 +68,60 @@ def main(args):
     )
     log_memory_status("Point Expert loaded:")
 
-    # 4. Generate OPD training data
-    logger.info("Generating OPD training data...")
-    all_data = []
+    # 4. Generate or load cached OPD training data
+    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
+    if os.path.exists(cache_path):
+        logger.info(f"Loading cached training data from {cache_path}")
+        with open(cache_path, "rb") as f:
+            all_data = pickle.load(f)
+        logger.info(f"  Loaded {len(all_data)} samples from cache")
+    else:
+        logger.info("Generating OPD training data...")
+        all_data = []
 
-    box_data = generate_coco_box_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_box,
-    )
-    for d in box_data:
-        d["task_type"] = "box"
-    all_data.extend(box_data)
-    logger.info(f"  Box: {len(box_data)}")
+        box_data = generate_coco_box_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_box,
+        )
+        for d in box_data:
+            d["task_type"] = "box"
+        all_data.extend(box_data)
+        logger.info(f"  Box: {len(box_data)}")
 
-    point_data = generate_coco_point_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_point,
-    )
-    for d in point_data:
-        d["task_type"] = "point"
-    all_data.extend(point_data)
-    logger.info(f"  Point: {len(point_data)}")
+        point_data = generate_coco_point_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_point,
+        )
+        for d in point_data:
+            d["task_type"] = "point"
+        all_data.extend(point_data)
+        logger.info(f"  Point: {len(point_data)}")
 
-    maze_data = generate_maze_dataset(
-        n=args.num_maze,
-        seed=99,
-    )
-    for d in maze_data:
-        d["task_type"] = "maze"
-    all_data.extend(maze_data)
-    logger.info(f"  Maze: {len(maze_data)}")
+        maze_data = generate_maze_dataset(
+            n=args.num_maze,
+            seed=99,
+        )
+        for d in maze_data:
+            d["task_type"] = "maze"
+        all_data.extend(maze_data)
+        logger.info(f"  Maze: {len(maze_data)}")
 
-    logger.info(f"Total OPD samples: {len(all_data)}")
+        logger.info(f"Total OPD samples: {len(all_data)}")
+
+        # Save cache for future runs
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(all_data, f)
+        logger.info(f"Cached training data to {cache_path}")
 
     # 5. Run OPD training
+    resume_ckpt = args.resume_from_checkpoint
+    if resume_ckpt and not os.path.isdir(resume_ckpt):
+        logger.error(f"Checkpoint not found: {resume_ckpt}")
+        sys.exit(1)
+
     logger.info("Starting OPD training (reverse KL distillation)...")
     train_opd(
         student_model=student_model,
@@ -118,6 +137,8 @@ def main(args):
         temperature=args.temperature,
         warmup_steps=args.warmup_steps,
         logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        resume_from_checkpoint=resume_ckpt,
         logger=logger,
     )
 
@@ -151,5 +172,8 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=512)
     parser.add_argument("--logging_steps", type=int, default=20)
     parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint dir to resume from, e.g. outputs/stage6_opd/checkpoint-500")
     args = parser.parse_args()
     main(args)

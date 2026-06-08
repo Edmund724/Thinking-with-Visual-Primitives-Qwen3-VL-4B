@@ -11,6 +11,7 @@ Key design (corrected per paper):
 
 import argparse
 import logging
+import pickle
 import random
 import sys
 import os
@@ -136,41 +137,54 @@ def main(args):
     )
     log_memory_status("Unified model loaded:")
 
-    # 2. Generate prompts for rejection sampling
-    logger.info("Generating prompts for rejection sampling...")
-    all_prompts = []
+    # 2. Generate or load cached prompts for rejection sampling
+    cache_path = os.path.join(args.output_dir, "prompts_cache.pkl")
+    if os.path.exists(cache_path):
+        logger.info(f"Loading cached prompts from {cache_path}")
+        with open(cache_path, "rb") as f:
+            all_prompts = pickle.load(f)
+        logger.info(f"  Loaded {len(all_prompts)} prompts from cache")
+    else:
+        logger.info("Generating prompts for rejection sampling...")
+        all_prompts = []
 
-    box_prompts = generate_coco_box_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_box_prompts,
-    )
-    for d in box_prompts:
-        d["task_type"] = "box"
-    all_prompts.extend(box_prompts)
-    logger.info(f"  Box prompts: {len(box_prompts)}")
+        box_prompts = generate_coco_box_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_box_prompts,
+        )
+        for d in box_prompts:
+            d["task_type"] = "box"
+        all_prompts.extend(box_prompts)
+        logger.info(f"  Box prompts: {len(box_prompts)}")
 
-    point_prompts = generate_coco_point_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_point_prompts,
-    )
-    for d in point_prompts:
-        d["task_type"] = "point"
-    all_prompts.extend(point_prompts)
-    logger.info(f"  Point prompts: {len(point_prompts)}")
+        point_prompts = generate_coco_point_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_point_prompts,
+        )
+        for d in point_prompts:
+            d["task_type"] = "point"
+        all_prompts.extend(point_prompts)
+        logger.info(f"  Point prompts: {len(point_prompts)}")
 
-    maze_prompts = generate_maze_dataset(
-        n=args.num_maze_prompts,
-        seed=45,
-    )
-    for d in maze_prompts:
-        d["task_type"] = "maze"
-    all_prompts.extend(maze_prompts)
-    logger.info(f"  Maze prompts: {len(maze_prompts)}")
+        maze_prompts = generate_maze_dataset(
+            n=args.num_maze_prompts,
+            seed=45,
+        )
+        for d in maze_prompts:
+            d["task_type"] = "maze"
+        all_prompts.extend(maze_prompts)
+        logger.info(f"  Maze prompts: {len(maze_prompts)}")
 
-    random.shuffle(all_prompts)
-    logger.info(f"Total prompts: {len(all_prompts)}")
+        random.shuffle(all_prompts)
+        logger.info(f"Total prompts: {len(all_prompts)}")
+
+        # Save cache for future runs
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(all_prompts, f)
+        logger.info(f"Cached prompts to {cache_path}")
 
     # 3. Load Box Expert (teacher)
     logger.info(f"Loading Box Expert from {args.box_expert_path}...")
@@ -244,6 +258,11 @@ def main(args):
 
     # 6. SFT Unified model on Normal-difficulty expert data
     logger.info("Training Unified model on Normal-difficulty expert data...")
+    resume_ckpt = args.resume_from_checkpoint
+    if resume_ckpt and not os.path.isdir(resume_ckpt):
+        logger.error(f"Checkpoint not found: {resume_ckpt}")
+        sys.exit(1)
+
     trainer = create_sft_trainer(
         model=unified_model,
         processor=processor,
@@ -260,7 +279,7 @@ def main(args):
         use_wandb=False,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_ckpt)
     final_dir = f"{args.output_dir}/final_model"
     trainer.save_model(final_dir)
     processor.save_pretrained(final_dir)
@@ -295,5 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint dir to resume SFT training, e.g. outputs/stage5_rft_unified/checkpoint-500")
     args = parser.parse_args()
     main(args)

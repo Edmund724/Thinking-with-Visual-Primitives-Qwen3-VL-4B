@@ -98,7 +98,7 @@ Stage 1:  Text Pretrain          文本-only embedding 初始化               ~
 Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~14h   ✅
 Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~18s   ✅
 Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~9.5h  ✅
-Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~30h   (预计)
+Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8h    ✅
 Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
 Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
 Stage 5:  Unified RFT            专家生成 rollout → Unified 学习         ~5h    (预计)
@@ -167,6 +167,8 @@ python scripts/merge_stage2.py \
 ### Stage 3a: Box Expert SFT ✅
 
 > **实测数据**: 40000 样本 (25K general + 15K box)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5000 步，~7.07s/step，耗时 **~9h37min**。
+>
+> **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
 
 ```bash
 python scripts/run_stage3a_sft_box.py \
@@ -175,20 +177,34 @@ python scripts/run_stage3a_sft_box.py \
     --num_box 15000 --num_epochs 1 --learning_rate 1e-4
 ```
 
-### Stage 3b: Point Expert SFT
+### Stage 3b: Point Expert SFT ✅
 
-> 尚未开始。推荐参数: batch_size=4, grad_accum=2, lr=1e-4 (85K 样本，有效 batch=8，10625 步，预计 **~30h**)。
+> **实测数据**: 85000 样本 (25K general + 10K point + 50K maze)，1 epoch，batch_size=4, grad_accum=2 (有效 batch=8)，lr=1e-4，10625 步，耗时 **~8h** (含 resume)。
+> 
+> 训练中途曾因显存碎片化导致速度从 3s/it 降至 30s/it，通过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` resume 后恢复正常。
 
 ```bash
+# 正常从头跑
 python scripts/run_stage3b_sft_point.py \
     --model_path outputs/stage2_merged_base \
     --output_dir outputs/stage3b_sft_point \
     --num_point 10000 --num_maze 50000 \
     --num_epochs 1 --learning_rate 1e-4 \
     --batch_size 4 --gradient_accumulation_steps 2
+
+# 若中途显存碎片化减速，resume 时加环境变量
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_point.py \
+    --model_path outputs/stage2_merged_base \
+    --output_dir outputs/stage3b_sft_point \
+    --num_point 10000 --num_maze 50000 \
+    --num_epochs 1 --learning_rate 1e-4 \
+    --batch_size 4 --gradient_accumulation_steps 2 \
+    --resume_from_checkpoint outputs/stage3b_sft_point/checkpoint-5000
 ```
 
 ### Stage 4a: Box Expert GRPO（默认 3 轮循环）
+
+> **注**：GRPO 采用多轮循环结构，每轮结束后模型会被 reload，轮间是天然断点。每轮本身应一次性跑完，不支持轮内 resume。若某轮中断，重跑时脚本会自动检测并跳过已完成的轮次，从中断处继续。
 
 ```bash
 python scripts/run_stage4a_grpo_box.py \

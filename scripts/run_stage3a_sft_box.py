@@ -83,6 +83,7 @@ def main(args):
         logger.warning(f"General data not found at {args.general_data_path}, using 100% box")
 
     all_data = general_data + box_data
+    random.seed(42)
     random.shuffle(all_data)
     logger.info(f"Total training samples: {len(all_data)}")
 
@@ -104,6 +105,9 @@ def main(args):
     )
 
     logger.info("Starting Box Expert SFT training...")
+    if args.resume_from_checkpoint and not os.path.isdir(args.resume_from_checkpoint):
+        logger.error(f"Checkpoint not found: {args.resume_from_checkpoint}")
+        sys.exit(1)
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)

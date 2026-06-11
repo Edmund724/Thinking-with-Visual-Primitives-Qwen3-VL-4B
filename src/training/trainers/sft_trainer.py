@@ -74,6 +74,12 @@ def create_sft_trainer(
     # Get pad_token_id from processor (C3: avoid hardcoding)
     pad_token_id = processor.tokenizer.pad_token_id or 0
 
+    # Ensure use_cache is disabled on ALL nested configs — incompatible with
+    # gradient checkpointing. The Qwen3VLTextModel deep inside reads its own
+    # config.use_cache during forward, which a top-level set won't reach.
+    from ...models.qwen_vl_loader import _set_use_cache_deep
+    _set_use_cache_deep(model)
+
     trainer = Trainer(
         model=model,
         args=training_args,

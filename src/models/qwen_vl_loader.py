@@ -57,6 +57,32 @@ def _is_adapter_checkpoint(path: str) -> bool:
     )
 
 
+def _set_use_cache_deep(module: torch.nn.Module) -> None:
+    """Recursively set use_cache=False on every config object in a module tree.
+
+    Qwen3VL has deeply nested submodules; the ``@merge_with_config_defaults``
+    decorator on ``Qwen3VLTextModel.forward`` reads ``self.config.use_cache``
+    from the innermost ``Qwen3VLTextConfig``.  A top-level ``model.config.use_cache
+    = False`` does NOT propagate there, so we must reach every config.
+    """
+    seen_configs: set[int] = set()
+
+    def _walk(m: torch.nn.Module) -> None:
+        # Set on the module's own config if present
+        cfg = getattr(m, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg_id = id(cfg)
+            if cfg_id not in seen_configs:
+                seen_configs.add(cfg_id)
+                cfg.use_cache = False
+        # Recurse into children
+        for child in m.children():
+            _walk(child)
+
+    _walk(module)
+    logger.debug(f"Set use_cache=False on {len(seen_configs)} config object(s)")
+
+
 def _load_base_model_and_processor(
     model_name: str,
     bnb_config: BitsAndBytesConfig,
@@ -165,6 +191,17 @@ def load_qlora_model(
     new_tokenizer_len = len(processor.tokenizer)
     logger.info(f"Added {num_added} special tokens: {SPECIAL_TOKENS}")
 
+    # Explicitly align model config / generation_config with tokenizer token IDs
+    # to suppress the auto-alignment warning from transformers.
+    tokenizer = processor.tokenizer
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    if model.generation_config is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        model.generation_config.bos_token_id = tokenizer.bos_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+
     # CRITICAL: resize embeddings BEFORE prepare_model_for_kbit_training
     # Only expand — never shrink. Model may have more embeddings than tokenizer tokens.
     current_embed_size = model.get_input_embeddings().num_embeddings
@@ -191,8 +228,11 @@ def load_qlora_model(
         )
 
     if use_gradient_checkpointing:
+        # use_cache is incompatible with gradient checkpointing; disable explicitly
+        # before enabling checkpointing to suppress the runtime warning.
+        model.config.use_cache = False
         model.gradient_checkpointing_enable()
-        logger.info("Gradient checkpointing enabled")
+        logger.info("Gradient checkpointing enabled (use_cache=False)")
 
     # Prepare for 4-bit training
     model = prepare_model_for_kbit_training(model)
@@ -221,6 +261,12 @@ def load_qlora_model(
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, peft_config)
+
+    # After PEFT wrapping, ensure use_cache=False on ALL nested config objects.
+    # Qwen3VL nesting: PeftModel → LoraModel → Qwen3VLForConditionalGeneration
+    #   → Qwen3VLModel → Qwen3VLTextModel (the one with @merge_with_config_defaults
+    #   decorator that reads self.config.use_cache during forward).
+    _set_use_cache_deep(model)
 
     model.print_trainable_parameters()
     return model, processor
@@ -300,6 +346,17 @@ def load_reference_model(
     num_added = processor.tokenizer.add_special_tokens(special_tokens_dict)
     new_tokenizer_len = len(processor.tokenizer)
     logger.info(f"Reference: added {num_added} special tokens, tokenizer len={new_tokenizer_len}")
+
+    # Explicitly align model config / generation_config with tokenizer token IDs
+    ref_tokenizer = processor.tokenizer
+    model.config.pad_token_id = ref_tokenizer.pad_token_id
+    model.config.bos_token_id = ref_tokenizer.bos_token_id
+    model.config.eos_token_id = ref_tokenizer.eos_token_id
+    if model.generation_config is not None:
+        model.generation_config.pad_token_id = ref_tokenizer.pad_token_id
+        model.generation_config.bos_token_id = ref_tokenizer.bos_token_id
+        model.generation_config.eos_token_id = ref_tokenizer.eos_token_id
+
     current_embed_size = model.get_input_embeddings().num_embeddings
     if new_tokenizer_len > current_embed_size:
         model.resize_token_embeddings(new_tokenizer_len)

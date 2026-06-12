@@ -24,13 +24,6 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Removed
 
-- **`src/training/grpo_fixes.py` and related monkey-patches removed** — After upgrading to `trl>=1.6.0` and switching back to HuggingFace native generation, the multimodal alignment monkey-patches are no longer needed. Verification script `scripts/verify_grpo_fixes_removable.py` confirmed that training completes without the target errors (`Image features and image tokens do not match`, `mm_token_type_ids` shape mismatch) when the patches are disabled.
-  - Deleted `src/training/grpo_fixes.py`
-  - Deleted `tests/test_grpo_fixes.py`
-  - Deleted verification script `scripts/verify_grpo_fixes_removable.py`
-  - Removed `apply_grpo_fixes()` imports and calls from `scripts/run_stage4a_grpo_box.py` and `scripts/run_stage4b_grpo_point.py`
-  - `src/training/grpo_utils.py` is kept because TRL 1.6.0 still decodes completions with `skip_special_tokens=True`, which would strip `<|box|>`/`<|point|>` visual primitive tokens. Re-decoding from `completion_ids` with `skip_special_tokens=False` is still required.
-
 - **vLLM dependency removed** — vLLM was incompatible with TRL GRPO generation (EOS bug, weight sync issues). GRPO now uses HuggingFace native generation exclusively.
   - Removed `vllm` from `requirements.txt`
   - Removed all `--use_vllm`, `--vllm_gpu_memory_utilization`, `--vllm_max_model_length`, `--vllm_enable_sleep_mode` flags from stage 4a/4b scripts
@@ -59,6 +52,12 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - Root cause: `GRPODataset` put images in a standalone `"image"` key, but TRL 1.5.1 GRPOTrainer expects images embedded in message content as `{"type": "image", "image": <PIL>}` blocks. Images were silently ignored → model generated without visual input → all rewards 0.
   - Fix: Updated `GRPODataset.__getitem__` to embed images in user message content using TRL's multimodal format.
   - File: `src/data/datasets/grpo_dataset.py`
+
+- **GRPO monkey-patches still required under TRL 1.6.0**
+  - A minimal verification run without `src/training/grpo_fixes.py` appeared to pass, but full-scale training later failed with `ValueError: Image features and image tokens do not match, tokens: 769, features: 768` at step 2542/5000.
+  - Root cause: the model occasionally emits an extra image/video pad token in the completion, creating a mismatch between the number of image tokens and the pre-computed `pixel_values` / `image_grid_thw` features.
+  - Fix: Restored `src/training/grpo_fixes.py`, `tests/test_grpo_fixes.py`, and the `apply_grpo_fixes(GRPOTrainer)` calls in `scripts/run_stage4a_grpo_box.py` and `scripts/run_stage4b_grpo_point.py`.
+  - Note: the small-scale verification script was removed; the only reliable test is the full training run.
 
 - **GRPO format_reward incompatible with Qwen3-VL chat template**
   - Root cause: Qwen3-VL-Thinking chat template prepends `<think>` to the prompt, so GRPO completions only contain `</think>` (not `<think>`). `format_reward` required both → always failed → 0.2 reward lost.

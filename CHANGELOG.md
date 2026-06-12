@@ -24,6 +24,13 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Removed
 
+- **`src/training/grpo_fixes.py` and related monkey-patches removed** — After upgrading to `trl>=1.6.0` and switching back to HuggingFace native generation, the multimodal alignment monkey-patches are no longer needed. Verification script `scripts/verify_grpo_fixes_removable.py` confirmed that training completes without the target errors (`Image features and image tokens do not match`, `mm_token_type_ids` shape mismatch) when the patches are disabled.
+  - Deleted `src/training/grpo_fixes.py`
+  - Deleted `tests/test_grpo_fixes.py`
+  - Deleted verification script `scripts/verify_grpo_fixes_removable.py`
+  - Removed `apply_grpo_fixes()` imports and calls from `scripts/run_stage4a_grpo_box.py` and `scripts/run_stage4b_grpo_point.py`
+  - `src/training/grpo_utils.py` is kept because TRL 1.6.0 still decodes completions with `skip_special_tokens=True`, which would strip `<|box|>`/`<|point|>` visual primitive tokens. Re-decoding from `completion_ids` with `skip_special_tokens=False` is still required.
+
 - **vLLM dependency removed** — vLLM was incompatible with TRL GRPO generation (EOS bug, weight sync issues). GRPO now uses HuggingFace native generation exclusively.
   - Removed `vllm` from `requirements.txt`
   - Removed all `--use_vllm`, `--vllm_gpu_memory_utilization`, `--vllm_max_model_length`, `--vllm_enable_sleep_mode` flags from stage 4a/4b scripts

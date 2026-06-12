@@ -23,7 +23,6 @@ import torch
 from trl import GRPOConfig, GRPOTrainer
 
 from src.data.datasets.grpo_dataset import GRPODataset
-from src.training.grpo_fixes import apply_grpo_fixes
 from src.training.grpo_utils import extract_completion_text
 from src.data.generators.coco_box_generator import generate_coco_box_samples
 from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
@@ -145,10 +144,6 @@ def main(args):
 
     num_rounds = args.num_rounds
     iou_thresholds = [0.3, 0.5, 0.7]
-
-    # Apply monkey-patches once, before training. Applying inside the round loop
-    # would nest wrappers on each iteration.
-    apply_grpo_fixes(GRPOTrainer)
 
     for round_idx in range(num_rounds):
         iou_th = iou_thresholds[round_idx] if round_idx < len(iou_thresholds) else 0.7

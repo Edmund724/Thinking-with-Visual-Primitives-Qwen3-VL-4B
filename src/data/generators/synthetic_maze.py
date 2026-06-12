@@ -247,11 +247,9 @@ def _build_maze_thinking_3step(grounding_log: str, solvable: bool) -> str:
         "No path to the destination exists."
     )
     return (
-        f"<think>\n"
         f"Intent Analysis: {intent}\n"
         f"Grounding: {grounding_log}\n"
-        f"Summarization: {summarization}\n"
-        f"</think>"
+        f"Summarization: {summarization}"
     )
 
 

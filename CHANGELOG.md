@@ -12,7 +12,7 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - `transformers`: 4.49.0 → 5.10.2 (major version bump)
   - `accelerate`: 1.2.0 → 1.13.0
   - `peft`: 0.14.0 → 0.19.1
-  - `trl`: 0.15.0 → 1.5.1 (major version bump)
+  - `trl`: 0.15.0 → 1.6.0 (major version bump)
   - `bitsandbytes`: 0.45.0 → 0.49.2
   - `flash-attn`: 2.7.0 → 2.8.3
   - `datasets`: 3.0.0 → 4.8.5 (major version bump)
@@ -22,13 +22,12 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - `huggingface-hub`: 0.27.0 → 1.18.0 (major version bump)
   - CUDA install target: cu124 → cu130
 
-### Added
+### Removed
 
-- **vLLM integration for GRPO acceleration**
-  - New dependency: `vllm>=0.22.0` (optional, for GRPO generation acceleration)
-  - Stage 4a/4b GRPO scripts now support `--use_vllm`, `--vllm_gpu_memory_utilization`, `--vllm_max_model_length`, `--vllm_enable_sleep_mode` flags
-  - vLLM uses `colocate` mode for single-GPU training
-  - Updated README.md and README_zh.md with vLLM installation and usage instructions
+- **vLLM dependency removed** — vLLM was incompatible with TRL GRPO generation (EOS bug, weight sync issues). GRPO now uses HuggingFace native generation exclusively.
+  - Removed `vllm` from `requirements.txt`
+  - Removed all `--use_vllm`, `--vllm_gpu_memory_utilization`, `--vllm_max_model_length`, `--vllm_enable_sleep_mode` flags from stage 4a/4b scripts
+  - Removed vLLM parameters from `GRPOConfig` in both scripts
 
 ### Fixed
 
@@ -49,69 +48,49 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - Fix 2: In `_generate`, strip generated image/video pad tokens from `completion_ids` to prevent orphan image tokens (no matching `pixel_values` features) from causing `ValueError: Image features and image tokens do not match`.
   - File: `src/training/grpo_fixes.py`
 
-### Changed
+- **GRPO image not passed to model (critical)**
+  - Root cause: `GRPODataset` put images in a standalone `"image"` key, but TRL 1.5.1 GRPOTrainer expects images embedded in message content as `{"type": "image", "image": <PIL>}` blocks. Images were silently ignored → model generated without visual input → all rewards 0.
+  - Fix: Updated `GRPODataset.__getitem__` to embed images in user message content using TRL's multimodal format.
+  - File: `src/data/datasets/grpo_dataset.py`
 
-- **`scripts/run_stage4b_grpo_point.py`**
-  - Added vLLM acceleration options: `--use_vllm`, `--vllm_gpu_memory_utilization`, `--vllm_max_model_length`, `--vllm_enable_sleep_mode`
-  - Adjusted defaults for **24GB VRAM**:
-    - `batch_size`: 1 → 2
-    - `gradient_accumulation_steps`: 4 → 6 (keeps effective batch ~12)
-    - `num_generations`: 5 → 3
-    - `max_completion_length`: 1024 → 512
-  - `gradient_checkpointing=False` (required for vLLM compatibility)
+- **GRPO format_reward incompatible with Qwen3-VL chat template**
+  - Root cause: Qwen3-VL-Thinking chat template prepends `<think>` to the prompt, so GRPO completions only contain `</think>` (not `<think>`). `format_reward` required both → always failed → 0.2 reward lost.
+  - Fix: Updated `format_reward` to accept completions with only `</think>`.
+  - File: `src/utils/metrics.py`
 
-- **`scripts/run_stage4a_grpo_box.py`**
-  - Same vLLM options and default parameter adjustments as stage4b
-  - Changed `gradient_checkpointing=True` → `False` (vLLM incompatible)
+- **GRPO reward function: added length penalty to fix zero within-group variance**
+  - Root cause: reward function (`compute_total_reward`) was completely insensitive to completion length. Model had no incentive to generate EOS, so all completions were clipped at `max_completion_length`. Within each group, rewards were nearly identical → `frac_reward_zero_std≈1` → GRPO Advantage≈0 → near-zero loss.
+  - Fix: Added two length penalties in `compute_total_reward`:
+    1. **Truncation penalty (-0.15)**: if completion length ≥ 95% of max limit, penalize (model failed to stop naturally).
+    2. **General length penalty**: if completion exceeds 1.5× target length, apply linear penalty up to -0.1.
+  - Files: `src/utils/metrics.py`, `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
+
+- **GRPO max_completion_length increased 512 → 768 → 1024**
+  - Maze GT data reaches ~447 tokens; 512 left almost no safety margin for early-training verbosity.
+  - 1024 gives sufficient breathing room.
+  - Files: `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
+
+- **GRPO VRAM growth / repeated OOM kills during long runs**
+  - Root cause 1: `apply_grpo_fixes()` was called inside the per-round loop, causing the monkey-patches to wrap themselves every round. The nested wrappers and accidental in-place mutation of `input_ids` could increase memory pressure and corrupt reused tensors.
+  - Root cause 2: TRL GRPO with Qwen3-VL is known to fragment CUDA memory because generated completions vary in length (`max_completion_length` up to 1024). Fragmentation causes the allocator to reserve more and more memory over thousands of steps until the process is OOM-killed.
+  - Fix:
+    1. Made `apply_grpo_fixes()` idempotent and moved the call outside the round loop in `scripts/run_stage4a_grpo_box.py` and `scripts/run_stage4b_grpo_point.py`.
+    2. In `_patch_get_per_token_logps_and_entropies`, clone `input_ids` before truncating orphan image/video pad tokens instead of mutating the caller's tensor in-place.
+    3. Added explicit cleanup between rounds: `del trainer`, `del policy_model`, `gc.collect()`, `clear_memory()`.
+    4. Added `GPUMemoryMonitor` callback to each `GRPOTrainer` so the cache is aggressively cleared when allocated memory exceeds the configured threshold.
+    5. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` at the top of both scripts to reduce fragmentation.
+  - Files: `src/training/grpo_fixes.py`, `scripts/run_stage4a_grpo_box.py`, `scripts/run_stage4b_grpo_point.py`
 
 ### Added
 
+- **Round 内 checkpoint-* 断点续训**
+  - 之前脚本只在整轮完成后跳过，round 内中途 OOM 会从头重跑。现在每轮开始前会自动查找 `round_N/checkpoint-*` 中 step 最大的目录：
+    - 存在 checkpoint：从该 checkpoint 加载 policy model 和 processor，并把路径传给 `trainer.train(resume_from_checkpoint=...)` 恢复 optimizer / scheduler / rng / trainer_state。
+    - 不存在 checkpoint：按原逻辑从上一轮（或 stage3 SFT）初始化。
+  - 由于 checkpoint 里同时保存了 `default`（当前策略）和 `ref/`（参考策略）两个 PEFT adapter，`resume_from_checkpoint` 会把两者都恢复，GRPO 的 KL 参考点不会错位。
+  - 文件：`scripts/run_stage4a_grpo_box.py`、`scripts/run_stage4b_grpo_point.py`
+
 - `src/training/grpo_fixes.py` — Monkey-patch module for TRL GRPOTrainer multimodal alignment
-- **Safety protection for vLLM LoRA merge/unmerge** — Added `unmerge_adapter()` guard before `trainer.save_model()` in both stage4a/4b scripts to prevent saving potentially merged (polluted) weights if vLLM weight sync was interrupted.
-
-### Fixed
-
-- **GRPO reward function: added length penalty to fix zero within-group variance**
-  - Root cause: reward function (`compute_total_reward`) was completely insensitive to completion length. Model had no incentive to generate EOS, so all completions were clipped at `max_completion_length=512`. Within each group of 3 completions, rewards were nearly identical → `frac_reward_zero_std≈1` → GRPO Advantage≈0 → near-zero loss.
-  - Fix: Added two length penalties in `compute_total_reward`:
-    1. **Truncation penalty (-0.4)**: if completion length ≥ 95% of max limit, penalize heavily (model failed to stop naturally).
-    2. **General length penalty**: if completion exceeds 1.5× target length (point: ~80, box: ~150, maze: ~300 tokens), apply linear penalty up to -0.15.
-  - Updated `make_point_reward_fn` and `make_box_reward_fn` to pass actual `completion_length` (from `completion_ids`) and `max_completion_length` to `compute_total_reward`.
-  - Files: `src/utils/metrics.py`, `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
-
-- **GRPO reward function: fixed gradient explosion & KL collapse**
-  - Problem: Initial `-0.4` truncation penalty was too aggressive. All completions were still clipped at 512, so every completion in a group got the same penalty → `frac_reward_zero_std` stayed ~0.9 → massive uniform negative advantage → grad_norm exploded to 7872, KL diverged to 104.
-  - Fix 1: Reduced truncation penalty `-0.4 → -0.15`.
-  - Fix 2: Added **not-truncated bonus `+0.2`** — gives the model a positive signal when it learns to stop naturally.
-  - Fix 3: Reduced general length penalty cap `0.15 → 0.1`.
-  - Fix 4: Hyperparameter changes to stabilize training:
-    - `learning_rate`: `1e-6 → 5e-7`
-    - `beta` (KL penalty coeff): `0.04 → 0.1`
-    - `temperature`: `1.0 → 1.2`
-  - Files: `src/utils/metrics.py`, `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
-
-- **GRPO max_completion_length increased 512 → 768**
-  - Maze GT data reaches ~447 tokens; 512 left almost no safety margin for early-training verbosity. Model frequently hit the limit, got truncated, then punished — creating a vicious cycle.
-  - 768 gives ~300 tokens of breathing room while length penalties still encourage conciseness.
-  - Files: `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
-
-- **Training speed optimization: batch_size doubled + gradient checkpointing re-enabled**
-  - `batch_size`: `2 → 4`
-  - `gradient_accumulation_steps`: `6 → 3`
-  - `gradient_checkpointing`: `False → True` (was disabled for vLLM compatibility)
-  - Result: effective batch size stays 12, but total steps halved from 1750 to 875 per epoch. Estimated time per round drops from ~36h to ~18h.
-  - Removed all vLLM parameters from GRPOConfig (vLLM is confirmed incompatible with TRL 1.5.1).
-  - Installed `liger-kernel` for potential additional speedup (can enable `use_liger_kernel=True` in GRPOConfig if compatible with Qwen3-VL).
-  - Files: `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
-
-- **Fixed vLLM 0.22.1 EOS bug causing 100% max-length completions**
-  - Root cause: vLLM 0.22.1 + TRL 1.5.1 incompatibility — `SamplingParams` does not automatically pick up the model's EOS token, so vLLM ignores `<|im_end|>` and generates to `max_completion_length` every time. This killed within-group variance (all completions same length → same truncation penalty → `frac_reward_zero_std≈1`) and made GRPO fail to learn.
-  - Fix: Added `generation_kwargs={"stop_token_ids": [processor.tokenizer.eos_token_id]}` to `GRPOConfig` in both stage4a/4b scripts. This explicitly passes the EOS token ID to vLLM's `SamplingParams`, forcing generation to stop at `<|im_end|>`.
-  - Verified: Without vLLM (native generation), `clipped_ratio` drops to 0 and `frac_reward_zero_std` drops to ~0.3 within 50 steps, confirming vLLM was the culprit.
-  - Also reverted `beta` from `0.1` back to `0.04` (the gradient explosion was caused by the vLLM EOS bug, not beta being too small).
-  - Files: `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
-
-- Diagnostic scripts (removed after debugging):
-  - `diagnose_tokenization.py`
-  - `diagnose_tokenization2.py`
-  - `test_grpo_fix.py`
+  - Fix 1: Rebuild `mm_token_type_ids` from actual `input_ids` to fix padding direction mismatch.
+  - Fix 2: Strip orphan image/video pad tokens from `completion_ids`.
+  - Fix 3: Log first completion every 5 steps for monitoring.

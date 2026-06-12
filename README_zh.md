@@ -45,13 +45,13 @@
 
 | 包 | 最低版本 |
 |----|---------|
-| PyTorch | 2.6.0 |
-| transformers | 4.49.0 |
-| flash-attn | 2.7.0+ (自动 fallback 到 eager) |
-| bitsandbytes | 0.45.0 |
-| accelerate | 1.2.0 |
-| peft | 0.14.0 |
-| trl | 0.15.0 |
+| PyTorch | 2.11.0 |
+| transformers | 5.10.0 |
+| flash-attn | 2.8.0+ (自动 fallback 到 eager) |
+| bitsandbytes | 0.49.0 |
+| accelerate | 1.13.0 |
+| peft | 0.19.0 |
+| trl | 1.6.0 |
 
 ---
 
@@ -64,8 +64,8 @@
 conda create -n tvp python=3.12 -y
 conda activate tvp
 
-# 安装 PyTorch (CUDA 12.4+)
-pip install torch>=2.6.0 torchvision>=0.21.0 --index-url https://download.pytorch.org/whl/cu124
+# 安装 PyTorch (CUDA 13.0+)
+pip install torch>=2.11.0 torchvision>=0.26.0 --index-url https://download.pytorch.org/whl/cu130
 
 # 安装其他依赖
 pip install -r requirements.txt
@@ -103,14 +103,14 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 Stage 1:  Text Pretrain          文本-only embedding 初始化               ~1.5h  ✅
 Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~14h   ✅
 Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~18s   ✅
-Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~9.5h  ✅
-Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8h    ✅
+Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~4.2h  ✅
+Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8.5h  ✅ (含 resume)
 Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
 Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
 Stage 5:  Unified RFT            专家生成 rollout → Unified 学习         ~5h    (预计)
 Stage 6:  OPD                    On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
                               ──────────────────────────────────────────────
-                              Total:                                     ~80h
+                              Total（已实测部分）:                         ~52h
 ```
 
 **核心设计**：
@@ -172,7 +172,7 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **实测数据**: 40000 样本 (25K general + 15K box)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5000 步，~7.07s/step，耗时 **~9h37min**。
+> **实测数据**: 40000 样本 (25K general + 15K box)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5000 步，~3.0s/step，耗时 **~4h12min**。
 >
 > **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
 
@@ -185,7 +185,7 @@ python scripts/run_stage3a_sft_box.py \
 
 ### Stage 3b: Point Expert SFT ✅
 
-> **实测数据**: 85000 样本 (25K general + 10K point + 50K maze)，1 epoch，batch_size=4, grad_accum=2 (有效 batch=8)，lr=1e-4，10625 步，耗时 **~8h** (含 resume)。
+> **实测数据**: 85000 样本 (25K general + 10K point + 50K maze)，1 epoch，batch_size=4, grad_accum=2 (有效 batch=8)，lr=1e-4，10625 步，~2.9s/step，耗时 **~8.5h** (含 resume)。
 > 
 > 训练中途曾因显存碎片化导致速度从 3s/it 降至 30s/it，通过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` resume 后恢复正常。
 

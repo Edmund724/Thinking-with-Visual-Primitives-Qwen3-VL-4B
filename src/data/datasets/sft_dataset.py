@@ -68,11 +68,20 @@ class SFTDataset(Dataset):
             {"role": "user", "content": user_content},
         ]
 
+        # Clean reasoning: remove existing <think> tags to avoid nesting with chat template
+        reasoning = sample.get("reasoning", "")
+        if reasoning.startswith("<think>"):
+            reasoning = reasoning[len("<think>"):].lstrip("\n")
+        if reasoning.endswith("<"):
+            reasoning = reasoning[:-1].rstrip()
+        if reasoning.startswith("<"):
+            reasoning = reasoning[1:].lstrip()
+
         full_messages = prompt_messages + [
             {
                 "role": "assistant",
                 "content": f"The answer is {sample['answer']}.",
-                "reasoning_content": sample["reasoning"],
+                "reasoning_content": reasoning,
             },
         ]
 

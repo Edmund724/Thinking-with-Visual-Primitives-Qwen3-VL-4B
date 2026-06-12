@@ -5,11 +5,16 @@ Continues training the Box Expert LoRA adapter with GRPO on box-only data.
 Uses Format RM + Accuracy RM with difficulty grading (Normal only).
 """
 
+import os
+
+# Mitigate CUDA memory fragmentation from variable-length GRPO completions.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
+import gc
 import logging
 import pickle
 import sys
-import os
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,30 +23,63 @@ import torch
 from trl import GRPOConfig, GRPOTrainer
 
 from src.data.datasets.grpo_dataset import GRPODataset
+from src.training.grpo_fixes import apply_grpo_fixes
+from src.training.grpo_utils import extract_completion_text
 from src.data.generators.coco_box_generator import generate_coco_box_samples
-from src.models.qwen_vl_loader import load_qlora_model
-from src.training.memory_utils import log_memory_status
+from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
+from src.training.memory_utils import log_memory_status, clear_memory, GPUMemoryMonitor
+from src.utils.constants import GPU_MEMORY_WARNING_GB
 from src.utils.logging_utils import setup_logging
 from src.utils.metrics import compute_total_reward
 
 logger = setup_logging(log_file="logs/stage4a_grpo_box.log")
 
 
-def make_box_reward_fn(iou_threshold: float):
+def _latest_checkpoint(round_dir: Path) -> Path | None:
+    """Return the latest checkpoint-* directory inside a round dir, or None."""
+    checkpoints = [p for p in round_dir.glob("checkpoint-*") if p.is_dir()]
+    if not checkpoints:
+        return None
+
+    def _step(p: Path) -> int:
+        try:
+            return int(p.name.split("-")[-1])
+        except ValueError:
+            return -1
+
+    return max(checkpoints, key=_step)
+
+
+def make_box_reward_fn(iou_threshold: float, tokenizer=None):
     """Factory: box-only reward with Format RM + Box Accuracy RM + difficulty grading."""
 
     def grpo_reward(completions, prompts=None, **kwargs):
+        # Support both training format (inputs=dict list) and test format (separate kwargs)
         inputs = kwargs.get("inputs", [])
+        gt_texts = kwargs.get("gt_text", [])
+        completion_ids_list = kwargs.get("completion_ids", [])
+
         rewards = []
         for i, completion in enumerate(completions):
-            if i >= len(inputs):
+            # Get gt_text from either format
+            if i < len(inputs):
+                gt_text = inputs[i].get("gt_text", "")
+            elif i < len(gt_texts):
+                gt_text = gt_texts[i]
+            else:
                 rewards.append(0.0)
                 continue
-            inp = inputs[i]
+
+            # Extract completion text: prefer re-decoding from IDs (preserves special tokens)
+            comp_id = completion_ids_list[i] if i < len(completion_ids_list) else None
+            pred_text = extract_completion_text(
+                completion, tokenizer=tokenizer, completion_id=comp_id
+            )
+
             try:
                 total = compute_total_reward(
-                    pred_text=completion,
-                    gt_text=inp["gt_text"],
+                    pred_text=pred_text,
+                    gt_text=gt_text,
                     task_type="box",
                     iou_threshold=iou_threshold,
                 )
@@ -51,7 +89,8 @@ def make_box_reward_fn(iou_threshold: float):
                 else:
                     # Easy: small reward (already perfect), Hard: zero
                     rewards.append(0.1 if total["difficulty"] == "easy" else 0.0)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Reward computation failed for sample {i}: {e}")
                 rewards.append(0.0)
         return rewards
 
@@ -107,6 +146,10 @@ def main(args):
     num_rounds = args.num_rounds
     iou_thresholds = [0.3, 0.5, 0.7]
 
+    # Apply monkey-patches once, before training. Applying inside the round loop
+    # would nest wrappers on each iteration.
+    apply_grpo_fixes(GRPOTrainer)
+
     for round_idx in range(num_rounds):
         iou_th = iou_thresholds[round_idx] if round_idx < len(iou_thresholds) else 0.7
         round_dir = Path(args.output_dir) / f"round_{round_idx + 1}"
@@ -132,7 +175,25 @@ def main(args):
         logger.info(f"GRPO Round {round_idx + 1}/{num_rounds} (IoU threshold: {iou_th})")
         logger.info(f"{'='*60}")
 
-        reward_fn = make_box_reward_fn(iou_th)
+        # If this round was interrupted, resume from the latest checkpoint-*
+        # instead of restarting the whole round.
+        resume_from = _latest_checkpoint(round_dir)
+        if resume_from is not None:
+            logger.info(
+                f"Found checkpoint {resume_from.name} for round {round_idx + 1}, resuming."
+            )
+            try:
+                policy_model, processor = load_qlora_model(
+                    model_name=str(resume_from),
+                    lora_r=args.lora_r,
+                    lora_alpha=args.lora_alpha,
+                )
+                log_memory_status(f"Loaded checkpoint {resume_from.name}:")
+            except Exception as e:
+                logger.warning(f"Could not load checkpoint {resume_from}: {e}, starting from scratch.")
+                resume_from = None
+
+        reward_fn = make_box_reward_fn(iou_th, tokenizer=processor.tokenizer)
 
         grpo_config = GRPOConfig(
             output_dir=str(round_dir),
@@ -163,20 +224,40 @@ def main(args):
 
         dataset = GRPODataset(all_data)
 
+        # use_cache is incompatible with gradient checkpointing; disable on all nested configs
+        _set_use_cache_deep(policy_model)
+
+        # Memory monitor threshold: 85% of total VRAM (5090D = ~27 GB) so we
+        # clear cache before fragmentation pushes us into OOM territory.
+        total_vram_gb = (
+            torch.cuda.get_device_properties(0).total_memory / 1e9
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        mem_threshold_gb = max(GPU_MEMORY_WARNING_GB, total_vram_gb * 0.85)
+
         trainer = GRPOTrainer(
             model=policy_model,
             reward_funcs=[reward_fn],
             args=grpo_config,
             train_dataset=dataset,
             processing_class=processor,
+            callbacks=[GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb)],
         )
 
         logger.info("Training GRPO...")
-        trainer.train()
+        trainer.train(resume_from_checkpoint=str(resume_from) if resume_from is not None else None)
         trainer.save_model(str(round_dir))
         processor.save_pretrained(str(round_dir))
 
         log_memory_status(f"Round {round_idx + 1} complete:")
+
+        # Explicitly free the trainer + old model before reloading to avoid
+        # carrying fragmented/accumulated memory into the next round.
+        del trainer
+        del policy_model
+        gc.collect()
+        clear_memory()
 
         # Reload for next round
         try:
@@ -210,7 +291,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--num_generations", type=int, default=5)
-    parser.add_argument("--max_completion_length", type=int, default=1024)
+    parser.add_argument("--max_completion_length", type=int, default=512)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--temperature", type=float, default=1.0)
     args = parser.parse_args()

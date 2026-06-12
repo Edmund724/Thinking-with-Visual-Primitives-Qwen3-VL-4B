@@ -51,22 +51,19 @@ def _build_thinking_3step(
     grounding_parts: List[str],
     summarization: str,
 ) -> str:
-    """Build 3-step thinking content.
+    """Build 3-step thinking content (raw text, no <think> tags).
 
+    The chat template will wrap this in <think>...</think> automatically.
     Format:
-        <think>
         Intent Analysis: {intent}
         Grounding: {grounding}
         Summarization: {summary}
-        </think>
     """
     grounding = " ".join(grounding_parts) if grounding_parts else "No objects detected."
     return (
-        f"<think>\n"
         f"Intent Analysis: {intent}\n"
         f"Grounding: {grounding}\n"
-        f"Summarization: {summarization}\n"
-        f"</think>"
+        f"Summarization: {summarization}"
     )
 
 

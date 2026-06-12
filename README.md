@@ -45,13 +45,13 @@ Since 24GB VRAM cannot accommodate online multi-rollout training for a 284B MoE 
 
 | Package | Minimum Version |
 |---------|----------------|
-| PyTorch | 2.6.0 |
-| transformers | 4.49.0 |
-| flash-attn | 2.7.0+ (auto fallback to eager) |
-| bitsandbytes | 0.45.0 |
-| accelerate | 1.2.0 |
-| peft | 0.14.0 |
-| trl | 0.15.0 |
+| PyTorch | 2.11.0 |
+| transformers | 5.10.0 |
+| flash-attn | 2.8.0+ (auto fallback to eager) |
+| bitsandbytes | 0.49.0 |
+| accelerate | 1.13.0 |
+| peft | 0.19.0 |
+| trl | 1.6.0 |
 
 ---
 
@@ -64,8 +64,8 @@ Since 24GB VRAM cannot accommodate online multi-rollout training for a 284B MoE 
 conda create -n tvp python=3.12 -y
 conda activate tvp
 
-# Install PyTorch (CUDA 12.4+)
-pip install torch>=2.6.0 torchvision>=0.21.0 --index-url https://download.pytorch.org/whl/cu124
+# Install PyTorch (CUDA 13.0+)
+pip install torch>=2.11.0 torchvision>=0.26.0 --index-url https://download.pytorch.org/whl/cu130
 
 # Install other dependencies
 pip install -r requirements.txt
@@ -103,14 +103,14 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 Stage 1:  Text Pretrain          Text-only embedding initialization           ~1.5h  ✅
 Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~14h   ✅
 Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~18s   ✅
-Stage 3a: Box Expert SFT         70% general + 30% Box-specific SFT           ~9.5h  ✅
-Stage 3b: Point Expert SFT       70% general + 30% Point+Maze SFT            ~8h    ✅
+Stage 3a: Box Expert SFT         70% general + 30% Box-specific SFT           ~4.2h  ✅
+Stage 3b: Point Expert SFT       70% general + 30% Point+Maze SFT            ~8.5h  ✅ (including resume)
 Stage 4a: Box Expert GRPO        Box expert GRPO (3 rounds, default)          ~6h    (est.)
 Stage 4b: Point Expert GRPO      Point expert GRPO (3 rounds, default)        ~6h    (est.)
 Stage 5:  Unified RFT            Expert-generated rollouts → Unified learning ~5h    (est.)
 Stage 6:  OPD                    On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
                               ──────────────────────────────────────────────
-                              Total:                                     ~80h
+                              Total (measured):                           ~52h
 ```
 
 **Core Design**:
@@ -172,7 +172,7 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **Benchmark**: 40000 samples (25K general + 15K box), 1 epoch, batch_size=1, grad_accum=8 (effective batch=8), lr=1e-4, 5000 steps, ~7.07s/step, duration **~9h37min**.
+> **Benchmark**: 40000 samples (25K general + 15K box), 1 epoch, batch_size=1, grad_accum=8 (effective batch=8), lr=1e-4, 5000 steps, ~3.0s/step, duration **~4h12min**.
 >
 > **Note**: Stage 3a does not enable data caching (pickle cache) to preserve accurate timing data. From Stage 3b onward, all scripts support training data pickle caching — auto-saved on first run, loaded directly on subsequent runs.
 
@@ -185,7 +185,7 @@ python scripts/run_stage3a_sft_box.py \
 
 ### Stage 3b: Point Expert SFT ✅
 
-> **Benchmark**: 85000 samples (25K general + 10K point + 50K maze), 1 epoch, batch_size=4, grad_accum=2 (effective batch=8), lr=1e-4, 10625 steps, duration **~8h** (including resume).
+> **Benchmark**: 85000 samples (25K general + 10K point + 50K maze), 1 epoch, batch_size=4, grad_accum=2 (effective batch=8), lr=1e-4, 10625 steps, ~2.9s/step, duration **~8.5h** (including resume).
 >
 > Mid-training VRAM fragmentation once caused speed degradation from 3s/it to 30s/it, resolved by resuming with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 

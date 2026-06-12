@@ -574,7 +574,9 @@ def format_reward(text: str) -> dict:
     # 1. Check <think> tags
     think_open = text.count("<think>")
     think_close = text.count("</think>")
-    has_think = think_open == 1 and think_close == 1
+    # Qwen3-VL chat template prepends <think> to prompt;
+    # GRPO completions only have </think> — accept that too.
+    has_think = (think_open == 1 and think_close == 1) or (think_close >= 1 and think_open == 0)
     details["has_think_tags"] = has_think
     if has_think:
         score += 0.2

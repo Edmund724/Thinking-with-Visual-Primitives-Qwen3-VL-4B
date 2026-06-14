@@ -7,20 +7,23 @@ Loads from merged Stage 2 base.
 Data ratio: 70% general + 30% visual primitives (20% maze + 10% point).
 """
 
+import os
+
+# Mitigate CUDA memory fragmentation from variable-length SFT completions.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
-import logging
 import pickle
 import random
 import sys
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from src.data.datasets.sft_dataset import SFTDataset
 from src.data.generators.coco_box_generator import generate_coco_point_samples
 from src.data.generators.synthetic_maze import generate_maze_dataset
+from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
@@ -56,9 +59,9 @@ def main(args):
         for d in all_data:
             d.pop("maze_grid", None)
     else:
-        logger.info("Generating training data (70% general + 30% point/maze)...")
+        logger.info("Generating training data (70% general + 30% point/maze/path)...")
 
-        # 10% point data (COCO object centers)
+        # Point data (COCO object centers)
         point_data = generate_coco_point_samples(
             image_dir=args.coco_image_dir,
             ann_file=args.coco_ann_file,
@@ -68,7 +71,7 @@ def main(args):
             d["task_type"] = "point"
         logger.info(f"  Point samples: {len(point_data)}")
 
-        # 20% maze data
+        # Maze data
         maze_data = generate_maze_dataset(
             n=args.num_maze,
             seed=42,
@@ -76,6 +79,16 @@ def main(args):
         for d in maze_data:
             d["task_type"] = "maze"
         logger.info(f"  Maze samples: {len(maze_data)}")
+
+        # Path tracing data
+        path_data = generate_path_tracing_dataset(
+            n=args.num_path,
+            seed=43,
+            cache_dir=os.path.join(args.output_dir, "path_tracing_cache"),
+        )
+        for d in path_data:
+            d["task_type"] = "point"
+        logger.info(f"  Path tracing samples: {len(path_data)}")
 
         # 70% general data (text-only pretrain data)
         general_data = []
@@ -96,7 +109,7 @@ def main(args):
                     "task_type": "general",
                 })
             # 70% of total = general, 30% = visual primitives
-            visual_count = len(point_data) + len(maze_data)
+            visual_count = len(point_data) + len(maze_data) + len(path_data)
             target_general = int(visual_count * 7 / 3)
             if len(general_data) > target_general:
                 general_data = general_data[:target_general]
@@ -104,7 +117,7 @@ def main(args):
         else:
             logger.warning(f"General data not found at {args.general_data_path}, using 100% visual")
 
-        all_data = general_data + point_data + maze_data
+        all_data = general_data + point_data + maze_data + path_data
         random.seed(42)
         random.shuffle(all_data)
         logger.info(f"Total training samples: {len(all_data)}")
@@ -153,7 +166,9 @@ if __name__ == "__main__":
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
     parser.add_argument("--num_point", type=int, default=10000)
-    parser.add_argument("--num_maze", type=int, default=50000)
+    parser.add_argument("--num_maze", type=int, default=40000)
+    parser.add_argument("--num_path", type=int, default=10000,
+                        help="Number of path tracing samples")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=1)

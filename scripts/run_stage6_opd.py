@@ -4,11 +4,11 @@
 Student = Unified RFT model (Stage 5 output)
 Experts = Box Expert + Point Expert (Stage 4 output, frozen teachers)
 
-For each sample:
-  1. Student generates response (on-policy)
-  2. Student and Expert forward on same sequence
-  3. Reverse KL: D_KL(student || expert)
-  4. Student LoRA updates to match expert distribution
+Following the paper (Sec 2.5.4), we distill from each expert separately:
+  1. Distill Box Expert on box-only data.
+  2. Distill Point Expert on point+maze data.
+
+Only one expert is kept in GPU memory at a time to avoid VRAM pressure.
 """
 
 import os
@@ -18,7 +18,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import gc
-import logging
+import glob
 import pickle
 import sys
 
@@ -39,6 +39,15 @@ from src.utils.logging_utils import setup_logging
 logger = setup_logging(log_file="logs/stage6_opd.log")
 
 
+def _latest_opd_checkpoint(output_dir: str):
+    """Return the latest checkpoint-* directory under output_dir, or None."""
+    ckpt_dirs = sorted(
+        glob.glob(os.path.join(output_dir, "checkpoint-*")),
+        key=lambda d: int(d.split("-")[-1]),
+    )
+    return ckpt_dirs[-1] if ckpt_dirs else None
+
+
 def main(args):
     logger.info("=" * 60)
     logger.info("Stage 6: OPD (Offline Preference Distillation)")
@@ -55,25 +64,7 @@ def main(args):
     )
     log_memory_status("Student loaded:")
 
-    # 2. Load Box Expert (frozen teacher)
-    logger.info(f"Loading Box Expert from {args.box_expert_path}...")
-    box_expert, _ = load_qlora_model(
-        model_name=args.box_expert_path,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-    )
-    log_memory_status("Box Expert loaded:")
-
-    # 3. Load Point Expert (frozen teacher)
-    logger.info(f"Loading Point Expert from {args.point_expert_path}...")
-    point_expert, _ = load_qlora_model(
-        model_name=args.point_expert_path,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-    )
-    log_memory_status("Point Expert loaded:")
-
-    # 4. Generate or load cached OPD training data
+    # 2. Generate or load cached OPD training data
     cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
     if os.path.exists(cache_path):
         logger.info(f"Loading cached training data from {cache_path}")
@@ -121,19 +112,32 @@ def main(args):
             pickle.dump(all_data, f)
         logger.info(f"Cached training data to {cache_path}")
 
-    # 5. Run OPD training
+    # Split by teacher routing
+    box_data = [d for d in all_data if d.get("task_type") == "box"]
+    point_data = [d for d in all_data if d.get("task_type") in ("point", "maze")]
+    logger.info(f"Routing: {len(box_data)} box samples, {len(point_data)} point/maze samples")
+
+    # Validate user-provided checkpoint if any
     resume_ckpt = args.resume_from_checkpoint
     if resume_ckpt and not os.path.isdir(resume_ckpt):
         logger.error(f"Checkpoint not found: {resume_ckpt}")
         sys.exit(1)
 
-    logger.info("Starting OPD training (reverse KL distillation)...")
+    # 3. Distill from Box Expert on box data
+    logger.info(f"Loading Box Expert from {args.box_expert_path}...")
+    box_expert, _ = load_qlora_model(
+        model_name=args.box_expert_path,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+    )
+    log_memory_status("Box Expert loaded:")
+
+    logger.info("Starting Box Expert distillation...")
     train_opd(
         student_model=student_model,
-        box_expert=box_expert,
-        point_expert=point_expert,
+        expert=box_expert,
         processor=processor,
-        train_data=all_data,
+        train_data=box_data,
         output_dir=args.output_dir,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
@@ -147,13 +151,54 @@ def main(args):
         logger=logger,
     )
 
-    # Release experts before saving final student to free VRAM
-    logger.info("Releasing expert models after OPD training...")
+    logger.info("Releasing Box Expert before loading Point Expert...")
     del box_expert
+    gc.collect()
+    clear_memory()
+    log_memory_status("Box Expert released:")
+
+    # Resume from the latest checkpoint produced by Box Expert distillation
+    box_ckpt = _latest_opd_checkpoint(args.output_dir)
+    if box_ckpt is not None:
+        logger.info(f"Will resume Point Expert distillation from {box_ckpt}")
+        point_resume = box_ckpt
+    else:
+        point_resume = None
+
+    # 4. Distill from Point Expert on point/maze data
+    logger.info(f"Loading Point Expert from {args.point_expert_path}...")
+    point_expert, _ = load_qlora_model(
+        model_name=args.point_expert_path,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+    )
+    log_memory_status("Point Expert loaded:")
+
+    logger.info("Starting Point Expert distillation...")
+    train_opd(
+        student_model=student_model,
+        expert=point_expert,
+        processor=processor,
+        train_data=point_data,
+        output_dir=args.output_dir,
+        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        per_device_batch_size=args.batch_size,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        warmup_steps=args.warmup_steps,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        resume_from_checkpoint=point_resume,
+        logger=logger,
+    )
+
+    # Release experts before saving final student to free VRAM
+    logger.info("Releasing Point Expert after OPD training...")
     del point_expert
     gc.collect()
     clear_memory()
-    log_memory_status("Expert models released:")
+    log_memory_status("Point Expert released:")
 
     # Save student model
     os.makedirs(args.output_dir, exist_ok=True)

@@ -4,13 +4,13 @@ import json
 import logging
 import os
 import random
-from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 from ..formatters.primitive_formatter import format_box, format_point, normalize_coordinate
+from ...utils.thinking_verifier import filter_verified_samples
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,59 @@ def bbox_to_normalized(bbox: List[float], img_w: int, img_h: int) -> Tuple[int, 
     x2 = normalize_coordinate(bbox[0] + bbox[2], img_w)
     y2 = normalize_coordinate(bbox[1] + bbox[3], img_h)
     return (x1, y1, x2, y2)
+
+
+def _filter_annotations_by_geometry(
+    anns: List[Dict],
+    img_w: int,
+    img_h: int,
+    max_area_ratio: float = 0.9,
+    min_area_ratio: float = 0.0001,
+    min_edge_pixels: int = 2,
+) -> List[Dict]:
+    """Filter out geometrically bad COCO annotations.
+
+    Rules (light-weight, suitable for small-scale data):
+      - Mega boxes: area > 90% of image area (often classification data
+        forced into detection format).
+      - Tiny boxes: area < 0.01% of image area (not visually meaningful).
+      - Degenerate boxes: width/height < 2 px.
+      - Strongly edge-touching boxes: box lies almost entirely on the image
+        border (touches two or more edges and spans >80% of that edge).
+    """
+    img_area = img_w * img_h
+    if img_area <= 0:
+        return []
+
+    filtered = []
+    for ann in anns:
+        x, y, w, h = ann.get("bbox", [0.0, 0.0, 0.0, 0.0])
+        if w <= 0 or h <= 0:
+            continue
+
+        area = w * h
+        area_ratio = area / img_area
+        if area_ratio > max_area_ratio:
+            continue
+        if area_ratio < min_area_ratio:
+            continue
+        if w < min_edge_pixels or h < min_edge_pixels:
+            continue
+
+        # Count how many edges the box touches
+        touches_left = x <= 0
+        touches_top = y <= 0
+        touches_right = (x + w) >= img_w
+        touches_bottom = (y + h) >= img_h
+        touch_count = sum([touches_left, touches_top, touches_right, touches_bottom])
+
+        # If it touches two or more edges and spans most of the image, drop it
+        if touch_count >= 2 and (w / img_w > 0.8 or h / img_h > 0.8):
+            continue
+
+        filtered.append(ann)
+
+    return filtered
 
 
 def _build_thinking_3step(
@@ -124,6 +177,11 @@ def generate_coco_box_samples(
         if not anns:
             continue
 
+        # Geometric quality filtering
+        anns = _filter_annotations_by_geometry(anns, img_w, img_h)
+        if not anns:
+            continue
+
         # Group by category
         cat_groups = {}
         for ann in anns:
@@ -195,7 +253,8 @@ def generate_coco_box_samples(
             "task_type": "box",
         })
 
-    logger.info(f"Generated {len(data)} COCO box samples from {len(valid_img_ids)} images")
+    data = filter_verified_samples(data, logger=logger)
+    logger.info(f"Generated {len(data)} verified COCO box samples from {len(valid_img_ids)} images")
     return data
 
 
@@ -245,6 +304,11 @@ def generate_coco_point_samples(
         if not anns:
             continue
 
+        # Geometric quality filtering
+        anns = _filter_annotations_by_geometry(anns, img_w, img_h)
+        if not anns:
+            continue
+
         # Pick one random annotation
         ann = random.choice(anns)
         cat_name = cat_map.get(ann["category_id"], "object")
@@ -273,7 +337,8 @@ def generate_coco_point_samples(
             "task_type": "point",
         })
 
-    logger.info(f"Generated {len(data)} COCO point samples from {len(valid_img_ids)} images")
+    data = filter_verified_samples(data, logger=logger)
+    logger.info(f"Generated {len(data)} verified COCO point samples from {len(valid_img_ids)} images")
     return data
 
 
@@ -323,4 +388,133 @@ def generate_synthetic_dense_counting(
             "task_type": "box",
         })
 
+    data = filter_verified_samples(data, logger=logger)
+    return data
+
+
+
+def generate_coco_counting_samples(
+    image_dir: str,
+    ann_file: str,
+    num_samples: int = 20000,
+    seed: int = 42,
+    min_instances: int = 3,
+    max_instances: int = 30,
+    target_categories: List[str] | None = None,
+) -> List[Dict]:
+    """Generate coarse-grained counting samples from COCO (paper Sec 2.4.1).
+
+    For each sample:
+      1. Pick an image and a target category that has >= min_instances boxes.
+      2. Prompt: "How many {category}s are in this image?"
+      3. Thinking: Intent Analysis → Batch Grounding (all boxes) → Summarization.
+      4. Answer: integer count.
+
+    This matches the paper's coarse-grained counting protocol: batch grounding
+    all candidate objects simultaneously, then tally.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    if not os.path.exists(ann_file):
+        logger.warning(f"COCO annotation file not found: {ann_file}. Returning empty list.")
+        return []
+
+    coco_data = load_coco_annotations(ann_file)
+    cat_map = build_category_map(coco_data)
+    name_to_cat = {name: cid for cid, name in cat_map.items()}
+    image_anns = build_image_annotations(coco_data)
+    images = {img["id"]: img for img in coco_data["images"]}
+
+    valid_img_ids = [img_id for img_id in images if img_id in image_anns]
+    if not valid_img_ids:
+        logger.warning("No valid images with annotations found.")
+        return []
+
+    if target_categories is None:
+        # COCO categories commonly suitable for dense counting
+        target_categories = [
+            "person", "car", "chair", "book", "bottle", "cup",
+            "orange", "apple", "bird", "cat", "dog",
+        ]
+
+    target_cat_ids = [
+        name_to_cat[name] for name in target_categories if name in name_to_cat
+    ]
+    if not target_cat_ids:
+        logger.warning("None of the target categories exist in COCO.")
+        return []
+
+    data = []
+    attempts = 0
+    max_attempts = num_samples * 10
+
+    while len(data) < num_samples and attempts < max_attempts:
+        attempts += 1
+        img_id = random.choice(valid_img_ids)
+        img_info = images[img_id]
+        img_w, img_h = img_info["width"], img_info["height"]
+
+        img_path = os.path.join(image_dir, img_info["file_name"])
+        if not os.path.exists(img_path):
+            continue
+
+        anns = image_anns[img_id]
+        if not anns:
+            continue
+
+        # Geometric quality filtering
+        anns = _filter_annotations_by_geometry(anns, img_w, img_h)
+        if not anns:
+            continue
+
+        # Group by category and keep only target categories with enough instances
+        cat_groups = {}
+        for ann in anns:
+            cat_id = ann["category_id"]
+            if cat_id not in target_cat_ids:
+                continue
+            cat_groups.setdefault(cat_id, []).append(ann)
+
+        dense_cats = [
+            cid for cid, anns in cat_groups.items()
+            if min_instances <= len(anns) <= max_instances
+        ]
+        if not dense_cats:
+            continue
+
+        cat_id = random.choice(dense_cats)
+        cat_name = cat_map.get(cat_id, "object")
+        cat_anns = cat_groups[cat_id]
+
+        boxes = [bbox_to_normalized(ann["bbox"], img_w, img_h) for ann in cat_anns]
+        count = len(boxes)
+
+        grounding_parts = [f"the {cat_name} is at {format_box([box])}" for box in boxes]
+        # Limit grounding parts to control sequence length while preserving count
+        if len(grounding_parts) > 12:
+            shown = grounding_parts[:6]
+            hidden = len(grounding_parts) - 6
+            grounding_parts = shown + [f"... and {hidden} more {cat_name}(s)"]
+
+        intent = f"I need to count all {cat_name}s in the image."
+        summarization = f"There are {count} {cat_name}(s) in total."
+        reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
+
+        prompt = f"How many {cat_name}s are in this image? Use <|box|> to mark each one."
+        answer = str(count)
+
+        data.append({
+            "image": img_path,
+            "prompt": prompt,
+            "reasoning": reasoning,
+            "answer": answer,
+            "task_type": "box",
+        })
+
+    data = filter_verified_samples(data, logger=logger)
+    logger.info(
+        f"Generated {len(data)} verified coarse-grained counting samples "
+        f"from {len(valid_img_ids)} images"
+    )
     return data

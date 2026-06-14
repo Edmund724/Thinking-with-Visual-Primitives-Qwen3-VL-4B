@@ -210,7 +210,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
 
 ### Stage 4a: Box Expert GRPO（默认 3 轮循环）
 
-> **注**：GRPO 采用多轮循环结构，每轮结束后模型会被 reload，轮间是天然断点。每轮本身应一次性跑完，不支持轮内 resume。若某轮中断，重跑时脚本会自动检测并跳过已完成的轮次，从中断处继续。
+> **注**：GRPO 采用多轮循环结构，每轮结束后模型会被 reload，轮间是天然断点。每轮本身应一次性跑完；若中途 OOM，脚本会自动查找最新的 `checkpoint-*` 并从中断处恢复。已完成的轮次在重跑时自动跳过。
+>
+> **显存提示**：所有 stage 脚本现已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，无需手动添加，可有效缓解长时间训练中的 CUDA 显存碎片化问题。
 
 ```bash
 python scripts/run_stage4a_grpo_box.py \
@@ -424,7 +426,7 @@ for name, path in stages.items():
 
 - **Box 任务**: IoU 匹配、漏检、格式合法性
 - **Point / Maze 任务**: L2 距离、撞墙检测 (Bresenham 采样)、回溯缺失检测
-- **通用**: 标签配对合法性 (`syntax_valid`)
+- **通用**: 标签配对合法性 (`syntax_valid`)、非拉丁文字惩罚、完成长度惩罚
 
 ```python
 from src.utils.metrics import process_reward
@@ -440,6 +442,26 @@ reward = process_reward(
 # 返回: answer_correct, syntax_valid, box_avg_iou, point_avg_dist,
 #       wall_collision_count, backtracking_missing, ...
 ```
+
+### 数据生成与质量控制
+
+除原始 COCO box/point 和合成迷宫外，训练流水线现己新增多种数据生成器，以扩展模型的推理能力：
+
+| 生成器 | 任务类型 | 描述 |
+|--------|---------|------|
+| `coco_box_generator.py` | Box / 计数 | COCO 边框 + 几何过滤（剔除超大/超小/退化/贴边框）+ 粗糙计数（3–30 个实例） |
+| `clevr_spatial.py` | 空间 VQA | 2D 合成场景（球/立方体/圆柱体），支持计数、存在性、空间计数、属性查询四类问题 |
+| `path_tracing.py` | Point | 缠绕的 Bézier 曲线，模型需追踪目标路径至终点；支持 uniform-color 模式迫使模型依赖曲率连续性 |
+| `synthetic_maze.py` | Point / Maze | 随机迷宫生成 + BFS 路径求解 |
+
+**Thinking-chain 验证器**（`thinking_verifier.py`）：所有生成器在生成后自动经过校验过滤，检查内容包括：
+- Tag 配对（`<|box|>`/`<|/box|>`、`<|point|>`/`<|/point|>`）
+- 坐标范围合法性（0–999）
+- 引用有效性（thinking 步骤引用的 primitive 真实存在）
+- Counting 答案与 primitive 数量一致性
+- 迷宫自相矛盾检测
+
+未通过任何一项检查的样本会在训练前被丢弃，确保 SFT 和 GRPO 的 cold-start 数据质量。
 
 ---
 
@@ -466,8 +488,10 @@ tvp-4b-5090d/
 │   │   │   ├── grpo_dataset.py       # GRPO 数据集
 │   │   │   └── image_loader.py       # Lazy image loading（防 OOM）
 │   │   ├── generators/
-│   │   │   ├── coco_box_generator.py # COCO → box/point 训练样本（3-step thinking）
+│   │   │   ├── coco_box_generator.py # COCO → box/point/counting 训练样本（3-step thinking + 几何过滤）
 │   │   │   ├── synthetic_maze.py     # 合成迷宫生成器（3-step thinking）
+│   │   │   ├── clevr_spatial.py      # CLEVR 风格 2D 空间 / VQA 生成器
+│   │   │   ├── path_tracing.py       # Bézier 曲线路径追踪生成器
 │   │   │   └── synthetic_path.py     # 合成路径生成器（暂未使用）
 │   │   └── formatters/
 │   │       └── primitive_formatter.py # 坐标标签格式化
@@ -476,11 +500,13 @@ tvp-4b-5090d/
 │   │   │   └── sft_trainer.py        # SFT Trainer 封装
 │   │   ├── pretrain_trainer.py       # Pretrain Trainer（仅训练 embedding）
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation 训练器
+│   │   ├── grpo_fixes.py             # GRPOTrainer 多模态猴补丁
 │   │   ├── callbacks.py              # 训练回调（内存监控）
 │   │   └── memory_utils.py           # GPU 显存工具
 │   └── utils/
 │       ├── constants.py              # 特殊 token / 超参常量
-│       ├── metrics.py                # Format RM + Accuracy RM + 难度分级
+│       ├── metrics.py                # Format RM + Accuracy RM + 难度分级 + 长度惩罚
+│       ├── thinking_verifier.py       # Thinking-chain 校验（tag 配对、坐标范围、引用检查）
 │       └── logging_utils.py          # 日志初始化
 ├── scripts/                          # 阶段入口脚本
 │   ├── generate_pretrain_data.py     # 预训练数据生成器
@@ -498,6 +524,8 @@ tvp-4b-5090d/
 │   ├── test_primitive_parser.py      # 坐标解析单元测试
 │   ├── test_metrics.py               # 奖励函数与几何工具测试
 │   ├── test_pretrain_format.py       # 预训练格式测试
+│   ├── test_grpo_fixes.py            # GRPO 猴补丁单元测试
+│   ├── test_grpo_reward_integration.py # GRPO 奖励集成测试
 │   └── test_logging_utils.py         # 日志工具测试
 ├── outputs/                          # 训练产物（按 stage 组织）
 │   ├── stage1_pretrain/              # embedding state_dict
@@ -593,9 +621,10 @@ pytest tests/ -v
 ## ⚠️ 已知限制
 
 1. **GRPO 在线 rollout 开销**: 单卡 24GB 下 `num_generations=5` 已是极限，如需更多 rollout 需要梯度累积或 offload。
-2. **Flash Attention 兼容性**: Blackwell (RTX 5090D) 对 flash-attn 2.7.0+ 支持仍在完善中，代码已内置 `eager` fallback。
+2. **Flash Attention 兼容性**: Blackwell (RTX 5090D) 对 flash-attn 2.8.0+ 支持仍在完善中，代码已内置 `eager` fallback。
 3. **COCO 数据**: 首次下载约 18GB，训练时按需读取。
 4. **本实现为复现**: 论文原始 pipeline 包含更多阶段和更大规模数据，本项目在单卡约束下做了精简。
+5. **vLLM 不支持**: vLLM 与 TRL GRPO + Qwen3-VL 不兼容，所有 GRPO 阶段均使用 HuggingFace 原生生成。
 
 ---
 

@@ -18,17 +18,19 @@ Data:
 After training: run scripts/merge_stage2.py to merge LoRA into base.
 """
 
+import os
+
+# Mitigate CUDA memory fragmentation from variable-length visual sequences.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
-import logging
 import random
 import sys
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from src.data.datasets.sft_dataset import SFTDataset
 from src.data.generators.coco_box_generator import (
     generate_coco_box_samples,
     generate_coco_point_samples,

@@ -7,18 +7,24 @@ Loads from merged Stage 2 base.
 Data ratio: 70% general + 30% box-only visual primitives.
 """
 
+import os
+
+# Mitigate CUDA memory fragmentation from variable-length SFT completions.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
-import logging
 import random
 import sys
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from src.data.datasets.sft_dataset import SFTDataset
-from src.data.generators.coco_box_generator import generate_coco_box_samples
+from src.data.generators.coco_box_generator import (
+    generate_coco_box_samples,
+    generate_coco_counting_samples,
+)
+from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
@@ -44,9 +50,9 @@ def main(args):
     log_memory_status("After model loading:")
 
     # 2. Generate training data
-    logger.info("Generating training data (70% general + 30% box)...")
+    logger.info("Generating training data (70% general + 30% box reasoning)...")
 
-    # 30% box data
+    # 30% specialized box-type visual primitive data
     box_data = generate_coco_box_samples(
         image_dir=args.coco_image_dir,
         ann_file=args.coco_ann_file,
@@ -54,7 +60,27 @@ def main(args):
     )
     for d in box_data:
         d["task_type"] = "box"
-    logger.info(f"  Box samples: {len(box_data)}")
+    logger.info(f"  Box localization samples: {len(box_data)}")
+
+    counting_data = generate_coco_counting_samples(
+        image_dir=args.coco_image_dir,
+        ann_file=args.coco_ann_file,
+        num_samples=args.num_counting,
+    )
+    for d in counting_data:
+        d["task_type"] = "box"
+    logger.info(f"  Coarse-grained counting samples: {len(counting_data)}")
+
+    clevr_data = generate_clevr_spatial_dataset(
+        n=args.num_clevr,
+        seed=44,
+        cache_dir=os.path.join(args.output_dir, "clevr_cache"),
+    )
+    for d in clevr_data:
+        d["task_type"] = "box"
+    logger.info(f"  CLEVR spatial/VQA samples: {len(clevr_data)}")
+
+    visual_data = box_data + counting_data + clevr_data
 
     # 70% general data (text-only pretrain data)
     general_data = []
@@ -75,14 +101,14 @@ def main(args):
                 "task_type": "general",
             })
         # Trim to ~70% ratio
-        target_general = int(len(box_data) * 7 / 3)
+        target_general = int(len(visual_data) * 7 / 3)
         if len(general_data) > target_general:
             general_data = general_data[:target_general]
         logger.info(f"  General samples: {len(general_data)}")
     else:
-        logger.warning(f"General data not found at {args.general_data_path}, using 100% box")
+        logger.warning(f"General data not found at {args.general_data_path}, using 100% visual")
 
-    all_data = general_data + box_data
+    all_data = general_data + visual_data
     random.seed(42)
     random.shuffle(all_data)
     logger.info(f"Total training samples: {len(all_data)}")
@@ -124,7 +150,11 @@ if __name__ == "__main__":
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_box", type=int, default=15000)
+    parser.add_argument("--num_box", type=int, default=10000)
+    parser.add_argument("--num_counting", type=int, default=10000,
+                        help="Number of coarse-grained counting samples")
+    parser.add_argument("--num_clevr", type=int, default=5000,
+                        help="Number of CLEVR-style spatial/VQA samples")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=1)

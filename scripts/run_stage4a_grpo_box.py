@@ -25,12 +25,21 @@ from trl import GRPOConfig, GRPOTrainer
 from src.data.datasets.grpo_dataset import GRPODataset
 from src.training.grpo_fixes import apply_grpo_fixes
 from src.training.grpo_utils import extract_completion_text
-from src.data.generators.coco_box_generator import generate_coco_box_samples
+from src.data.generators.coco_box_generator import (
+    generate_coco_box_samples,
+    generate_coco_counting_samples,
+)
+from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
 from src.training.memory_utils import log_memory_status, clear_memory, GPUMemoryMonitor
 from src.utils.constants import GPU_MEMORY_WARNING_GB
 from src.utils.logging_utils import setup_logging
-from src.utils.metrics import compute_total_reward, length_reward
+from src.utils.metrics import (
+    compute_total_reward,
+    filter_normal_level_data,
+    length_reward,
+    make_quality_reward_fn,
+)
 
 logger = logging.getLogger("stage4a_grpo_box")
 
@@ -127,7 +136,7 @@ def main(args):
             all_data = pickle.load(f)
         logger.info(f"  Loaded {len(all_data)} samples from cache")
     else:
-        logger.info("Generating GRPO training data (box-only)...")
+        logger.info("Generating GRPO training data (box + counting + spatial/VQA)...")
         all_data = []
 
         box_data = generate_coco_box_samples(
@@ -138,7 +147,27 @@ def main(args):
         for d in box_data:
             d["task_type"] = "box"
         all_data.extend(box_data)
-        logger.info(f"  Box samples: {len(box_data)}")
+        logger.info(f"  Box localization samples: {len(box_data)}")
+
+        counting_data = generate_coco_counting_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_counting,
+        )
+        for d in counting_data:
+            d["task_type"] = "box"
+        all_data.extend(counting_data)
+        logger.info(f"  Coarse-grained counting samples: {len(counting_data)}")
+
+        clevr_data = generate_clevr_spatial_dataset(
+            n=args.num_clevr,
+            seed=44,
+            cache_dir=os.path.join(args.output_dir, "clevr_cache"),
+        )
+        for d in clevr_data:
+            d["task_type"] = "box"
+        all_data.extend(clevr_data)
+        logger.info(f"  CLEVR spatial/VQA samples: {len(clevr_data)}")
 
         logger.info(f"Total GRPO samples: {len(all_data)}")
 
@@ -150,6 +179,29 @@ def main(args):
 
     num_rounds = args.num_rounds
     iou_thresholds = [0.3, 0.5, 0.7]
+
+    # Difficulty filtering: keep only Normal-level samples (paper Sec 2.5.2).
+    filtered_cache_path = os.path.join(args.output_dir, "filtered_train_data_cache.pkl")
+    if os.path.exists(filtered_cache_path):
+        logger.info(f"Loading filtered training data from {filtered_cache_path}")
+        with open(filtered_cache_path, "rb") as f:
+            all_data = pickle.load(f)
+        logger.info(f"  Loaded {len(all_data)} Normal-difficulty samples")
+    else:
+        logger.info("Difficulty filtering: retaining only Normal-level samples...")
+        all_data = filter_normal_level_data(
+            model=policy_model,
+            processor=processor,
+            data=all_data,
+            num_generations=args.num_generations,
+            max_completion_length=args.max_completion_length,
+            task_type="box",
+            iou_threshold=iou_thresholds[0] if num_rounds > 0 else 0.5,
+            logger=logger,
+        )
+        with open(filtered_cache_path, "wb") as f:
+            pickle.dump(all_data, f)
+        logger.info(f"Cached filtered training data to {filtered_cache_path}")
 
     # Apply monkey-patches once, before training. Applying inside the round loop
     # would nest wrappers on each iteration.
@@ -242,9 +294,13 @@ def main(args):
         )
         mem_threshold_gb = max(GPU_MEMORY_WARNING_GB, total_vram_gb * 0.85)
 
+        quality_fn = make_quality_reward_fn(
+            tokenizer=processor.tokenizer, task_type_default="box"
+        )
+
         trainer = GRPOTrainer(
             model=policy_model,
-            reward_funcs=[reward_fn],
+            reward_funcs=[reward_fn, quality_fn],
             args=grpo_config,
             train_dataset=dataset,
             processing_class=processor,
@@ -285,7 +341,11 @@ if __name__ == "__main__":
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_samples", type=int, default=5000)
+    parser.add_argument("--num_samples", type=int, default=3000)
+    parser.add_argument("--num_counting", type=int, default=3000,
+                        help="Number of coarse-grained counting samples")
+    parser.add_argument("--num_clevr", type=int, default=2000,
+                        help="Number of CLEVR-style spatial/VQA samples")
     parser.add_argument("--num_rounds", type=int, default=3)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-6)

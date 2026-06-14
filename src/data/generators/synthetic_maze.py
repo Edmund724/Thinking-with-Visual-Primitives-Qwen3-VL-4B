@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from ...utils.constants import MAZE_SOLVABLE_RATIO
+from ...utils.thinking_verifier import filter_verified_samples
 from ..formatters.primitive_formatter import format_point, normalize_coordinate
 
 
@@ -335,4 +336,7 @@ def generate_maze_dataset(
             "task_type": "maze",
         })
 
+    import logging
+    logger = logging.getLogger(__name__)
+    data = filter_verified_samples(data, logger=logger)
     return data

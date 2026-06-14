@@ -12,7 +12,7 @@ Output: data/pretrain/pretrain_data.json (conversations format)
 import json
 import os
 import random
-from typing import List, Tuple
+from typing import List
 
 
 def random_box() -> str:
@@ -265,7 +265,7 @@ def generate_dataset(n: int = 25000, seed: int = 42) -> List[dict]:
 
 
 def export_for_training(data: List[dict], output_path: str):
-    """Export as JSON lines (one sample per line for streaming)."""
+    """Export as a single JSON array of conversation dicts."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(data, f, ensure_ascii=False)

@@ -6,6 +6,7 @@ from typing import List, Tuple
 import numpy as np
 
 from .constants import BOX_PATTERN, POINT_PATTERN
+from ..training.grpo_utils import extract_completion_text
 
 
 def extract_answer(text: str) -> str | None:
@@ -846,3 +847,277 @@ def compute_total_reward(
         "process_metrics": proc,
         "format_details": fmt,
     }
+
+
+def _has_duplicate_coords(coords: List[Tuple[int, ...]], tolerance: int = 3) -> bool:
+    """Check if any two coordinates are nearly identical."""
+    if len(coords) < 2:
+        return False
+    for i in range(len(coords)):
+        for j in range(i + 1, len(coords)):
+            if all(abs(a - b) <= tolerance for a, b in zip(coords[i], coords[j])):
+                return True
+    return False
+
+
+def _count_in_answer(answer_text: str | None) -> int | None:
+    """Extract a count integer from answer text, if possible."""
+    if not answer_text:
+        return None
+    # Look for the last integer in the answer
+    nums = re.findall(r"\d+", answer_text)
+    if nums:
+        try:
+            return int(nums[-1])
+        except ValueError:
+            return None
+    return None
+
+
+def _looks_like_reward_hacking(pred_text: str, gt_text: str) -> bool:
+    """Detect common reward-hacking patterns in the generated text."""
+    pred_lower = pred_text.lower()
+    # Model explicitly claims to use ground truth or labels its own prediction as GT
+    suspicious_phrases = [
+        "ground truth",
+        "ground-truth",
+        "gt answer",
+        "gt is",
+        "true answer is",
+    ]
+    if any(p in pred_lower for p in suspicious_phrases):
+        return True
+
+    # Predicted final answer appears verbatim inside GT reasoning (copy-paste GT)
+    pred_answer = extract_answer(pred_text)
+    if pred_answer and gt_text:
+        # If pred answer is a long chunk of GT reasoning, likely copied
+        if pred_answer in gt_text and len(pred_answer) > 20:
+            return True
+
+    return False
+
+
+def _meaningful_references(text: str) -> bool:
+    """Check that box references (<|ref|>...<|/ref|>) are not empty or pure numbers."""
+    refs = re.findall(r"<\|ref\|>(.*?)<\|/ref\|>", text)
+    if not refs:
+        # No refs is okay for points or simple formats
+        return True
+    for ref in refs:
+        ref_clean = ref.strip()
+        if not ref_clean or ref_clean.isdigit():
+            return False
+    return True
+
+
+def quality_reward_text(pred_text: str, gt_text: str, task_type: str = "box") -> float:
+    """Quality Reward Model (Quality RM) — rule-based approximation.
+
+    Scores from {0.0, 0.5, 1.0} matching the paper's discrete tiers:
+        1.0  No quality issues detected.
+        0.5  Minor issues (small redundancy, weak consistency).
+        0.0  Serious issues (reward hacking, contradiction, missing backtracking).
+
+    Checks:
+        - Redundancy: duplicate boxes/points in the thinking trace.
+        - Consistency: final answer count matches number of visual primitives
+          (for counting-style tasks).
+        - Contradiction: maze solvability claim conflicts with path presence.
+        - Reward hacking: suspicious phrases or copied ground truth.
+        - Meaningful references: box refs are not empty or numeric codes.
+    """
+    pred_reasoning = extract_reasoning(pred_text) or ""
+    pred_answer = extract_answer(pred_text)
+
+    issues = 0
+    major_issue = False
+
+    # 1. Redundancy
+    pred_boxes = parse_boxes(pred_reasoning)
+    pred_points = parse_points(pred_reasoning)
+    if _has_duplicate_coords(pred_boxes) or _has_duplicate_coords(pred_points):
+        issues += 1
+
+    # 2. Consistency (counting tasks): answer number vs visual primitives
+    if task_type == "box":
+        answer_count = _count_in_answer(pred_answer)
+        if answer_count is not None and len(pred_boxes) > 0:
+            # Allow small tolerance; severe mismatch is a major issue
+            if abs(answer_count - len(pred_boxes)) > max(1, len(pred_boxes) * 0.2):
+                major_issue = True
+        elif answer_count is not None and answer_count > 0 and len(pred_boxes) == 0:
+            major_issue = True
+
+    # 3. Contradiction (maze): claims solvable but no path points, or vice versa
+    if task_type == "maze":
+        solvable_claim = False
+        if pred_answer is not None:
+            solvable_claim = "true" in pred_answer.lower() or "yes" in pred_answer.lower()
+        has_path = len(pred_points) >= 2
+        if solvable_claim and not has_path:
+            major_issue = True
+        if not solvable_claim and has_path:
+            issues += 1
+
+    # 4. Reward hacking
+    if _looks_like_reward_hacking(pred_text, gt_text):
+        major_issue = True
+
+    # 5. Meaningful references
+    if not _meaningful_references(pred_text):
+        issues += 1
+
+    if major_issue:
+        return 0.0
+    if issues > 0:
+        return 0.5
+    return 1.0
+
+
+def make_quality_reward_fn(tokenizer=None, task_type_default: str = "box"):
+    """Factory for a TRL-compatible Quality RM reward function."""
+
+    def quality_reward(completions, prompts=None, **kwargs):
+        inputs = kwargs.get("inputs", [])
+        gt_texts = kwargs.get("gt_text", [])
+        task_types = kwargs.get("task_type", [])
+        completion_ids_list = kwargs.get("completion_ids", [])
+
+        rewards = []
+        for i, completion in enumerate(completions):
+            if i < len(inputs):
+                gt_text = inputs[i].get("gt_text", "")
+                task_type = inputs[i].get("task_type", task_type_default)
+            elif i < len(gt_texts):
+                gt_text = gt_texts[i]
+                task_type = task_types[i] if i < len(task_types) else task_type_default
+            else:
+                rewards.append(0.0)
+                continue
+
+            comp_id = completion_ids_list[i] if i < len(completion_ids_list) else None
+            pred_text = extract_completion_text(
+                completion, tokenizer=tokenizer, completion_id=comp_id
+            )
+
+            try:
+                rewards.append(quality_reward_text(pred_text, gt_text, task_type))
+            except Exception:
+                rewards.append(0.0)
+        return rewards
+
+    return quality_reward
+
+
+
+def filter_normal_level_data(
+    model,
+    processor,
+    data: List[dict],
+    num_generations: int = 4,
+    max_completion_length: int = 384,
+    task_type: str = "box",
+    iou_threshold: float = 0.5,
+    point_dist_threshold: float = 10.0,
+    easy_threshold: float = 1.5,
+    hard_threshold: float = 0.5,
+    logger=None,
+) -> List[dict]:
+    """Pre-filter GRPO training data to keep only Normal-difficulty samples.
+
+    For each prompt, generate `num_generations` on-policy rollouts and classify
+    the sample as Easy/Normal/Hard based on reward scores. Only Normal samples
+    are retained, following the paper's Specialized RL data selection (Sec 2.5.2).
+    """
+    import torch
+
+    from ..data.datasets.image_loader import load_image
+
+    model.eval()
+    normal_data = []
+    easy_count = 0
+    hard_count = 0
+
+    for i, sample in enumerate(data):
+        image = load_image(sample.get("image"))
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful visual reasoning assistant. Think step by step.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": sample["prompt"]},
+                    ]
+                    if image is not None
+                    else sample["prompt"]
+                ),
+            },
+        ]
+        prompt_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = processor(
+            text=[prompt_text],
+            images=[image] if image is not None else None,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        scores = []
+        gt_text = sample.get(
+            "reasoning", ""
+        ) + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
+
+        for _ in range(num_generations):
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_completion_length,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                    eos_token_id=processor.tokenizer.eos_token_id,
+                )
+            input_len = inputs["input_ids"].shape[1]
+            pred = processor.tokenizer.decode(
+                outputs[0][input_len:], skip_special_tokens=False
+            )
+            try:
+                total = compute_total_reward(
+                    pred_text=pred,
+                    gt_text=gt_text,
+                    task_type=task_type,
+                    iou_threshold=iou_threshold,
+                    point_dist_threshold=point_dist_threshold,
+                    maze_grid=sample.get("maze_grid"),
+                )
+                scores.append(total["total_reward"])
+            except Exception:
+                scores.append(0.0)
+
+        if all(s >= easy_threshold for s in scores):
+            easy_count += 1
+        elif all(s < hard_threshold for s in scores):
+            hard_count += 1
+        else:
+            normal_data.append(sample)
+
+        if logger is not None and (i + 1) % 50 == 0:
+            logger.info(
+                f"  {i + 1}/{len(data)}: "
+                f"{len(normal_data)} normal kept, {easy_count} easy, {hard_count} hard"
+            )
+
+    if logger is not None:
+        logger.info(
+            f"Difficulty filtering done: {len(normal_data)} Normal kept, "
+            f"{easy_count} Easy skipped, {hard_count} Hard skipped"
+        )
+
+    model.train()
+    return normal_data

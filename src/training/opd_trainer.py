@@ -200,8 +200,7 @@ def _opd_collate(features: list) -> Dict[str, Any]:
 
 def train_opd(
     student_model,
-    box_expert,
-    point_expert,
+    expert,
     processor: AutoProcessor,
     train_data: List[Dict[str, Any]],
     output_dir: str,
@@ -216,24 +215,20 @@ def train_opd(
     resume_from_checkpoint: Optional[str] = None,
     logger: logging.Logger | None = None,
 ):
-    """Run OPD training with reverse KL distillation.
+    """Run OPD training with reverse KL distillation for one expert.
 
-    Student generates on-policy, experts score the same sequence.
-    Task routing: box → Box Expert, point/maze → Point Expert.
-
-    Experts are loaded one at a time to save VRAM.
+    Student generates on-policy, the provided expert scores the same sequence.
+    Call this function once per expert (box expert on box data, point expert on
+    point/maze data) to keep only one teacher in GPU memory at a time, matching
+    the paper's two-teacher full-vocabulary distillation (Sec 2.5.4).
     """
     if logger is None:
         logger = logging.getLogger(__name__)
 
-    # Freeze experts
-    for param in box_expert.parameters():
+    # Freeze expert
+    for param in expert.parameters():
         param.requires_grad = False
-    box_expert.eval()
-
-    for param in point_expert.parameters():
-        param.requires_grad = False
-    point_expert.eval()
+    expert.eval()
 
     # Student should be in train mode
     student_model.train()
@@ -319,13 +314,7 @@ def train_opd(
                 )
             full_ids = generated[0]  # prompt + student response
 
-            # 2. Select expert by task type
-            if task_type == "box":
-                expert = box_expert
-            else:
-                expert = point_expert
-
-            # 3. Forward student on full sequence
+            # 2. Forward student on full sequence
             student_outputs = student_model(
                 input_ids=full_ids.unsqueeze(0),
                 labels=full_ids.unsqueeze(0),
@@ -334,7 +323,7 @@ def train_opd(
             # Get logits excluding the last position (no prediction after final token)
             student_logits = student_outputs.logits[:, :-1, :]  # [1, seq-1, vocab]
 
-            # 4. Forward expert on SAME full sequence (frozen, no grad)
+            # 3. Forward expert on SAME full sequence (frozen, no grad)
             with torch.no_grad():
                 expert_outputs = expert(
                     input_ids=full_ids.unsqueeze(0),
@@ -347,7 +336,7 @@ def train_opd(
             student_logits = student_logits[:, :min_len, :]
             expert_logits = expert_logits[:, :min_len, :]
 
-            # 5. Compute reverse KL: D_KL(student || expert)
+            # 4. Compute reverse KL: D_KL(student || expert)
             # p_s = softmax(student_logits / temp)
             # kl = sum(p_s * (log(p_s) - log(p_e)))
             temp = max(temperature, 0.1)
@@ -358,7 +347,7 @@ def train_opd(
             kl_per_token = (p_s * (log_p_s - log_p_e)).sum(dim=-1)  # [1, min_len]
             kl_loss = kl_per_token.mean()
 
-            # 6. Backward
+            # 5. Backward
             kl_loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.3)
             optimizer.step()

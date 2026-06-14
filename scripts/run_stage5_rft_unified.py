@@ -16,7 +16,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import gc
-import logging
 import pickle
 import random
 import sys
@@ -25,11 +24,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from src.data.datasets.sft_dataset import SFTDataset
 from src.data.generators.coco_box_generator import (
     generate_coco_box_samples,
+    generate_coco_counting_samples,
     generate_coco_point_samples,
 )
+from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.data.datasets.image_loader import load_image
 from src.models.qwen_vl_loader import load_qlora_model
@@ -163,6 +163,26 @@ def main(args):
         all_prompts.extend(box_prompts)
         logger.info(f"  Box prompts: {len(box_prompts)}")
 
+        counting_prompts = generate_coco_counting_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_counting_prompts,
+        )
+        for d in counting_prompts:
+            d["task_type"] = "box"
+        all_prompts.extend(counting_prompts)
+        logger.info(f"  Counting prompts: {len(counting_prompts)}")
+
+        clevr_prompts = generate_clevr_spatial_dataset(
+            n=args.num_clevr_prompts,
+            seed=47,
+            cache_dir=os.path.join(args.output_dir, "clevr_prompt_cache"),
+        )
+        for d in clevr_prompts:
+            d["task_type"] = "box"
+        all_prompts.extend(clevr_prompts)
+        logger.info(f"  CLEVR prompts: {len(clevr_prompts)}")
+
         point_prompts = generate_coco_point_samples(
             image_dir=args.coco_image_dir,
             ann_file=args.coco_ann_file,
@@ -210,7 +230,7 @@ def main(args):
     # 5. Expert generation + difficulty grading
     logger.info("Running expert generation with difficulty grading...")
     filtered_data = []
-    easy_count = 0
+    easy_samples = []
     hard_count = 0
 
     for i, sample in enumerate(all_prompts):
@@ -233,28 +253,39 @@ def main(args):
             args.iou_threshold, args.point_dist_threshold,
         )
 
+        record = {
+            "image": sample["image"],
+            "prompt": sample["prompt"],
+            "reasoning": best_rollout or sample["reasoning"],
+            "answer": extract_answer(best_rollout) or sample["answer"],
+            "task_type": sample.get("task_type", "box"),
+        }
+
         if difficulty == "normal":
-            filtered_data.append({
-                "image": sample["image"],
-                "prompt": sample["prompt"],
-                "reasoning": best_rollout or sample["reasoning"],
-                "answer": extract_answer(best_rollout) or sample["answer"],
-                "task_type": sample.get("task_type", "box"),
-            })
+            filtered_data.append(record)
         elif difficulty == "easy":
-            easy_count += 1
+            easy_samples.append(record)
         else:
             hard_count += 1
 
         if (i + 1) % 50 == 0:
             logger.info(
                 f"  {i + 1}/{len(all_prompts)}: "
-                f"{len(filtered_data)} normal kept, {easy_count} easy, {hard_count} hard"
+                f"{len(filtered_data)} normal kept, {len(easy_samples)} easy, {hard_count} hard"
             )
 
+    # Retain all Normal + 5% Easy to mitigate catastrophic forgetting (paper Sec 2.5.3)
+    if easy_samples:
+        random.shuffle(easy_samples)
+        retained_easy_count = max(1, int(len(easy_samples) * 0.05))
+        filtered_data.extend(easy_samples[:retained_easy_count])
+        logger.info(
+            f"Retained {retained_easy_count} Easy samples ({0.05*100:.0f}%) alongside Normal data"
+        )
+
     logger.info(
-        f"Difficulty grading done: {len(filtered_data)} Normal kept, "
-        f"{easy_count} Easy (skipped), {hard_count} Hard (skipped)"
+        f"Difficulty grading done: {len(filtered_data)} total kept "
+        f"(Normal + 5% Easy), {len(easy_samples)} Easy total, {hard_count} Hard skipped"
     )
 
     # Release expert models before SFT to free VRAM for Unified model training.
@@ -310,7 +341,11 @@ if __name__ == "__main__":
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_box_prompts", type=int, default=5000)
+    parser.add_argument("--num_box_prompts", type=int, default=4000)
+    parser.add_argument("--num_counting_prompts", type=int, default=3000,
+                        help="Number of counting prompts for rejection sampling")
+    parser.add_argument("--num_clevr_prompts", type=int, default=2000,
+                        help="Number of CLEVR spatial/VQA prompts for rejection sampling")
     parser.add_argument("--num_point_prompts", type=int, default=3000)
     parser.add_argument("--num_maze_prompts", type=int, default=3000)
     parser.add_argument("--num_rollouts", type=int, default=5)

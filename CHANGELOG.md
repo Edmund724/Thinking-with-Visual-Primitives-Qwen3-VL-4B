@@ -22,6 +22,19 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - `huggingface-hub`: 0.27.0 → 1.18.0 (major version bump)
   - CUDA install target: cu124 → cu130
 
+- **stage4b max_completion_length 提升至 768** (`49be15f`)
+  - 原因：maze GT 数据约 447 tokens，512 长度对早期训练 verbose 没有安全余量。
+  - 文件：`scripts/run_stage4b_grpo_point.py`, `configs/stage4b_grpo_point.yaml`
+
+- **stage4b batch_size 降为 3** (`8fde423`)
+  - 在 max_completion_length=768 下平衡 5090D 显存。
+  - 文件：`scripts/run_stage4b_grpo_point.py`, `configs/stage4b_grpo_point.yaml`
+
+- **GRPO generation_batch_size 恢复为 num_generations** (`c6887cd`)
+  - 从 `batch_size * num_generations` 改回 `num_generations`，每个 gradient step 重新生成 completion。
+  - 原因：大 generation batch 在 TRL 1.6.0 + Qwen3-VL 下导致 image token / pixel_values / image_grid_thw 对齐错误。
+  - 文件：`scripts/run_stage4a_grpo_box.py`, `scripts/run_stage4b_grpo_point.py`
+
 ### Removed
 
 - **vLLM dependency removed** — vLLM was incompatible with TRL GRPO generation (EOS bug, weight sync issues). GRPO now uses HuggingFace native generation exclusively.
@@ -105,6 +118,17 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - Also added: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and per-epoch `torch.cuda.empty_cache()` to reduce fragmentation from variable-length student completions; expert models are released after OPD training before saving the final student.
   - Files: `src/training/opd_trainer.py`, `scripts/run_stage6_opd.py`
 
+- **GRPO 多模态猴补丁恢复与修正** (`79f034f`, `5576938`, `d84aaa2`, `b78f435`)
+  - 曾误以为 TRL 1.6.0 原生处理多模态对齐，移除 `src/training/grpo_fixes.py`；实际长训练仍触发 `Image features and image tokens do not match`。
+  - 恢复并调整猴补丁逻辑：仅在 shape 不匹配时从 `input_ids` 重建 `mm_token_type_ids`，并剥离 completion 中的 orphan image/video pad tokens。
+  - 尝试 always-rebuild 后出现 features > tokens 的 shape mismatch，最终回滚到 `a5f4baf` 原始逻辑。
+  - 文件：`src/training/grpo_fixes.py`, `tests/test_grpo_fixes.py`, `scripts/run_stage4a_grpo_box.py`, `scripts/run_stage4b_grpo_point.py`
+
+- **解决 GRPO/SFT 输出中的非英文学符乱码** (`9ba2ce8`)
+  - 在 system prompt 中明确要求英文输出。
+  - `format_reward` 增加非拉丁文字惩罚（西里尔、阿拉伯、CJK、泰文、希腊等），每个字符扣 0.01，最多扣 0.2。
+  - 文件：`src/data/datasets/grpo_dataset.py`, `src/data/datasets/sft_dataset.py`, `src/utils/metrics.py`
+
 ### Added
 
 - **Round 内 checkpoint-* 断点续训**
@@ -118,3 +142,42 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - Fix 1: Rebuild `mm_token_type_ids` from actual `input_ids` to fix padding direction mismatch.
   - Fix 2: Strip orphan image/video pad tokens from `completion_ids`.
   - Fix 3: Log first completion every 5 steps for monitoring.
+
+- **COCO 几何过滤 (Geometric Filtering)**
+  - 新增 `_filter_annotations_by_geometry`，过滤 mega box (>90% 图像面积)、tiny box (<0.01% 面积)、退化 box 和强贴边 box。
+  - 在 `generate_coco_box_samples` 和 `generate_coco_point_samples` 中自动应用。
+  - 文件：`src/data/generators/coco_box_generator.py`
+
+- **Thinking-chain 验证器 (Cold-start 数据校验)**
+  - 新增 `src/utils/thinking_verifier.py`：检查 tag 配对、坐标范围、引用有效性、counting 答案与 primitive 数量一致性、maze 自相矛盾。
+  - 集成到 COCO box/point、合成 dense counting、maze 生成器中，生成后自动过滤不合格样本。
+  - 文件：`src/utils/thinking_verifier.py`, `src/data/generators/coco_box_generator.py`, `src/data/generators/synthetic_maze.py`
+
+- **Coarse-grained Counting 数据生成器**
+  - 新增 `generate_coco_counting_samples`：从 COCO 选择 3–30 实例的类别，按论文 3-step thinking 协议生成 batch grounding + count answer。
+  - 集成到 `scripts/run_stage3a_sft_box.py` 和 `scripts/run_stage4a_grpo_box.py`。
+  - 文件：`src/data/generators/coco_box_generator.py`, `scripts/run_stage3a_sft_box.py`, `scripts/run_stage4a_grpo_box.py`
+
+- **CLEVR-style Spatial / VQA 数据生成器**
+  - 新增 `src/data/generators/clevr_spatial.py`：生成 2D 合成场景（球/立方体/圆柱体），支持 counting、spatial existence、spatial count、attribute query 四类问题。
+  - 集成到 Stage 3a SFT、Stage 4a GRPO 和 Stage 5 RFT 的 prompt pool。
+  - 文件：`src/data/generators/clevr_spatial.py`, `scripts/run_stage3a_sft_box.py`, `scripts/run_stage4a_grpo_box.py`, `scripts/run_stage5_rft_unified.py`
+
+- **Path Tracing 数据生成器**
+  - 新增 `src/data/generators/path_tracing.py`：生成缠绕的 Bézier 曲线，随机选择一条作为目标路径，输出 waypoint 序列作为 thinking，答案为终点标签。
+  - 支持 uniform-style 模式（所有线同色），迫使模型依赖曲率连续性而非颜色。
+  - 集成到 `scripts/run_stage3b_sft_point.py` 和 `scripts/run_stage4b_grpo_point.py`。
+  - 文件：`src/data/generators/path_tracing.py`, `scripts/run_stage3b_sft_point.py`, `scripts/run_stage4b_grpo_point.py`
+
+- **Stage 5 RFT Prompt Pool 扩展**
+  - Rejection sampling 的 prompt pool 新增 coarse-grained counting 和 CLEVR spatial/VQA，与 box/point/maze 一起用于生成专家 rollout。
+  - 文件：`scripts/run_stage5_rft_unified.py`
+
+- **代码清理**
+  - 删除 `src/data/generators/coco_box_generator.py` 中未使用的 `Path` import。
+
+
+- **统一设置 CUDA 显存碎片缓解环境变量**
+  - 在 `scripts/run_stage1_pretrain.py`、`run_stage2_visual_pretrain.py`、`run_stage3a_sft_box.py`、`run_stage3b_sft_point.py` 顶部统一设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
+  - 现在 stage1–stage6 全部脚本都内置该环境变量，无需每次手动在命令行添加。
+  - 文件：`scripts/run_stage1_pretrain.py`, `scripts/run_stage2_visual_pretrain.py`, `scripts/run_stage3a_sft_box.py`, `scripts/run_stage3b_sft_point.py`

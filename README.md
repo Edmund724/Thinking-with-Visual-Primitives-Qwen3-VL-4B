@@ -210,7 +210,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
 
 ### Stage 4a: Box Expert GRPO (3 rounds by default)
 
-> **Note**: GRPO uses a multi-round loop structure. After each round, the model is reloaded — inter-round gaps are natural checkpoints. Each round should run to completion (no intra-round resume). If interrupted, the script auto-detects and skips completed rounds on restart.
+> **Note**: GRPO uses a multi-round loop structure. After each round, the model is reloaded — inter-round gaps are natural checkpoints. Each round should run to completion; if interrupted mid-round, the script auto-detects the latest `checkpoint-*` and resumes from it. Completed rounds are skipped on restart.
+>
+> **VRAM tip**: All stage scripts now set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` internally to mitigate CUDA memory fragmentation during long runs.
 
 ```bash
 python scripts/run_stage4a_grpo_box.py \
@@ -424,7 +426,7 @@ Beyond merely checking final answer correctness, we designed fine-grained proces
 
 - **Box tasks**: IoU matching, missed detections, format legality
 - **Point / Maze tasks**: L2 distance, wall collision detection (Bresenham sampling), backtracking absence detection
-- **General**: label pairing legality (`syntax_valid`)
+- **General**: label pairing legality (`syntax_valid`), non-Latin script penalty, completion length penalty
 
 ```python
 from src.utils.metrics import process_reward
@@ -440,6 +442,26 @@ reward = process_reward(
 # Returns: answer_correct, syntax_valid, box_avg_iou, point_avg_dist,
 #          wall_collision_count, backtracking_missing, ...
 ```
+
+### Data Generation & Quality Control
+
+Beyond the original COCO box/point and synthetic maze tasks, the pipeline now includes additional data generators to broaden the model's reasoning capabilities:
+
+| Generator | Task Type | Description |
+|-----------|-----------|-------------|
+| `coco_box_generator.py` | Box / Counting | COCO bounding boxes with geometric filtering (mega/tiny/degenerate/edge boxes removed) + coarse-grained counting (3–30 instances) |
+| `clevr_spatial.py` | Spatial VQA | 2D synthetic scenes (sphere/cube/cylinder) with counting, existence, spatial count, and attribute queries |
+| `path_tracing.py` | Point | Intertwined Bézier curves where the model must trace a target path to its endpoint; supports uniform-color mode to force curvature-based reasoning |
+| `synthetic_maze.py` | Point / Maze | Random maze generation with BFS path solving |
+
+**Thinking-chain Verifier** (`thinking_verifier.py`): All generators are automatically filtered through a post-generation validation step that checks:
+- Tag pairing (`<|box|>`/`<|/box|>`, `<|point|>`/`<|/point|>`)
+- Coordinate range validity (0–999)
+- Reference validity (thinking steps reference real primitives)
+- Counting answer consistency with primitive count
+- Maze self-contradiction detection
+
+Samples failing any check are discarded before training, ensuring high-quality cold-start data for SFT and GRPO.
 
 ---
 
@@ -466,8 +488,10 @@ tvp-4b-5090d/
 │   │   │   ├── grpo_dataset.py       # GRPO dataset
 │   │   │   └── image_loader.py       # Lazy image loading (OOM prevention)
 │   │   ├── generators/
-│   │   │   ├── coco_box_generator.py # COCO → box/point training samples (3-step thinking)
+│   │   │   ├── coco_box_generator.py # COCO → box/point/counting samples (3-step thinking + geometric filtering)
 │   │   │   ├── synthetic_maze.py     # Synthetic maze generator (3-step thinking)
+│   │   │   ├── clevr_spatial.py      # CLEVR-style 2D spatial/VQA generator
+│   │   │   ├── path_tracing.py       # Bézier curve path tracing generator
 │   │   │   └── synthetic_path.py     # Synthetic path generator (unused)
 │   │   └── formatters/
 │   │       └── primitive_formatter.py # Coordinate label formatting
@@ -476,11 +500,13 @@ tvp-4b-5090d/
 │   │   │   └── sft_trainer.py        # SFT Trainer wrapper
 │   │   ├── pretrain_trainer.py       # Pretrain Trainer (embedding only)
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation trainer
+│   │   ├── grpo_fixes.py             # GRPOTrainer multimodal monkey-patches
 │   │   ├── callbacks.py              # Training callbacks (memory monitoring)
 │   │   └── memory_utils.py           # GPU memory utilities
 │   └── utils/
 │       ├── constants.py              # Special token / hyperparameter constants
-│       ├── metrics.py                # Format RM + Accuracy RM + difficulty grading
+│       ├── metrics.py                # Format RM + Accuracy RM + difficulty grading + length penalty
+│       ├── thinking_verifier.py       # Thinking-chain validation (tag pairing, coord range, ref checks)
 │       └── logging_utils.py          # Logging initialization
 ├── scripts/                          # Stage entry scripts
 │   ├── generate_pretrain_data.py     # Pretrain data generator
@@ -498,6 +524,8 @@ tvp-4b-5090d/
 │   ├── test_primitive_parser.py      # Coordinate parser unit tests
 │   ├── test_metrics.py               # Reward function & geometry tool tests
 │   ├── test_pretrain_format.py       # Pretrain format tests
+│   ├── test_grpo_fixes.py            # GRPO monkey-patch unit tests
+│   ├── test_grpo_reward_integration.py # GRPO reward integration tests
 │   └── test_logging_utils.py         # Logging utility tests
 ├── outputs/                          # Training artifacts (organized by stage)
 │   ├── stage1_pretrain/              # embedding state_dict
@@ -593,9 +621,10 @@ And this project:
 ## ⚠️ Known Limitations
 
 1. **GRPO online rollout overhead**: `num_generations=5` is the limit on a single 24GB GPU; more rollouts require gradient accumulation or offloading.
-2. **Flash Attention compatibility**: Blackwell (RTX 5090D) support for flash-attn 2.7.0+ is still maturing; code has built-in `eager` fallback.
+2. **Flash Attention compatibility**: Blackwell (RTX 5090D) support for flash-attn 2.8.0+ is still maturing; code has built-in `eager` fallback.
 3. **COCO data**: Initial download is ~18GB; loaded on-demand during training.
 4. **This is a reproduction**: The paper's original pipeline includes more stages and larger-scale data; this project is simplified for single-GPU constraints.
+5. **vLLM not supported**: vLLM is incompatible with TRL GRPO generation for Qwen3-VL; all GRPO stages use HuggingFace native generation exclusively.
 
 ---
 

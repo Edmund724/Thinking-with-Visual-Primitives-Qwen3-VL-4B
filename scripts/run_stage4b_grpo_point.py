@@ -12,7 +12,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import gc
-import logging
 import pickle
 import sys
 from pathlib import Path
@@ -27,11 +26,17 @@ from src.training.grpo_fixes import apply_grpo_fixes
 from src.training.grpo_utils import extract_completion_text
 from src.data.generators.coco_box_generator import generate_coco_point_samples
 from src.data.generators.synthetic_maze import generate_maze_dataset
+from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
 from src.training.memory_utils import log_memory_status, clear_memory, GPUMemoryMonitor
 from src.utils.constants import GPU_MEMORY_WARNING_GB
 from src.utils.logging_utils import setup_logging
-from src.utils.metrics import compute_total_reward, length_reward
+from src.utils.metrics import (
+    compute_total_reward,
+    filter_normal_level_data,
+    length_reward,
+    make_quality_reward_fn,
+)
 
 logger = setup_logging(log_file="logs/stage4b_grpo_point.log")
 
@@ -132,7 +137,7 @@ def main(args):
             all_data = pickle.load(f)
         logger.info(f"  Loaded {len(all_data)} samples from cache")
     else:
-        logger.info("Generating GRPO training data (point+maze)...")
+        logger.info("Generating GRPO training data (point+maze+path)...")
         all_data = []
 
         point_data = generate_coco_point_samples(
@@ -154,6 +159,16 @@ def main(args):
         all_data.extend(maze_data)
         logger.info(f"  Maze samples: {len(maze_data)}")
 
+        path_data = generate_path_tracing_dataset(
+            n=args.num_path,
+            seed=43,
+            cache_dir=os.path.join(args.output_dir, "path_tracing_cache"),
+        )
+        for d in path_data:
+            d["task_type"] = "point"
+        all_data.extend(path_data)
+        logger.info(f"  Path tracing samples: {len(path_data)}")
+
         logger.info(f"Total GRPO samples: {len(all_data)}")
 
         # Save cache for future runs
@@ -164,6 +179,29 @@ def main(args):
 
     num_rounds = args.num_rounds
     dist_thresholds = [20.0, 10.0, 5.0]
+
+    # Difficulty filtering: keep only Normal-level samples (paper Sec 2.5.2).
+    filtered_cache_path = os.path.join(args.output_dir, "filtered_train_data_cache.pkl")
+    if os.path.exists(filtered_cache_path):
+        logger.info(f"Loading filtered training data from {filtered_cache_path}")
+        with open(filtered_cache_path, "rb") as f:
+            all_data = pickle.load(f)
+        logger.info(f"  Loaded {len(all_data)} Normal-difficulty samples")
+    else:
+        logger.info("Difficulty filtering: retaining only Normal-level samples...")
+        all_data = filter_normal_level_data(
+            model=policy_model,
+            processor=processor,
+            data=all_data,
+            num_generations=args.num_generations,
+            max_completion_length=args.max_completion_length,
+            task_type="point",
+            point_dist_threshold=dist_thresholds[0] if num_rounds > 0 else 10.0,
+            logger=logger,
+        )
+        with open(filtered_cache_path, "wb") as f:
+            pickle.dump(all_data, f)
+        logger.info(f"Cached filtered training data to {filtered_cache_path}")
 
     # Apply monkey-patches once, before training. Applying inside the round loop
     # would nest wrappers on each iteration.
@@ -254,9 +292,13 @@ def main(args):
         )
         mem_threshold_gb = max(GPU_MEMORY_WARNING_GB, total_vram_gb * 0.85)
 
+        quality_fn = make_quality_reward_fn(
+            tokenizer=processor.tokenizer, task_type_default="point"
+        )
+
         trainer = GRPOTrainer(
             model=policy_model,
-            reward_funcs=[reward_fn],
+            reward_funcs=[reward_fn, quality_fn],
             args=grpo_config,
             train_dataset=dataset,
             processing_class=processor,
@@ -297,7 +339,9 @@ if __name__ == "__main__":
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
     parser.add_argument("--num_point", type=int, default=2000)
-    parser.add_argument("--num_maze", type=int, default=5000)
+    parser.add_argument("--num_maze", type=int, default=4000)
+    parser.add_argument("--num_path", type=int, default=2000,
+                        help="Number of path tracing samples")
     parser.add_argument("--num_rounds", type=int, default=3)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-6)

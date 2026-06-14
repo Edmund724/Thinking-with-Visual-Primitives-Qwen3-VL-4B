@@ -11,11 +11,14 @@ Only embed_tokens (and lm_head if not tied) are trained.
 Expected: ~30 min on RTX 5090D for 25K samples × 3 epochs.
 """
 
+import os
+
+# Mitigate CUDA memory fragmentation during training.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
-import logging
 import sys
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

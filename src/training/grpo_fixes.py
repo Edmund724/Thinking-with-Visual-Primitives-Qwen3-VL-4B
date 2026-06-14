@@ -1,7 +1,10 @@
 """
 Monkey-patch fixes for TRL GRPOTrainer multimodal alignment with Qwen3-VL.
 
-Fix 1: Rebuild mm_token_type_ids from input_ids to fix padding direction mismatch.
+Fix 1: Always rebuild mm_token_type_ids / token_type_ids from input_ids to fix
+       padding direction mismatch between processor output (right-padded) and
+       TRL's left-padded input_ids. This prevents RuntimeError: shape mismatch in
+       Qwen3-VL's get_rope_index.
 Fix 2: Strip generated image/video pad tokens from completion_ids to prevent
        orphan image tokens without matching pixel_values features.
 """
@@ -36,42 +39,29 @@ def _patch_prepare_inputs(trainer_class):
         # Call original
         result = orig(self, inputs)
 
-        # --- Rebuild mm_token_type_ids / token_type_ids ONLY if missing or wrong shape ---
-        # TRL 1.5.1 _generate_and_score_completions already extends these correctly
-        # with zeros for the completion part. We only fix them if the shape is wrong.
+        # --- Rebuild mm_token_type_ids / token_type_ids from actual input_ids ---
+        # TRL builds these from the processor output (right-padded) while input_ids
+        # is left-padded. This causes padding-direction mismatch and leads to
+        # RuntimeError: shape mismatch in Qwen3-VL's get_rope_index. Rebuilding from
+        # input_ids guarantees alignment.
         prompt_ids = result.get("prompt_ids")
         completion_ids = result.get("completion_ids")
         if prompt_ids is None:
             return result
 
-        # Full sequence length = prompt + completion
-        full_len = prompt_ids.shape[-1]
-        if completion_ids is not None:
-            full_len += completion_ids.shape[-1]
-
         if self._is_vlm:
-            # Only rebuild mm_token_type_ids if missing or shape mismatch
-            mm_ids_existing = result.get("mm_token_type_ids")
-            if mm_ids_existing is None or mm_ids_existing.shape[-1] != full_len:
-                # Build from full prompt+completion ids if available
-                if completion_ids is not None:
-                    input_ids = torch.cat([prompt_ids, completion_ids], dim=-1)
-                else:
-                    input_ids = prompt_ids
-                mm_ids = self._rebuild_mm_ids_from_input_ids(input_ids)
-                if mm_ids is not None:
-                    result["mm_token_type_ids"] = mm_ids
+            if completion_ids is not None:
+                input_ids = torch.cat([prompt_ids, completion_ids], dim=-1)
+            else:
+                input_ids = prompt_ids
 
-            # Only rebuild token_type_ids if missing or shape mismatch
-            token_type_ids_existing = result.get("token_type_ids")
-            if token_type_ids_existing is None or token_type_ids_existing.shape[-1] != full_len:
-                if completion_ids is not None:
-                    input_ids = torch.cat([prompt_ids, completion_ids], dim=-1)
-                else:
-                    input_ids = prompt_ids
-                token_type_ids = self._rebuild_token_type_ids(input_ids)
-                if token_type_ids is not None:
-                    result["token_type_ids"] = token_type_ids
+            mm_ids = self._rebuild_mm_ids_from_input_ids(input_ids)
+            if mm_ids is not None:
+                result["mm_token_type_ids"] = mm_ids
+
+            token_type_ids = self._rebuild_token_type_ids(input_ids)
+            if token_type_ids is not None:
+                result["token_type_ids"] = token_type_ids
 
         return result
 
@@ -128,6 +118,23 @@ def _patch_get_per_token_logps_and_entropies(trainer_class):
         mm_token_type_ids=None,
         image_position_ids=None,
     ):
+        # Rebuild mm_token_type_ids / token_type_ids from input_ids to fix padding
+        # direction mismatch (same reason as in _prepare_inputs).
+        # The helper methods are added by _patch_prepare_inputs; when patches are
+        # applied via apply_grpo_fixes they always exist, but guard for isolated tests.
+        if (
+            self._is_vlm
+            and input_ids is not None
+            and input_ids.numel() > 0
+            and hasattr(self, "_rebuild_mm_ids_from_input_ids")
+        ):
+            rebuilt_mm_ids = self._rebuild_mm_ids_from_input_ids(input_ids)
+            if rebuilt_mm_ids is not None:
+                mm_token_type_ids = rebuilt_mm_ids
+            rebuilt_token_type_ids = self._rebuild_token_type_ids(input_ids)
+            if rebuilt_token_type_ids is not None:
+                token_type_ids = rebuilt_token_type_ids
+
         # Strip orphan image/video tokens from the completion part.
         # This prevents "Image features and image tokens do not match".
         if self._is_vlm and hasattr(self, "_image_pad_token_id"):

@@ -301,7 +301,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_rounds", type=int, default=3)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
-    parser.add_argument("--batch_size", type=int, default=6)
+    parser.add_argument("--batch_size", type=int, default=3)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--lora_r", type=int, default=256)
     parser.add_argument("--lora_alpha", type=int, default=512)

@@ -2,7 +2,7 @@
 stage3b_checkpoint: outputs/stage3b_sft_point
 output_dir: outputs/stage4b_grpo_point
 max_completion_length: 768
-per_device_batch_size: 6
+per_device_batch_size: 3
 gradient_accumulation_steps: 1
 learning_rate: 1.0e-6
 num_train_epochs: 1

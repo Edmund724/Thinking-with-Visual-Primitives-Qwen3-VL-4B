@@ -53,7 +53,8 @@ class GRPODataset(Dataset):
             "You are a helpful visual reasoning assistant. "
             "Think step by step inside " + "\x3cthink\x3e" + "..." + "\x3c/think\x3e" + " tags, then provide your final answer. "
             "Use visual primitives (<|box|>, <|point|>) when needed to mark locations. "
-            "Always close your reasoning with " + "\x3c/think\x3e" + " before giving the answer."
+            "Always close your reasoning with " + "\x3c/think\x3e" + " before giving the answer. "
+            "Respond in English only; do not use characters from other languages."
         )
 
         if image is not None:

@@ -554,6 +554,21 @@ def process_reward(
     return result
 
 
+# Regex matching characters from non-Latin scripts (Cyrillic, Arabic, CJK, Thai, etc.)
+_NON_LATIN_SCRIPT_RE = re.compile(
+    r"["
+    r"\u0370-\u03FF\u1F00-\u1FFF"  # Greek
+    r"\u0400-\u04FF"               # Cyrillic
+    r"\u0600-\u06FF"               # Arabic
+    r"\u0900-\u097F"               # Devanagari
+    r"\u0E00-\u0E7F"               # Thai
+    r"\u3040-\u309F\u30A0-\u30FF"  # Hiragana/Katakana
+    r"\u4E00-\u9FFF"               # CJK Unified Ideographs
+    r"\uAC00-\uD7AF"               # Korean Hangul Syllables
+    r"]"
+)
+
+
 def format_reward(text: str) -> dict:
     """Format Reward Model (Format RM).
 
@@ -562,9 +577,11 @@ def format_reward(text: str) -> dict:
         2. Special token syntax is valid (paired open/close)
         3. Coordinates are within [0, 999]
         4. No duplicate special tokens (e.g., nested boxes)
+        5. Output is in English (no non-Latin script characters)
 
     Returns:
-        Dict with individual check results and total score (0.0~0.8).
+        Dict with individual check results and total score (0.0~0.8, can go
+        negative due to the non-Latin penalty).
     """
     from .constants import BOX_OPEN, BOX_CLOSE, POINT_OPEN, POINT_CLOSE
 
@@ -651,6 +668,17 @@ def format_reward(text: str) -> dict:
     details["no_nested_tokens"] = no_duplicates
     if no_duplicates:
         score += 0.2
+
+    # 5. Penalize non-Latin script characters (Thai, Cyrillic, CJK, etc.)
+    non_latin_chars = len(_NON_LATIN_SCRIPT_RE.findall(text))
+    details["non_latin_char_count"] = non_latin_chars
+    if non_latin_chars > 0:
+        # Cap penalty at -0.2 to avoid over-punishing minor contamination
+        penalty = min(0.01 * non_latin_chars, 0.2)
+        score -= penalty
+        details["non_latin_penalty"] = round(-penalty, 2)
+    else:
+        details["non_latin_penalty"] = 0.0
 
     details["total_format_score"] = round(score, 2)
     return details

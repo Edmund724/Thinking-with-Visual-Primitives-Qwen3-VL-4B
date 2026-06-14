@@ -62,7 +62,8 @@ class SFTDataset(Dataset):
                 "role": "system",
                 "content": (
                     "You are a helpful visual reasoning assistant. "
-                    "Think step by step and use visual primitives when needed."
+                    "Think step by step and use visual primitives when needed. "
+                    "Respond in English only; do not use characters from other languages."
                 ),
             },
             {"role": "user", "content": user_content},

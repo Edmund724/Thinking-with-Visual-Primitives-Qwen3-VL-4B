@@ -309,7 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--num_generations", type=int, default=6)
-    parser.add_argument("--max_completion_length", type=int, default=384)
+    parser.add_argument("--max_completion_length", type=int, default=768)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--temperature", type=float, default=1.0)
     args = parser.parse_args()

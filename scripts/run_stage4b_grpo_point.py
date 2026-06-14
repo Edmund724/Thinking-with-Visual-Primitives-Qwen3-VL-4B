@@ -233,7 +233,7 @@ def main(args):
             max_grad_norm=0.3,
             lr_scheduler_type="cosine",
             num_generations=args.num_generations,
-            generation_batch_size=args.batch_size * args.num_generations,
+            generation_batch_size=args.num_generations,
             max_completion_length=args.max_completion_length,
             beta=args.beta,
             temperature=args.temperature,

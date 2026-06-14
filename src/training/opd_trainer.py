@@ -27,6 +27,8 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoProcessor
 from tqdm import tqdm
 
+from ..data.datasets.image_loader import load_image
+
 
 class OPDDataset(Dataset):
     """Dataset for OPD training.
@@ -46,36 +48,49 @@ class OPDDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.data[idx]
         task_type = sample.get("task_type", "box")
+        image = load_image(sample.get("image"))
 
-        # Build prompt messages
+        # Build prompt messages with image embedded in multimodal content blocks
+        system_content = "You are a helpful visual reasoning assistant. Think step by step."
+        if image is not None:
+            user_content = [
+                {"type": "image", "image": image},
+                {"type": "text", "text": sample["prompt"]},
+            ]
+        else:
+            user_content = sample["prompt"]
+
         messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful visual reasoning assistant. Think step by step.",
-            },
-            {
-                "role": "user",
-                "content": sample["prompt"],
-            },
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
         ]
 
         prompt_text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
 
-        # Tokenize prompt
-        prompt_inputs = self.processor(
-            text=[prompt_text],
-            return_tensors="pt",
-            padding=False,
-        )
-        prompt_ids = prompt_inputs["input_ids"][0]
+        # Process prompt with image so pixel_values / image_grid_thw are available
+        if image is not None:
+            prompt_inputs = self.processor(
+                text=[prompt_text],
+                images=[image],
+                return_tensors="pt",
+                padding=False,
+            )
+        else:
+            prompt_inputs = self.processor(
+                text=[prompt_text],
+                return_tensors="pt",
+                padding=False,
+            )
+
+        # Remove batch dimension
+        prompt_inputs = {k: v.squeeze(0) for k, v in prompt_inputs.items()}
 
         return {
             "prompt_text": prompt_text,
-            "prompt_ids": prompt_ids,
             "task_type": task_type,
-            "sample": sample,  # Keep original sample for image loading if needed
+            **prompt_inputs,
         }
 
 
@@ -154,6 +169,35 @@ def _load_opd_checkpoint(
     return global_step, epoch, step_in_epoch
 
 
+def _opd_collate(features: list) -> Dict[str, Any]:
+    """Collate OPD batch; pixel_values are concatenated, not stacked.
+
+    Qwen3-VL expects pixel_values concatenated along the patch dimension,
+    with image_grid_thw indicating each image's grid size.
+    """
+    batch: Dict[str, Any] = {}
+    all_keys = set()
+    for f in features:
+        all_keys.update(f.keys())
+
+    for key in all_keys:
+        if key in ("prompt_text", "task_type"):
+            batch[key] = [f[key] for f in features]
+        elif key == "pixel_values":
+            present = [f[key] for f in features if key in f]
+            if present:
+                batch[key] = torch.cat(present, dim=0)
+        elif key == "image_grid_thw":
+            present = [f[key] for f in features if key in f]
+            if present:
+                batch[key] = torch.stack(present, dim=0)
+        else:
+            # Stack tensors present in all samples
+            if all(key in f for f in features):
+                batch[key] = torch.stack([f[key] for f in features], dim=0)
+    return batch
+
+
 def train_opd(
     student_model,
     box_expert,
@@ -201,6 +245,7 @@ def train_opd(
         batch_size=per_device_batch_size,
         shuffle=True,
         drop_last=False,
+        collate_fn=_opd_collate,
     )
     logger.info(f"OPD dataset: {len(dataset)} samples, {len(dataloader)} batches")
 
@@ -248,17 +293,29 @@ def train_opd(
                     g["lr"] = lr
 
             task_type = batch["task_type"][0]  # batch_size=1
-            prompt_ids = batch["prompt_ids"][0].to(student_model.device)
+
+            # Build prompt inputs and move to device
+            prompt_inputs = {
+                k: v[0].to(student_model.device)
+                for k, v in batch.items()
+                if k not in ("task_type", "prompt_text")
+            }
+            prompt_ids = prompt_inputs["input_ids"]
+            image_kwargs = {
+                k: v for k, v in prompt_inputs.items()
+                if k in ("pixel_values", "image_grid_thw")
+            }
 
             # 1. Student generates response (on-policy)
             with torch.no_grad():
                 generated = student_model.generate(
                     input_ids=prompt_ids.unsqueeze(0),
                     max_new_tokens=max_new_tokens,
-                    temperature=0.7,
+                    temperature=max(temperature, 0.1),
                     do_sample=True,
                     pad_token_id=pad_token_id,
                     eos_token_id=eos_token_id,
+                    **image_kwargs,
                 )
             full_ids = generated[0]  # prompt + student response
 
@@ -272,6 +329,7 @@ def train_opd(
             student_outputs = student_model(
                 input_ids=full_ids.unsqueeze(0),
                 labels=full_ids.unsqueeze(0),
+                **image_kwargs,
             )
             # Get logits excluding the last position (no prediction after final token)
             student_logits = student_outputs.logits[:, :-1, :]  # [1, seq-1, vocab]
@@ -280,6 +338,7 @@ def train_opd(
             with torch.no_grad():
                 expert_outputs = expert(
                     input_ids=full_ids.unsqueeze(0),
+                    **image_kwargs,
                 )
                 expert_logits = expert_outputs.logits[:, :-1, :]  # [1, seq-1, vocab]
 
@@ -336,5 +395,10 @@ def train_opd(
             f"OPD Epoch {epoch+1}/{num_epochs} complete. "
             f"Avg KL: {avg_kl:.4f} | Time: {time.time() - epoch_t0:.1f}s"
         )
+
+        # Clear cache between epochs to combat fragmentation from variable-length
+        # student completions (same pattern as stage 4 GRPO rounds).
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     logger.info("OPD training complete.")

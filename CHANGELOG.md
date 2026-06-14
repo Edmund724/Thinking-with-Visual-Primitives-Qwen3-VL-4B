@@ -87,6 +87,24 @@ All notable changes to the GRPO training pipeline are documented in this file.
     5. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` at the top of both scripts to reduce fragmentation.
   - Files: `src/training/grpo_fixes.py`, `scripts/run_stage4a_grpo_box.py`, `scripts/run_stage4b_grpo_point.py`
 
+- **Stage 5: Unified RFT VRAM and cleanup issues**
+  - Root cause 1: `scripts/run_stage5_rft_unified.py` did not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, leaving it vulnerable to the same CUDA fragmentation that caused stage 4 OOMs during long runs with variable-length completions.
+  - Root cause 2: Box Expert and Point Expert models remained in GPU memory during the Unified model SFT phase, wasting VRAM.
+  - Fix:
+    1. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` at the top of `scripts/run_stage5_rft_unified.py`.
+    2. After difficulty grading / rejection sampling, explicitly `del box_expert; del point_expert; gc.collect(); clear_memory()` before constructing the SFT trainer.
+  - Files: `scripts/run_stage5_rft_unified.py`
+
+- **Stage 6: OPD image not passed to model (critical)**
+  - Root cause: `OPDDataset.__getitem__` only returned text `prompt_ids`; `pixel_values` / `image_grid_thw` were never computed or passed to `student_model.generate()`, `student_model()`, or `expert()`. The models therefore processed text-only prompts and ignored the input image, making the distillation target meaningless for visual tasks.
+  - Fix:
+    1. Updated `OPDDataset.__getitem__` to load the image and process prompt + image through the processor, returning `pixel_values` and `image_grid_thw` alongside `input_ids`.
+    2. Added `_opd_collate` to correctly batch/concatenate `pixel_values` and stack `image_grid_thw`.
+    3. Threaded image kwargs through `student_model.generate()`, `student_model()`, and `expert()` in `train_opd`.
+  - Also fixed: `generate` temperature was hard-coded to `0.7` instead of using the configured `temperature` argument.
+  - Also added: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and per-epoch `torch.cuda.empty_cache()` to reduce fragmentation from variable-length student completions; expert models are released after OPD training before saving the final student.
+  - Files: `src/training/opd_trainer.py`, `scripts/run_stage6_opd.py`
+
 ### Added
 
 - **Round 内 checkpoint-* 断点续训**

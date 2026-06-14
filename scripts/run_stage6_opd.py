@@ -11,11 +11,16 @@ For each sample:
   4. Student LoRA updates to match expert distribution
 """
 
+import os
+
+# Mitigate CUDA memory fragmentation from variable-length OPD completions.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
+import gc
 import logging
 import pickle
 import sys
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,7 +33,7 @@ from src.data.generators.coco_box_generator import (
 from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.opd_trainer import train_opd
-from src.training.memory_utils import log_memory_status
+from src.training.memory_utils import log_memory_status, clear_memory
 from src.utils.logging_utils import setup_logging
 
 logger = setup_logging(log_file="logs/stage6_opd.log")
@@ -141,6 +146,14 @@ def main(args):
         resume_from_checkpoint=resume_ckpt,
         logger=logger,
     )
+
+    # Release experts before saving final student to free VRAM
+    logger.info("Releasing expert models after OPD training...")
+    del box_expert
+    del point_expert
+    gc.collect()
+    clear_memory()
+    log_memory_status("Expert models released:")
 
     # Save student model
     os.makedirs(args.output_dir, exist_ok=True)

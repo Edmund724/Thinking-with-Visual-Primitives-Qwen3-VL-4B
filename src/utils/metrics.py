@@ -677,6 +677,27 @@ def counting_reward(pred_count: int, gt_count: int) -> float:
     return float(reward)
 
 
+def length_reward(completion_length: int, target_length: int, max_penalty: float = 0.05) -> float:
+    """Gentle length regularization reward.
+
+    Encourages completions close to a target length. Penalizes only when the
+    completion is longer than the target; penalty grows linearly up to
+    `max_penalty` when length reaches 2x the target.
+
+    Args:
+        completion_length: Number of tokens in the completion.
+        target_length: Desired completion length in tokens.
+        max_penalty: Maximum negative reward (default 0.05).
+
+    Returns:
+        Continuous reward in [-max_penalty, 0.0].
+    """
+    if completion_length <= target_length:
+        return 0.0
+    over_ratio = (completion_length - target_length) / target_length
+    return -max_penalty * min(over_ratio, 1.0)
+
+
 def compute_total_reward(
     pred_text: str,
     gt_text: str,

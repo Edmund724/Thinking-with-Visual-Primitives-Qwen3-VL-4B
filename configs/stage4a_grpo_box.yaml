@@ -1,9 +1,9 @@
 # Stage 4a: Specialized GRPO — Box Expert
 stage3a_checkpoint: outputs/stage3a_sft_box
 output_dir: outputs/stage4a_grpo_box
-max_completion_length: 1024
-per_device_batch_size: 1
-gradient_accumulation_steps: 4
+max_completion_length: 384
+per_device_batch_size: 6
+gradient_accumulation_steps: 1
 learning_rate: 1.0e-6
 num_train_epochs: 1
 lora_r: 256
@@ -12,14 +12,14 @@ lora_dropout: 0.05
 optimizer: paged_adamw_8bit
 bf16: true
 warmup_steps: 50
-logging_steps: 5
+logging_steps: 10
 save_steps: 200
 save_total_limit: 2
 gradient_checkpointing: true
 report_to: none
 num_samples: 5000
 num_rounds: 3
-num_generations: 5
+num_generations: 6
 beta: 0.04
 temperature: 1.0
 iou_thresholds: [0.3, 0.5, 0.7]

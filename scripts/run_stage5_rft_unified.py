@@ -9,12 +9,17 @@ Key design (corrected per paper):
   - Unified model (re-init from merged Stage 2 base) SFTs on filtered data
 """
 
+import os
+
+# Mitigate CUDA memory fragmentation from variable-length expert rollouts.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
+import gc
 import logging
 import pickle
 import random
 import sys
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,7 +34,7 @@ from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.data.datasets.image_loader import load_image
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
-from src.training.memory_utils import log_memory_status
+from src.training.memory_utils import log_memory_status, clear_memory
 from src.utils.logging_utils import setup_logging
 from src.utils.metrics import compute_total_reward, extract_answer
 
@@ -251,6 +256,14 @@ def main(args):
         f"Difficulty grading done: {len(filtered_data)} Normal kept, "
         f"{easy_count} Easy (skipped), {hard_count} Hard (skipped)"
     )
+
+    # Release expert models before SFT to free VRAM for Unified model training.
+    logger.info("Releasing expert models before Unified SFT training...")
+    del box_expert
+    del point_expert
+    gc.collect()
+    clear_memory()
+    log_memory_status("Expert models released:")
 
     if len(filtered_data) < 100:
         logger.warning("Too few Normal samples — consider adjusting thresholds")

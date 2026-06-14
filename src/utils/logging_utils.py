@@ -9,8 +9,9 @@ def setup_logging(
     name: str | None = None,
     level: int = logging.INFO,
     log_file: Path | None = None,
+    console: bool = True,
 ) -> logging.Logger:
-    """Setup logger with console and optional file handler."""
+    """Setup logger with optional console and file handlers."""
     if name is None:
         name = "tvp"
         if log_file is not None:
@@ -25,10 +26,11 @@ def setup_logging(
     )
 
     # Console handler
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
-    console.setFormatter(formatter)
-    logger.addHandler(console)
+    if console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     # File handler
     if log_file is not None:

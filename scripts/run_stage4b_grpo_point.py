@@ -31,7 +31,7 @@ from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
 from src.training.memory_utils import log_memory_status, clear_memory, GPUMemoryMonitor
 from src.utils.constants import GPU_MEMORY_WARNING_GB
 from src.utils.logging_utils import setup_logging
-from src.utils.metrics import compute_total_reward
+from src.utils.metrics import compute_total_reward, length_reward
 
 logger = setup_logging(log_file="logs/stage4b_grpo_point.log")
 
@@ -91,10 +91,14 @@ def make_point_reward_fn(point_dist_threshold: float, tokenizer=None):
                     point_dist_threshold=point_dist_threshold,
                     maze_grid=maze_grid,
                 )
-                if total["difficulty"] == "normal":
-                    rewards.append(total["total_reward"])
-                else:
-                    rewards.append(0.1 if total["difficulty"] == "easy" else 0.0)
+                # Use raw total reward without difficulty-based collapsing to preserve
+                # within-group variance. Add a gentle length penalty to differentiate
+                # completions of different conciseness.
+                comp_id = completion_ids_list[i] if i < len(completion_ids_list) else None
+                comp_len = len(comp_id) if comp_id is not None else len(pred_text.split())
+                target_len = 150 if task_type == "maze" else 80
+                length_r = length_reward(comp_len, target_length=target_len, max_penalty=0.1)
+                rewards.append(total["total_reward"] + length_r)
             except Exception as e:
                 logger.warning(f"Reward computation failed for sample {i}: {e}")
                 rewards.append(0.0)
@@ -229,7 +233,7 @@ def main(args):
             max_grad_norm=0.3,
             lr_scheduler_type="cosine",
             num_generations=args.num_generations,
-            generation_batch_size=args.num_generations,
+            generation_batch_size=args.batch_size * args.num_generations,
             max_completion_length=args.max_completion_length,
             beta=args.beta,
             temperature=args.temperature,
@@ -297,15 +301,15 @@ if __name__ == "__main__":
     parser.add_argument("--num_rounds", type=int, default=3)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=6)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--lora_r", type=int, default=256)
     parser.add_argument("--lora_alpha", type=int, default=512)
-    parser.add_argument("--logging_steps", type=int, default=5)
+    parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--warmup_steps", type=int, default=50)
-    parser.add_argument("--num_generations", type=int, default=5)
-    parser.add_argument("--max_completion_length", type=int, default=512)
+    parser.add_argument("--num_generations", type=int, default=6)
+    parser.add_argument("--max_completion_length", type=int, default=384)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--temperature", type=float, default=1.0)
     args = parser.parse_args()

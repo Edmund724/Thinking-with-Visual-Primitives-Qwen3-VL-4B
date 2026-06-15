@@ -212,10 +212,9 @@ def _generate_counting_question(
         intent = f"I need to count all {shape}s in the image."
 
     count = len(filtered)
-    grounding_parts = [
-        f"object at {format_box([obj.normalized_bbox(img_w, img_h)])}"
-        for obj in filtered
-    ]
+    # Batch grounding for counting-style questions.
+    bboxes = [obj.normalized_bbox(img_w, img_h) for obj in filtered]
+    grounding_parts = [f"objects are at {format_box(bboxes)}"]
     summarization = f"There are {count} matching objects in total."
     reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 
@@ -318,10 +317,9 @@ def _generate_spatial_count_question(
         intent = f"I need to count objects {direction} the {anchor_desc}."
 
     count = len(filtered)
-    grounding_parts = [
-        f"object at {format_box([obj.normalized_bbox(img_w, img_h)])}"
-        for obj in filtered
-    ]
+    # Batch grounding for spatial-count questions.
+    bboxes = [obj.normalized_bbox(img_w, img_h) for obj in filtered]
+    grounding_parts = [f"objects are at {format_box(bboxes)}"]
     summarization = f"There are {count} objects {direction} the {anchor_desc}."
     reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 

@@ -644,17 +644,16 @@ def format_reward(text: str) -> dict:
     if coords_valid:
         score += 0.2
 
-    # 4. Check no duplicate/nested special tokens
-    # Simple heuristic: each <|box|> should have exactly one matching <|/box|>
-    # and no nested boxes
+    # 4. Check no duplicate/nested special tokens and correct inner bracket format.
+    # Correct: <|box|>[[x1,y1,x2,y2]]<|/box|> or
+    #          <|box|>[[x1,y1,x2,y2],[x3,y3,x4,y4]]<|/box|>
+    # Wrong:   <|box|>[[[x1,...],[x2,...]]]<|/box|> (extra bracket around each box)
     no_duplicates = True
-    # Check for patterns like <|box|>...<|box|>...<|/box|>...<|/box|>
-    # which indicates nesting
     box_segments = re.findall(
         re.escape(BOX_OPEN) + r"(.*?)" + re.escape(BOX_CLOSE), text, re.DOTALL
     )
     for seg in box_segments:
-        if BOX_OPEN in seg or BOX_CLOSE in seg:
+        if BOX_OPEN in seg or BOX_CLOSE in seg or "[[" in seg or "]]" in seg:
             no_duplicates = False
             break
 
@@ -662,7 +661,7 @@ def format_reward(text: str) -> dict:
         re.escape(POINT_OPEN) + r"(.*?)" + re.escape(POINT_CLOSE), text, re.DOTALL
     )
     for seg in point_segments:
-        if POINT_OPEN in seg or POINT_CLOSE in seg:
+        if POINT_OPEN in seg or POINT_CLOSE in seg or "[[" in seg or "]]" in seg:
             no_duplicates = False
             break
 
@@ -756,29 +755,34 @@ def compute_total_reward(
     accuracy_score = 0.0
 
     if task_type == "box":
-        # Box: IoU + counting support
+        # Box: IoU + counting support + non-count answer correctness
         avg_iou = proc.get("box_avg_iou", 0.0)
-        num_pred = proc.get("box_num_pred", 0)
-        num_gt = proc.get("box_num_gt", 0)
+        answer_correct = proc.get("answer_correct", False)
 
         # Try to get counts for counting reward
         pred_answer = extract_answer(pred_text)
         gt_answer = extract_answer(gt_text)
+        both_are_counts = False
+        count_r = 0.0
         if pred_answer is not None and gt_answer is not None:
             try:
                 pred_count = int(pred_answer)
                 gt_count = int(gt_answer)
                 count_r = counting_reward(pred_count, gt_count)
+                both_are_counts = True
             except ValueError:
                 count_r = 0.0
-        else:
-            count_r = 0.0
 
-        # If counts match perfectly, use IoU; otherwise use counting reward
-        if count_r >= 0.7 * 0.99:  # Almost perfect count match
-            accuracy_score = avg_iou + 0.3  # Bonus for correct count
+        if both_are_counts:
+            # If counts match perfectly, use IoU; otherwise use counting reward
+            if count_r >= 0.7 * 0.99:  # Almost perfect count match
+                accuracy_score = avg_iou + 0.3  # Bonus for correct count
+            else:
+                accuracy_score = count_r + avg_iou * 0.3  # Weighted mix
         else:
-            accuracy_score = count_r + avg_iou * 0.3  # Weighted mix
+            # Non-count answers (e.g., CLEVR color / TrueFalse): reward exact match
+            answer_r = 1.0 if answer_correct else 0.0
+            accuracy_score = answer_r + avg_iou * 0.3
 
     elif task_type == "point":
         # Point: distance-based

@@ -100,9 +100,9 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + On-Policy Distillation）
 
 ```
-Stage 1:  Text Pretrain          文本-only embedding 初始化               ~1.5h  ✅
-Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~14h   ✅
-Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~18s   ✅
+Stage 1:  Text Pretrain          文本-only embedding 初始化               ~57min ✅
+Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~9.6h  ✅
+Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~22s   ✅
 Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~4.2h  ✅
 Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8.5h  ✅ (含 resume)
 Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
@@ -125,13 +125,24 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student || expert)
 
 **纯文本训练，无图像**。只训练 `embed_tokens` 层。25K 条程序化生成样本，3 epochs。
 
-> **实测数据**: 25K 样本，3 epochs，18750 步 (batch_size=4, lr=2e-4)，Epoch 1/2/3 Avg Loss: 1.0399 / 0.9944 / 0.9899，耗时 **~1h25min**。
+> **本次真实运行参数与结果**：
+> - 参数：`num_samples=25000`, `num_epochs=3`, `batch_size=8`, `gradient_accumulation_steps=4`（有效 batch=32）, `max_length=256`, `learning_rate=2e-4`
+> - 可训练参数量：~389M
+> - 耗时：**~57 min**（Epoch 1 ~19 min / Epoch 2 ~19 min / Epoch 3 ~19 min）
+> - Epoch 平均 loss：1.1928 / 1.0072 / 1.0024
+> - 输出：`outputs/stage1_pretrain/pretrain_state_dict.pt`
 
 ```bash
 python scripts/run_stage1_pretrain.py \
     --model_path models/Qwen3-VL-4B-Thinking \
+    --data_path data/pretrain/pretrain_data.json \
     --output_dir outputs/stage1_pretrain \
-    --num_epochs 3
+    --num_samples 25000 \
+    --num_epochs 3 \
+    --batch_size 8 \
+    --gradient_accumulation_steps 4 \
+    --max_length 256 \
+    --learning_rate 2e-4
 ```
 
 **输出**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
@@ -142,7 +153,11 @@ python scripts/run_stage1_pretrain.py \
 
 **在 COCO 图像上训练**，建立"视觉特征 → 坐标"的真实映射。不是随机猜坐标。
 
-> **实测数据**: 60000 样本 (50K box + 10K point)，1 epoch，batch_size=2, grad_accum=2 (有效 batch=4)，耗时 **~14h**。
+> **本次真实运行参数与结果**：
+> - 参数：`num_box=50000`, `num_point=10000`（每 epoch 共 60K 样本）, `num_epochs=2`, `batch_size=2`, `gradient_accumulation_steps=4`（有效 batch=8）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`
+> - 步数：~7500 步/epoch，共 15000 步
+> - 耗时：**~9 h 36 min**
+> - 输出：`outputs/stage2_visual_pretrain/`
 
 ```bash
 python scripts/run_stage2_visual_pretrain.py \
@@ -150,7 +165,11 @@ python scripts/run_stage2_visual_pretrain.py \
     --pretrain_embedding_path outputs/stage1_pretrain \
     --output_dir outputs/stage2_visual_pretrain \
     --num_box 50000 --num_point 10000 \
-    --num_epochs 1 --batch_size 2 --gradient_accumulation_steps 2
+    --num_epochs 2 \
+    --batch_size 2 --gradient_accumulation_steps 4 \
+    --max_seq_length 2048 \
+    --lora_r 256 --lora_alpha 512 \
+    --learning_rate 2e-6
 ```
 
 **输出**: `outputs/stage2_visual_pretrain/`
@@ -161,7 +180,7 @@ python scripts/run_stage2_visual_pretrain.py \
 
 **必须合并**！避免双层 LoRA 叠加。
 
-> **实测耗时**: **~18s**。
+> **本次真实耗时**：**~22 s**。
 
 ```bash
 python scripts/merge_stage2.py \
@@ -169,6 +188,19 @@ python scripts/merge_stage2.py \
     --adapter_path outputs/stage2_visual_pretrain \
     --output_dir outputs/stage2_merged_base
 ```
+
+**输出**: `outputs/stage2_merged_base/`（完整 bf16 模型，~8.8GB `model.safetensors`）
+
+> **合并后是否需要验证再进入 Stage 3？**  
+> 严格来说不需要——`merge_stage2.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但因为刚刚修复了数据格式和 reward，建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
+>
+> ```bash
+> python scripts/smoke_test_stage2.py
+> # 或指定图片 / 问题
+> python scripts/smoke_test_stage2.py \
+>     --image_path data/coco/train2017/000000000009.jpg \
+>     --question "Locate the main object in the image. Mark it with a box."
+> ```
 
 ### Stage 3a: Box Expert SFT ✅
 

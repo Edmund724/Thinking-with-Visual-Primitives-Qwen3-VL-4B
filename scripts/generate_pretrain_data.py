@@ -23,12 +23,12 @@ def random_box() -> str:
     h = random.randint(20, 300)
     x2 = min(x1 + w, 999)
     y2 = min(y1 + h, 999)
-    return f"<|box|>[[{x1}, {y1}, {x2}, {y2}]]<|/box|>"
+    return f"<|box|>[[{x1},{y1},{x2},{y2}]]<|/box|>"
 
 
 def random_multi_box(num: int) -> str:
     """Generate multiple boxes in one tag."""
-    boxes = []
+    parts = []
     for _ in range(num):
         x1 = random.randint(0, 900)
         y1 = random.randint(0, 900)
@@ -36,27 +36,27 @@ def random_multi_box(num: int) -> str:
         h = random.randint(20, 200)
         x2 = min(x1 + w, 999)
         y2 = min(y1 + h, 999)
-        boxes.append(f"[{x1},{y1},{x2},{y2}]")
-    inner = "[" + "],[".join(boxes) + "]"
-    return f"<|box|>[{inner}]<|/box|>"
+        parts.append(f"{x1},{y1},{x2},{y2}")
+    inner = "[[" + "],[".join(parts) + "]]"
+    return f"<|box|>{inner}<|/box|>"
 
 
 def random_point() -> str:
     """Generate a random point in [0, 999] coordinates."""
     x = random.randint(0, 999)
     y = random.randint(0, 999)
-    return f"<|point|>[[{x}, {y}]]<|/point|>"
+    return f"<|point|>[[{x},{y}]]<|/point|>"
 
 
 def random_multi_point(num: int) -> str:
     """Generate multiple points in one tag (path/waypoints)."""
-    points = []
+    parts = []
     for _ in range(num):
         x = random.randint(0, 999)
         y = random.randint(0, 999)
-        points.append(f"[{x},{y}]")
-    inner = "[" + "],[".join(points) + "]"
-    return f"<|point|>[{inner}]<|/point|>"
+        parts.append(f"{x},{y}")
+    inner = "[[" + "],[".join(parts) + "]]"
+    return f"<|point|>{inner}<|/point|>"
 
 
 # ---- Template pools ----

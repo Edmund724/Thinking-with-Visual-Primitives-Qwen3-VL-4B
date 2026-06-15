@@ -373,10 +373,8 @@ def generate_synthetic_dense_counting(
             ))
 
         intent = "I need to count all small objects in the image."
-        grounding_parts = [f"object at {format_box([box])}" for box in boxes]
-        # Limit grounding parts to avoid too long thinking
-        if len(grounding_parts) > 10:
-            grounding_parts = grounding_parts[:5] + [f"... and {len(grounding_parts) - 5} more objects"]
+        # Batch grounding: all objects in one tag to match coarse-grained counting.
+        grounding_parts = [f"objects are at {format_box(boxes)}"]
         summarization = f"There are {num_objects} small objects in total."
         reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 
@@ -490,12 +488,8 @@ def generate_coco_counting_samples(
         boxes = [bbox_to_normalized(ann["bbox"], img_w, img_h) for ann in cat_anns]
         count = len(boxes)
 
-        grounding_parts = [f"the {cat_name} is at {format_box([box])}" for box in boxes]
-        # Limit grounding parts to control sequence length while preserving count
-        if len(grounding_parts) > 12:
-            shown = grounding_parts[:6]
-            hidden = len(grounding_parts) - 6
-            grounding_parts = shown + [f"... and {hidden} more {cat_name}(s)"]
+        # Batch grounding: all target boxes in a single visual primitive tag.
+        grounding_parts = [f"the {cat_name}s are at {format_box(boxes)}"]
 
         intent = f"I need to count all {cat_name}s in the image."
         summarization = f"There are {count} {cat_name}(s) in total."

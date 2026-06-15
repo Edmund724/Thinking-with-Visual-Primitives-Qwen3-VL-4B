@@ -97,7 +97,10 @@ def make_box_reward_fn(iou_threshold: float, tokenizer=None):
                 # completions of different conciseness.
                 comp_id = completion_ids_list[i] if i < len(completion_ids_list) else None
                 comp_len = len(comp_id) if comp_id is not None else len(pred_text.split())
-                length_r = length_reward(comp_len, target_length=120, max_penalty=0.1)
+                # Box completions often need >120 tokens (multiple boxes/counting).
+                # Use a more permissive target and a small penalty to avoid
+                # punishing valid long chains.
+                length_r = length_reward(comp_len, target_length=240, max_penalty=0.05)
                 rewards.append(total["total_reward"] + length_r)
             except Exception as e:
                 logger.warning(f"Reward computation failed for sample {i}: {e}")

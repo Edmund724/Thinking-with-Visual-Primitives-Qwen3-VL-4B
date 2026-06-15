@@ -81,6 +81,7 @@ def main(args):
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         per_device_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_length=args.max_length,
         warmup_steps=args.warmup_steps,
         logger=logger,
@@ -110,6 +111,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Gradient accumulation steps for embedding-only pretrain")
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--warmup_steps", type=int, default=200)
     args = parser.parse_args()

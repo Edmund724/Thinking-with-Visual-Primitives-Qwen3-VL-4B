@@ -100,6 +100,7 @@ def train_pretrain(
     num_epochs: int = 3,
     learning_rate: float = 2e-4,
     per_device_batch_size: int = 4,
+    gradient_accumulation_steps: int = 1,
     max_length: int = 256,
     warmup_steps: int = 200,
     logging_steps: int = 50,
@@ -133,7 +134,7 @@ def train_pretrain(
     )
     logger.info(
         f"Dataset: {len(dataset)} samples, {len(dataloader)} batches/epoch "
-        f"(batch_size={per_device_batch_size})"
+        f"(batch_size={per_device_batch_size}, accum={gradient_accumulation_steps})"
     )
 
     # Optimizer: only trainable parameters (embed_tokens ± lm_head)
@@ -141,12 +142,14 @@ def train_pretrain(
     n_params = sum(p.numel() for p in trainable_params)
     logger.info(f"Trainable params: {n_params:,} ({n_params/1e6:.1f}M)")
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
+    total_optimizer_steps = (len(dataloader) // gradient_accumulation_steps) * num_epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=len(dataloader) * num_epochs
+        optimizer, T_max=max(total_optimizer_steps, 1)
     )
 
     model.train()
     global_step = 0
+    optimizer_step = 0
     logger.info(f"Starting training loop ({num_epochs} epochs, {len(dataloader)} batches/epoch)...")
 
     for epoch in range(num_epochs):
@@ -157,45 +160,48 @@ def train_pretrain(
         for step, batch in enumerate(pbar):
             global_step += 1
 
-            # Warmup
-            if global_step <= warmup_steps:
-                lr = learning_rate * global_step / warmup_steps
-                for g in optimizer.param_groups:
-                    g["lr"] = lr
-
             # Move to GPU
             batch = {k: v.to(model.device) for k, v in batch.items()}
 
-            # Forward + backward
+            # Forward + backward with accumulation scaling
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 outputs = model(**batch)
-                loss = outputs.loss
+                loss = outputs.loss / gradient_accumulation_steps
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.3)
-            optimizer.step()
-            optimizer.zero_grad()
+            epoch_loss += loss.item() * gradient_accumulation_steps
 
-            # Cosine schedule after warmup
-            if global_step > warmup_steps:
-                scheduler.step()
+            # Update weights only after accumulating enough gradients
+            if global_step % gradient_accumulation_steps == 0:
+                optimizer_step += 1
 
-            loss_val = loss.item()
-            epoch_loss += loss_val
+                # Warmup (at optimizer-step granularity)
+                if optimizer_step <= warmup_steps:
+                    lr = learning_rate * optimizer_step / warmup_steps
+                    for g in optimizer.param_groups:
+                        g["lr"] = lr
 
-            # Update tqdm bar
-            pbar.set_postfix({
-                "loss": f"{loss_val:.4f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-            })
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.3)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            if global_step % logging_steps == 0:
-                logger.info(
-                    f"  Epoch {epoch+1}/{num_epochs} | "
-                    f"Step {global_step} | "
-                    f"Loss: {loss_val:.4f} | "
-                    f"LR: {optimizer.param_groups[0]['lr']:.2e}"
-                )
+                # Cosine schedule after warmup
+                if optimizer_step > warmup_steps:
+                    scheduler.step()
+
+                loss_val = loss.item() * gradient_accumulation_steps
+                pbar.set_postfix({
+                    "loss": f"{loss_val:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                })
+
+                if optimizer_step % logging_steps == 0:
+                    logger.info(
+                        f"  Epoch {epoch+1}/{num_epochs} | "
+                        f"Step {optimizer_step} | "
+                        f"Loss: {loss_val:.4f} | "
+                        f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+                    )
 
         avg_loss = epoch_loss / max(len(dataloader), 1)
         logger.info(

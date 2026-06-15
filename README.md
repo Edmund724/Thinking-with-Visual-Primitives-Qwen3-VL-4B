@@ -100,9 +100,9 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 Training Pipeline (Separated Experts + On-Policy Distillation)
 
 ```
-Stage 1:  Text Pretrain          Text-only embedding initialization           ~1.5h  ✅
-Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~14h   ✅
-Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~18s   ✅
+Stage 1:  Text Pretrain          Text-only embedding initialization           ~57min ✅
+Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~9.6h  ✅
+Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~22s   ✅
 Stage 3a: Box Expert SFT         70% general + 30% Box-specific SFT           ~4.2h  ✅
 Stage 3b: Point Expert SFT       70% general + 30% Point+Maze SFT            ~8.5h  ✅ (including resume)
 Stage 4a: Box Expert GRPO        Box expert GRPO (3 rounds, default)          ~6h    (est.)
@@ -125,13 +125,24 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student||expert)) 
 
 **Text-only training, no images**. Only trains `embed_tokens` layers. 25K programmatically generated samples, 3 epochs.
 
-> **Benchmark**: 25K samples, 3 epochs, 18750 steps (batch_size=4, lr=2e-4), Epoch 1/2/3 Avg Loss: 1.0399 / 0.9944 / 0.9899, duration **~1h25min**.
+> **Actual run (this reproduction)**:
+> - Parameters: `num_samples=25000`, `num_epochs=3`, `batch_size=8`, `gradient_accumulation_steps=4` (effective batch=32), `max_length=256`, `learning_rate=2e-4`
+> - Trainable params: ~389M
+> - Duration: **~57min** (Epoch 1 ~19min / Epoch 2 ~19min / Epoch 3 ~19min)
+> - Epoch avg loss: 1.1928 / 1.0072 / 1.0024
+> - Output: `outputs/stage1_pretrain/pretrain_state_dict.pt`
 
 ```bash
 python scripts/run_stage1_pretrain.py \
     --model_path models/Qwen3-VL-4B-Thinking \
+    --data_path data/pretrain/pretrain_data.json \
     --output_dir outputs/stage1_pretrain \
-    --num_epochs 3
+    --num_samples 25000 \
+    --num_epochs 3 \
+    --batch_size 8 \
+    --gradient_accumulation_steps 4 \
+    --max_length 256 \
+    --learning_rate 2e-4
 ```
 
 **Output**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
@@ -142,7 +153,11 @@ python scripts/run_stage1_pretrain.py \
 
 **Training on COCO images** to establish real "visual features → coordinates" mapping. No random coordinate guessing.
 
-> **Benchmark**: 60000 samples (50K box + 10K point), 1 epoch, batch_size=2, grad_accum=2 (effective batch=4), duration **~14h**.
+> **Actual run (this reproduction)**:
+> - Parameters: `num_box=50000`, `num_point=10000` (total 60K samples/epoch), `num_epochs=2`, `batch_size=2`, `gradient_accumulation_steps=4` (effective batch=8), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`
+> - Steps: ~7500 steps/epoch, 15000 steps total
+> - Duration: **~9h36min**
+> - Output: `outputs/stage2_visual_pretrain/`
 
 ```bash
 python scripts/run_stage2_visual_pretrain.py \
@@ -150,7 +165,11 @@ python scripts/run_stage2_visual_pretrain.py \
     --pretrain_embedding_path outputs/stage1_pretrain \
     --output_dir outputs/stage2_visual_pretrain \
     --num_box 50000 --num_point 10000 \
-    --num_epochs 1 --batch_size 2 --gradient_accumulation_steps 2
+    --num_epochs 2 \
+    --batch_size 2 --gradient_accumulation_steps 4 \
+    --max_seq_length 2048 \
+    --lora_r 256 --lora_alpha 512 \
+    --learning_rate 2e-6
 ```
 
 **Output**: `outputs/stage2_visual_pretrain/`
@@ -161,7 +180,7 @@ python scripts/run_stage2_visual_pretrain.py \
 
 **Must merge!** Avoid stacking double LoRA layers.
 
-> **Benchmark duration**: **~18s**.
+> **Actual run**: merge duration **~22s**.
 
 ```bash
 python scripts/merge_stage2.py \
@@ -169,6 +188,21 @@ python scripts/merge_stage2.py \
     --adapter_path outputs/stage2_visual_pretrain \
     --output_dir outputs/stage2_merged_base
 ```
+
+**Output**: `outputs/stage2_merged_base/` (full bf16 model, ~8.8GB `model.safetensors`)
+
+> **Do I need to validate the merged model before Stage 3?**  
+> Strictly speaking, no — `merge_stage2.py` is deterministic and Stage 3 SFT will immediately fail to load if the merge is corrupt. However, because you just fixed the data format / reward functions, I recommend a **5-minute smoke test**: load `outputs/stage2_merged_base` on one COCO image and check that it emits spatial coordinates inside `<think>` tags.
+>
+> ```bash
+> python scripts/smoke_test_stage2.py
+> # or specify image / question
+> python scripts/smoke_test_stage2.py \
+>     --image_path data/coco/train2017/000000000009.jpg \
+>     --question "Locate the main object in the image. Mark it with a box."
+> ```
+>
+> If reasoning + coordinates appear, proceed directly to Stage 3a.
 
 ### Stage 3a: Box Expert SFT ✅
 

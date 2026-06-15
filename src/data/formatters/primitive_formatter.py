@@ -12,13 +12,11 @@ def format_box(coords: List[Tuple[int, int, int, int]]) -> str:
         coords: List of (x1, y1, x2, y2) tuples.
 
     Returns:
-        Formatted box tag string.
+        Formatted box tag string. Single box: ``<|box|>[[x1,y1,x2,y2]]<|/box|>``.
+        Multiple boxes: ``<|box|>[[x1,y1,x2,y2],[x3,y3,x4,y4]]<|/box|>``.
     """
-    if len(coords) == 1:
-        inner = f"[[{coords[0][0]},{coords[0][1]},{coords[0][2]},{coords[0][3]}]]"
-    else:
-        parts = [f"[{c[0]},{c[1]},{c[2]},{c[3]}]" for c in coords]
-        inner = "[[" + "],[".join(parts) + "]]"
+    parts = [f"{c[0]},{c[1]},{c[2]},{c[3]}" for c in coords]
+    inner = "[[" + "],[".join(parts) + "]]"
     return f"{BOX_OPEN}{inner}{BOX_CLOSE}"
 
 
@@ -29,13 +27,11 @@ def format_point(coords: List[Tuple[int, int]]) -> str:
         coords: List of (x, y) tuples.
 
     Returns:
-        Formatted point tag string.
+        Formatted point tag string. Single point: ``<|point|>[[x,y]]<|/point|>``.
+        Multiple points: ``<|point|>[[x1,y1],[x2,y2]]<|/point|>``.
     """
-    if len(coords) == 1:
-        inner = f"[[{coords[0][0]},{coords[0][1]}]]"
-    else:
-        parts = [f"[{c[0]},{c[1]}]" for c in coords]
-        inner = "[[" + "],[".join(parts) + "]]"
+    parts = [f"{c[0]},{c[1]}" for c in coords]
+    inner = "[[" + "],[".join(parts) + "]]"
     return f"{POINT_OPEN}{inner}{POINT_CLOSE}"
 
 

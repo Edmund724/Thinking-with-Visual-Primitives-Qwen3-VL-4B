@@ -44,6 +44,31 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Fixed
 
+- **Visual primitive tag format consistency (multi-box / multi-point bracket bug)**
+  - `format_box` and `format_point` previously produced triple brackets for multiple coordinates, e.g. `<|box|>[[[x1,...],[x2,...]]]<|/box|>`. This confused the model and led to ~68% malformed tags in stage3a eval.
+  - Fixed to always emit the consistent form: single `<|box|>[[x1,y1,x2,y2]]<|/box|>` and multi `<|box|>[[x1,y1,x2,y2],[x3,y3,x4,y4]]<|/box|>`.
+  - Files: `src/data/formatters/primitive_formatter.py`, `scripts/generate_pretrain_data.py`
+
+- **SFT final answer format and reasoning cleanup**
+  - Removed the hard-coded `f"The answer is {answer}."` wrapper in `SFTDataset`; assistant content now uses the raw answer string, preserving `\boxed{...}` forms and reducing trailing-punctuation mismatch.
+  - Removed the dangerous `reasoning.startswith("<")` / `reasoning.endswith("<")` cleanup that could strip visual primitive tags.
+  - Files: `src/data/datasets/sft_dataset.py`
+
+- **GRPO reward weaknesses exposed by stage3a eval**
+  - `format_reward` now also rejects extra inner brackets like `[[[...]]]` inside a box/point tag, so malformed syntax is penalized during RL.
+  - `compute_total_reward` for box tasks now gives a full exact-match reward for non-count answers (color / TrueFalse) instead of relying only on IoU.
+  - Box GRPO length target raised from 120 to 240 tokens with a smaller max penalty, so valid multi-box / counting completions are no longer punished.
+  - Files: `src/utils/metrics.py`, `scripts/run_stage4a_grpo_box.py`
+
+### Changed
+
+- **Unified grounding style across generators**
+  - Coarse-grained counting, synthetic dense counting, and CLEVR counting/spatial-count questions now use a single visual primitive tag with all relevant boxes, matching the paper's batch-grounding protocol.
+  - Previously some generators emitted one tag per box while others put multiple boxes in one tag, with inconsistent inner bracket formats.
+  - Files: `src/data/generators/coco_box_generator.py`, `src/data/generators/clevr_spatial.py`
+
+### Fixed
+
 - **Compatibility warnings after major dependency upgrade (transformers 5.x / TRL 1.5.1 / PyTorch 2.11)**
   - Removed stale `BNB_CUDA_VERSION=130` from `~/.bashrc` — no longer needed because PyTorch, bitsandbytes, and flash-attn are all natively built for CUDA 13.0.
   - Eliminated `tokenizer has new PAD/BOS/EOS tokens` warning by syncing `model.config.pad_token_id`, `eos_token_id`, and `bos_token_id` with the tokenizer after `add_special_tokens()` in:

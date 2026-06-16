@@ -726,6 +726,64 @@ def length_reward(completion_length: int, target_length: int, max_penalty: float
     return -max_penalty * min(over_ratio, 1.0)
 
 
+def _count_repeated_ngrams(tokens: List[str], n: int = 4) -> int:
+    """Count how many n-grams appear more than once."""
+    if len(tokens) < n:
+        return 0
+    seen = set()
+    repeats = set()
+    for i in range(len(tokens) - n + 1):
+        gram = tuple(tokens[i : i + n])
+        if gram in seen:
+            repeats.add(gram)
+        else:
+            seen.add(gram)
+    return len(repeats)
+
+
+def _count_repeated_coordinates(coords: List[Tuple[int, ...]], tolerance: int = 3) -> int:
+    """Count coordinate clusters that appear multiple times."""
+    if len(coords) < 2:
+        return 0
+    duplicates = 0
+    for i in range(len(coords)):
+        for j in range(i + 1, len(coords)):
+            if all(abs(a - b) <= tolerance for a, b in zip(coords[i], coords[j])):
+                duplicates += 1
+    return duplicates
+
+
+def repeat_token_penalty(
+    pred_text: str,
+    max_penalty: float = 0.15,
+    ngram: int = 4,
+) -> float:
+    """Penalty for repeated text patterns (looping / reward hacking).
+
+    Checks:
+      1. Repeated n-grams in the reasoning text.
+      2. Repeated box/point coordinates.
+
+    Returns:
+        Negative penalty in [-max_penalty, 0.0].
+    """
+    reasoning = extract_reasoning(pred_text) or ""
+    tokens = reasoning.split()
+    ngram_repeats = _count_repeated_ngrams(tokens, n=ngram)
+
+    boxes = parse_boxes(pred_text)
+    points = parse_points(pred_text)
+    coord_repeats = _count_repeated_coordinates(boxes) + _count_repeated_coordinates(points)
+
+    # Normalize: one duplicate n-gram or coordinate pair is minor; many are severe.
+    total_repeats = ngram_repeats + coord_repeats
+    if total_repeats == 0:
+        return 0.0
+
+    penalty = max_penalty * min(total_repeats / 5.0, 1.0)
+    return -penalty
+
+
 def compute_total_reward(
     pred_text: str,
     gt_text: str,
@@ -829,8 +887,11 @@ def compute_total_reward(
                 0.50 * answer_correct
             )
 
+    # Repeat-token penalty (discourage looping / reward hacking)
+    repeat_penalty = repeat_token_penalty(pred_text)
+
     # Total reward
-    total = format_score + accuracy_score
+    total = format_score + accuracy_score + repeat_penalty
 
     # Difficulty grading
     # Easy: total >= 1.5 (both format and accuracy are good)
@@ -851,6 +912,48 @@ def compute_total_reward(
         "process_metrics": proc,
         "format_details": fmt,
     }
+
+
+def is_rollout_correct(
+    pred_text: str,
+    gt_text: str,
+    task_type: str = "box",
+    iou_threshold: float = 0.5,
+    point_dist_threshold: float = 10.0,
+    maze_grid: np.ndarray | None = None,
+) -> bool:
+    """Binary correctness used for paper-style difficulty grading.
+
+    The paper (Sec 2.5.2) categorizes rollouts by the *number of correct
+    rollouts*, not by a continuous reward threshold. A rollout is considered
+    correct when its final answer is correct AND the output satisfies basic
+    syntax constraints.
+    """
+    # Syntax must be valid (Format RM gate)
+    fmt = format_reward(pred_text)
+    if not fmt.get("tokens_paired") or not fmt.get("coords_in_range"):
+        return False
+
+    # Answer must be correct (Accuracy RM gate)
+    proc = process_reward(
+        pred_text, gt_text, task_type,
+        iou_threshold, point_dist_threshold, maze_grid,
+    )
+    if not proc.get("answer_correct", False):
+        return False
+
+    # For box/point tasks, additionally require at least one valid primitive
+    # to avoid empty-but-correct-format corner cases.
+    if task_type in ("box", "point", "path"):
+        reasoning = extract_reasoning(pred_text) or ""
+        if task_type == "box":
+            if not parse_boxes(reasoning):
+                return False
+        else:
+            if not parse_points(reasoning):
+                return False
+
+    return True
 
 
 def _has_duplicate_coords(coords: List[Tuple[int, ...]], tolerance: int = 3) -> bool:
@@ -918,18 +1021,16 @@ def _meaningful_references(text: str) -> bool:
 def quality_reward_text(pred_text: str, gt_text: str, task_type: str = "box") -> float:
     """Quality Reward Model (Quality RM) — rule-based approximation.
 
+    The paper uses an LLM-based Generative Reward Model (GRM) that evaluates
+    redundancy, consistency, self-contradiction, meaningful entities, and reward
+    hacking (Sec 2.5.2). Because running an LLM judge inside the GRPO loop is
+    expensive on a single 24GB GPU, this implementation uses a rule-based
+    approximation that targets the same failure modes.
+
     Scores from {0.0, 0.5, 1.0} matching the paper's discrete tiers:
         1.0  No quality issues detected.
         0.5  Minor issues (small redundancy, weak consistency).
         0.0  Serious issues (reward hacking, contradiction, missing backtracking).
-
-    Checks:
-        - Redundancy: duplicate boxes/points in the thinking trace.
-        - Consistency: final answer count matches number of visual primitives
-          (for counting-style tasks).
-        - Contradiction: maze solvability claim conflicts with path presence.
-        - Reward hacking: suspicious phrases or copied ground truth.
-        - Meaningful references: box refs are not empty or numeric codes.
     """
     pred_reasoning = extract_reasoning(pred_text) or ""
     pred_answer = extract_answer(pred_text)
@@ -937,24 +1038,25 @@ def quality_reward_text(pred_text: str, gt_text: str, task_type: str = "box") ->
     issues = 0
     major_issue = False
 
-    # 1. Redundancy
+    # 1. Redundancy: duplicate boxes/points in the thinking trace.
     pred_boxes = parse_boxes(pred_reasoning)
     pred_points = parse_points(pred_reasoning)
     if _has_duplicate_coords(pred_boxes) or _has_duplicate_coords(pred_points):
         issues += 1
 
-    # 2. Consistency (counting tasks): answer number vs visual primitives
+    # 2. Consistency (counting tasks): final answer count matches number of visual primitives.
     if task_type == "box":
         answer_count = _count_in_answer(pred_answer)
         if answer_count is not None and len(pred_boxes) > 0:
-            # Allow small tolerance; severe mismatch is a major issue
+            # Allow small tolerance; severe mismatch is a major issue.
             if abs(answer_count - len(pred_boxes)) > max(1, len(pred_boxes) * 0.2):
                 major_issue = True
         elif answer_count is not None and answer_count > 0 and len(pred_boxes) == 0:
             major_issue = True
 
-    # 3. Contradiction (maze): claims solvable but no path points, or vice versa
+    # 3. Contradiction checks.
     if task_type == "maze":
+        # Maze: claims solvable but no path points, or vice versa.
         solvable_claim = False
         if pred_answer is not None:
             solvable_claim = "true" in pred_answer.lower() or "yes" in pred_answer.lower()
@@ -963,12 +1065,32 @@ def quality_reward_text(pred_text: str, gt_text: str, task_type: str = "box") ->
             major_issue = True
         if not solvable_claim and has_path:
             issues += 1
+    elif task_type == "box":
+        # Box: answer says "no X" / "False" / "0" but outputs boxes, or vice versa.
+        answer_lower = (pred_answer or "").lower()
+        negative_answer = any(
+            tok in answer_lower for tok in ["false", "no ", "none", "0", "not found"]
+        ) or (pred_answer == "0")
+        if negative_answer and len(pred_boxes) > 0:
+            major_issue = True
+        if not negative_answer and len(pred_boxes) == 0:
+            issues += 1
 
-    # 4. Reward hacking
+    # 4. Reward hacking: suspicious phrases or copied ground truth.
     if _looks_like_reward_hacking(pred_text, gt_text):
         major_issue = True
 
-    # 5. Meaningful references
+    # 5. Self-contradiction inside reasoning (e.g., "there is no dog" followed by a dog box).
+    reasoning_lower = pred_reasoning.lower()
+    negation_markers = [
+        "no ", "not ", "none", "does not exist", "cannot see", "isn't", "aren't",
+        "no visible", "no such", "doesn't appear",
+    ]
+    has_negation = any(m in reasoning_lower for m in negation_markers)
+    if has_negation and (len(pred_boxes) > 0 or len(pred_points) > 0):
+        major_issue = True
+
+    # 6. Meaningful references: box refs are not empty or numeric codes.
     if not _meaningful_references(pred_text):
         issues += 1
 
@@ -1024,70 +1146,147 @@ def filter_normal_level_data(
     task_type: str = "box",
     iou_threshold: float = 0.5,
     point_dist_threshold: float = 10.0,
-    easy_threshold: float = 1.5,
-    hard_threshold: float = 0.5,
+    batch_size: int = 4,
+    empty_cache_every: int = 50,
     logger=None,
 ) -> List[dict]:
     """Pre-filter GRPO training data to keep only Normal-difficulty samples.
 
     For each prompt, generate `num_generations` on-policy rollouts and classify
-    the sample as Easy/Normal/Hard based on reward scores. Only Normal samples
-    are retained, following the paper's Specialized RL data selection (Sec 2.5.2).
+    the sample as Easy/Normal/Hard based on the *number of correct rollouts*,
+    matching the paper's Specialized RL data selection (Sec 2.5.2):
+
+        * Easy:   all rollouts are correct.
+        * Hard:   all rollouts are incorrect.
+        * Normal: at least one correct and at least one incorrect rollout.
+
+    A rollout is considered correct when its final answer is correct AND the
+    output satisfies basic syntax constraints (see ``is_rollout_correct``).
+    This mirrors the paper's binary "correct response" counting rather than
+    thresholding a continuous reward value.
+
+    Batched generation is used to saturate the GPU: we process ``batch_size``
+    distinct prompts at once and repeat each prompt ``num_generations`` times,
+    so a single ``model.generate`` call handles ``batch_size * num_generations``
+    sequences. Gradient checkpointing is temporarily disabled and ``use_cache``
+    is enabled during filtering because we are in inference mode.
     """
     import torch
 
-    from ..data.datasets.image_loader import load_image
+    from .batch_inference import batch_generate_completions, generate_single_completion
 
+    was_training = model.training
     model.eval()
+
+    # Disable gradient checkpointing and enable KV-cache for fast inference.
+    grad_ckpt_enabled = getattr(model, "is_gradient_checkpointing", False) or getattr(
+        model, "gradient_checkpointing", False
+    )
+    if grad_ckpt_enabled:
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception:
+            pass
+
+    cache_configs = {}
+
+    def _set_use_cache(module, value):
+        cfg = getattr(module, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cid = id(cfg)
+            if cid not in cache_configs:
+                cache_configs[cid] = cfg.use_cache
+            cfg.use_cache = value
+        for child in module.children():
+            _set_use_cache(child, value)
+
+    _set_use_cache(model, True)
+
     normal_data = []
     easy_count = 0
     hard_count = 0
+    last_input_len = 0
 
-    for i, sample in enumerate(data):
-        image = load_image(sample.get("image"))
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful visual reasoning assistant. Think step by step.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": sample["prompt"]},
-                    ]
-                    if image is not None
-                    else sample["prompt"]
-                ),
-            },
-        ]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = processor(
-            text=[prompt_text],
-            images=[image] if image is not None else None,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-        scores = []
-        gt_text = sample.get(
-            "reasoning", ""
-        ) + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
-
-        for _ in range(num_generations):
-            with torch.inference_mode():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=max_completion_length,
-                    temperature=0.7,
-                    do_sample=True,
-                    pad_token_id=processor.tokenizer.pad_token_id,
-                    eos_token_id=processor.tokenizer.eos_token_id,
+    def _process_chunk(chunk):
+        nonlocal easy_count, hard_count, normal_data
+        try:
+            outputs, input_len = batch_generate_completions(
+                model=model,
+                processor=processor,
+                samples=chunk,
+                num_generations=num_generations,
+                max_completion_length=max_completion_length,
+                temperature=0.7,
+            )
+        except Exception as e:
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning(f"Batched generation failed: {e}; falling back to singles.")
+            for sample in chunk:
+                _process_single(sample)
+            return
+        nonlocal last_input_len
+        last_input_len = input_len
+        for j, sample in enumerate(chunk):
+            gt_text = (
+                sample.get("reasoning", "")
+                + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
+            )
+            rollouts = []
+            start = j * g
+            for offset in range(g):
+                pred = processor.tokenizer.decode(
+                    outputs[start + offset][input_len:], skip_special_tokens=False
                 )
-            input_len = inputs["input_ids"].shape[1]
+                try:
+                    total = compute_total_reward(
+                        pred_text=pred,
+                        gt_text=gt_text,
+                        task_type=task_type,
+                        iou_threshold=iou_threshold,
+                        point_dist_threshold=point_dist_threshold,
+                        maze_grid=sample.get("maze_grid"),
+                    )
+                    rollouts.append({"pred_text": pred, "total_reward": total["total_reward"]})
+                except Exception:
+                    rollouts.append({"pred_text": pred, "total_reward": 0.0})
+
+            correct_count = sum(
+                1
+                for r in rollouts
+                if is_rollout_correct(
+                    pred_text=r["pred_text"],
+                    gt_text=gt_text,
+                    task_type=task_type,
+                    iou_threshold=iou_threshold,
+                    point_dist_threshold=point_dist_threshold,
+                    maze_grid=sample.get("maze_grid"),
+                )
+            )
+            if correct_count == num_generations:
+                easy_count += 1
+            elif correct_count == 0:
+                hard_count += 1
+            else:
+                normal_data.append(sample)
+
+    def _process_single(sample):
+        nonlocal easy_count, hard_count, normal_data
+        gt_text = (
+            sample.get("reasoning", "")
+            + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
+        )
+        rollouts = []
+        for _ in range(num_generations):
+            try:
+                outputs, input_len = generate_single_completion(
+                    model=model,
+                    processor=processor,
+                    sample=sample,
+                    max_completion_length=max_completion_length,
+                    temperature=0.7,
+                )
+            except Exception:
+                continue
             pred = processor.tokenizer.decode(
                 outputs[0][input_len:], skip_special_tokens=False
             )
@@ -1100,22 +1299,43 @@ def filter_normal_level_data(
                     point_dist_threshold=point_dist_threshold,
                     maze_grid=sample.get("maze_grid"),
                 )
-                scores.append(total["total_reward"])
+                rollouts.append({"pred_text": pred, "total_reward": total["total_reward"]})
             except Exception:
-                scores.append(0.0)
+                rollouts.append({"pred_text": pred, "total_reward": 0.0})
 
-        if all(s >= easy_threshold for s in scores):
+        correct_count = sum(
+            1
+            for r in rollouts
+            if is_rollout_correct(
+                pred_text=r["pred_text"],
+                gt_text=gt_text,
+                task_type=task_type,
+                iou_threshold=iou_threshold,
+                point_dist_threshold=point_dist_threshold,
+                maze_grid=sample.get("maze_grid"),
+            )
+        )
+        if correct_count == num_generations:
             easy_count += 1
-        elif all(s < hard_threshold for s in scores):
+        elif correct_count == 0:
             hard_count += 1
         else:
             normal_data.append(sample)
 
-        if logger is not None and (i + 1) % 50 == 0:
+    for chunk_start in range(0, len(data), batch_size):
+        chunk = data[chunk_start : chunk_start + batch_size]
+        _process_chunk(chunk)
+
+        processed = min(chunk_start + batch_size, len(data))
+        if logger is not None and processed % 50 == 0:
+            peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
             logger.info(
-                f"  {i + 1}/{len(data)}: "
-                f"{len(normal_data)} normal kept, {easy_count} easy, {hard_count} hard"
+                f"  {processed}/{len(data)}: "
+                f"{len(normal_data)} normal kept, {easy_count} easy, {hard_count} hard | "
+                f"input_len={last_input_len} peak_mem={peak_mb:.0f}MB"
             )
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
     if logger is not None:
         logger.info(
@@ -1123,5 +1343,17 @@ def filter_normal_level_data(
             f"{easy_count} Easy skipped, {hard_count} Hard skipped"
         )
 
-    model.train()
+    # Restore gradient checkpointing and KV-cache settings.
+    if grad_ckpt_enabled:
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+    _set_use_cache(model, False)
+
+    if was_training:
+        model.train()
+    else:
+        model.eval()
+
     return normal_data

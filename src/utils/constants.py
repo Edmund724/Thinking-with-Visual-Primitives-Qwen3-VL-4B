@@ -28,9 +28,9 @@ POINT_PATTERN = re.compile(
     r"<\|point\|>\[\[(.*?)\]\]<\|/point\|>"
 )
 
-# QLoRA defaults
-DEFAULT_LORA_R = 64
-DEFAULT_LORA_ALPHA = 128
+# QLoRA defaults (aligned with reproduction hyperparameters)
+DEFAULT_LORA_R = 256
+DEFAULT_LORA_ALPHA = 512
 DEFAULT_LORA_DROPOUT = 0.05
 DEFAULT_LORA_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
@@ -45,15 +45,15 @@ GPU_MEMORY_WARNING_GB = 20.0
 DEFAULT_MAX_SEQ_LENGTH = 2048
 DEFAULT_IMAGE_SIZE = 448
 
-# Hard Negative Mining thresholds per round
-HN_BOX_IOU_THRESHOLDS = [0.5, 0.6, 0.7]
+# Hard Negative Mining thresholds per round (3-round GRPO schedule)
+HN_BOX_IOU_THRESHOLDS = [0.3, 0.5, 0.7]
 HN_POINT_DIST_THRESHOLD_PX = 10.0
 
 # DPO
 DEFAULT_DPO_BETA = 0.1
 
-# OPD distillation temperature
-DEFAULT_DISTILL_TEMPERATURE = 2.0
+# OPD distillation temperature (paper Sec 2.5.4 uses 1.0~1.5)
+DEFAULT_DISTILL_TEMPERATURE = 1.0
 
 # Maze dataset ratio
 MAZE_SOLVABLE_RATIO = 0.5

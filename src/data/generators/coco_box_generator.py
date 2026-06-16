@@ -391,6 +391,66 @@ def generate_synthetic_dense_counting(
 
 
 
+def _bbox_area(ann: Dict, img_w: int, img_h: int) -> float:
+    """Return bbox area as a ratio of image area."""
+    x, y, w, h = ann.get("bbox", [0.0, 0.0, 0.0, 0.0])
+    if w <= 0 or h <= 0:
+        return 0.0
+    return (w * h) / (img_w * img_h)
+
+
+def _size_label(area_ratio: float) -> str:
+    """Map area ratio to a coarse size label."""
+    if area_ratio > 0.15:
+        return "large"
+    if area_ratio > 0.05:
+        return "medium"
+    return "small"
+
+
+def _dominant_color_name(image_path: str, bbox: List[float]) -> str | None:
+    """Extract a coarse dominant color name from a bbox region.
+
+    Uses simple RGB centroid and maps to basic color names. Returns None if
+    the image cannot be loaded.
+    """
+    try:
+        from PIL import Image
+        img = Image.open(image_path).convert("RGB")
+        x, y, w, h = bbox
+        x1, y1 = max(0, int(x)), max(0, int(y))
+        x2, y2 = min(img.width, int(x + w)), min(img.height, int(y + h))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        crop = img.crop((x1, y1, x2, y2))
+        # Downsample for speed
+        crop = crop.resize((32, 32))
+        arr = np.array(crop).reshape(-1, 3)
+        mean = arr.mean(axis=0)
+        r, g, b = mean
+
+        # Simple hue-ish mapping
+        if r > g and r > b and abs(r - g) > 20 and abs(r - b) > 20:
+            return "red"
+        if g > r and g > b and abs(g - r) > 20:
+            return "green"
+        if b > r and b > g and abs(b - r) > 20:
+            return "blue"
+        if r > 180 and g > 180 and b < 120:
+            return "yellow"
+        if r > 120 and g > 80 and b > 120:
+            return "purple"
+        if r > 120 and g > 100 and b > 80 and abs(r - g) < 30 and abs(r - b) < 40:
+            return "brown"
+        if r > 180 and g > 180 and b > 180:
+            return "white"
+        if r < 60 and g < 60 and b < 60:
+            return "black"
+        return None
+    except Exception:
+        return None
+
+
 def generate_coco_counting_samples(
     image_dir: str,
     ann_file: str,
@@ -399,6 +459,7 @@ def generate_coco_counting_samples(
     min_instances: int = 3,
     max_instances: int = 30,
     target_categories: List[str] | None = None,
+    attribute_constraint_ratio: float = 0.0,
 ) -> List[Dict]:
     """Generate coarse-grained counting samples from COCO (paper Sec 2.4.1).
 
@@ -407,6 +468,10 @@ def generate_coco_counting_samples(
       2. Prompt: "How many {category}s are in this image?"
       3. Thinking: Intent Analysis → Batch Grounding (all boxes) → Summarization.
       4. Answer: integer count.
+
+    Args:
+        attribute_constraint_ratio: Fraction of counting samples that add a
+            color or size attribute constraint (e.g. 'How many red cars?').
 
     This matches the paper's coarse-grained counting protocol: batch grounding
     all candidate objects simultaneously, then tally.
@@ -485,17 +550,65 @@ def generate_coco_counting_samples(
         cat_name = cat_map.get(cat_id, "object")
         cat_anns = cat_groups[cat_id]
 
+        # Optional attribute constraint.
+        attr_type = None
+        attr_value = None
+        if random.random() < attribute_constraint_ratio:
+            attr_type = random.choice(["color", "size"])
+            if attr_type == "color":
+                # Filter to a dominant color present in at least 2 boxes.
+                color_counts = {}
+                color_boxes = {}
+                for ann in cat_anns:
+                    color = _dominant_color_name(img_path, ann["bbox"])
+                    if color:
+                        color_counts[color] = color_counts.get(color, 0) + 1
+                        color_boxes.setdefault(color, []).append(ann)
+                valid_colors = [c for c, n in color_counts.items() if n >= 2]
+                if valid_colors:
+                    attr_value = random.choice(valid_colors)
+                    cat_anns = color_boxes[attr_value]
+            else:
+                # Filter to a size label present in at least 2 boxes.
+                size_counts = {}
+                size_boxes = {}
+                for ann in cat_anns:
+                    area_ratio = _bbox_area(ann, img_w, img_h)
+                    size = _size_label(area_ratio)
+                    size_counts[size] = size_counts.get(size, 0) + 1
+                    size_boxes.setdefault(size, []).append(ann)
+                valid_sizes = [s for s, n in size_counts.items() if n >= 2]
+                if valid_sizes:
+                    attr_value = random.choice(valid_sizes)
+                    cat_anns = size_boxes[attr_value]
+
         boxes = [bbox_to_normalized(ann["bbox"], img_w, img_h) for ann in cat_anns]
         count = len(boxes)
 
         # Batch grounding: all target boxes in a single visual primitive tag.
         grounding_parts = [f"the {cat_name}s are at {format_box(boxes)}"]
 
-        intent = f"I need to count all {cat_name}s in the image."
-        summarization = f"There are {count} {cat_name}(s) in total."
+        if attr_type == "color":
+            prompt = (
+                f"How many {attr_value} {cat_name}s are in this image? "
+                "Use <|box|> to mark each one."
+            )
+            intent = f"I need to count all {attr_value} {cat_name}s in the image."
+            summarization = f"There are {count} {attr_value} {cat_name}(s) in total."
+        elif attr_type == "size":
+            prompt = (
+                f"How many {attr_value} {cat_name}s are in this image? "
+                "Use <|box|> to mark each one."
+            )
+            intent = f"I need to count all {attr_value} {cat_name}s in the image."
+            summarization = f"There are {count} {attr_value} {cat_name}(s) in total."
+        else:
+            prompt = f"How many {cat_name}s are in this image? Use <|box|> to mark each one."
+            intent = f"I need to count all {cat_name}s in the image."
+            summarization = f"There are {count} {cat_name}(s) in total."
+
         reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 
-        prompt = f"How many {cat_name}s are in this image? Use <|box|> to mark each one."
         answer = str(count)
 
         data.append({
@@ -511,4 +624,168 @@ def generate_coco_counting_samples(
         f"Generated {len(data)} verified coarse-grained counting samples "
         f"from {len(valid_img_ids)} images"
     )
+    return data
+
+
+def generate_coco_negative_box_samples(
+    image_dir: str,
+    ann_file: str,
+    num_samples: int = 2000,
+    seed: int = 45,
+    candidate_categories: List[str] | None = None,
+) -> List[Dict]:
+    """Generate faithful-refusal negative box samples.
+
+    For each sample, pick an image and a category that is NOT present in it,
+    then ask the model to locate/count that category. The correct behavior is
+    to answer \boxed{0} / \boxed{False} and output no boxes, matching the
+    paper's negative sample augmentation (Sec 2.4.2).
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    if not os.path.exists(ann_file):
+        logger.warning(f"COCO annotation file not found: {ann_file}. Returning empty list.")
+        return []
+
+    coco_data = load_coco_annotations(ann_file)
+    cat_map = build_category_map(coco_data)
+    name_to_cat = {name: cid for cid, name in cat_map.items()}
+    image_anns = build_image_annotations(coco_data)
+    images = {img["id"]: img for img in coco_data["images"]}
+
+    if candidate_categories is None:
+        candidate_categories = list(name_to_cat.keys())
+    candidate_cat_ids = {name_to_cat[name] for name in candidate_categories if name in name_to_cat}
+
+    valid_img_ids = [img_id for img_id in images if img_id in image_anns]
+    if not valid_img_ids:
+        logger.warning("No valid images with annotations found.")
+        return []
+
+    data = []
+    attempts = 0
+    max_attempts = num_samples * 10
+
+    while len(data) < num_samples and attempts < max_attempts:
+        attempts += 1
+        img_id = random.choice(valid_img_ids)
+        img_info = images[img_id]
+        img_w, img_h = img_info["width"], img_info["height"]
+
+        img_path = os.path.join(image_dir, img_info["file_name"])
+        if not os.path.exists(img_path):
+            continue
+
+        present_cat_ids = {ann["category_id"] for ann in image_anns[img_id]}
+        absent_cat_ids = candidate_cat_ids - present_cat_ids
+        if not absent_cat_ids:
+            continue
+
+        cat_id = random.choice(list(absent_cat_ids))
+        cat_name = cat_map.get(cat_id, "object")
+
+        # Randomly choose localization or counting refusal.
+        if random.random() < 0.5:
+            prompt = f"Locate all {cat_name}s in the image and mark each with <|box|>."
+            answer = r"\boxed{False}"
+            summarization = f"There are no {cat_name}s visible in the image."
+        else:
+            prompt = f"How many {cat_name}s are in this image? Use <|box|> to mark each one."
+            answer = r"\boxed{0}"
+            summarization = f"There are 0 {cat_name}(s) in the image."
+
+        intent = f"I need to check whether any {cat_name}s appear in the image."
+        reasoning = _build_thinking_3step(
+            intent,
+            ["I scanned the image and found no matching objects."],
+            summarization,
+        )
+
+        data.append({
+            "image": img_path,
+            "prompt": prompt,
+            "reasoning": reasoning,
+            "answer": answer,
+            "task_type": "box",
+        })
+
+    data = filter_verified_samples(data, logger=logger)
+    logger.info(f"Generated {len(data)} verified COCO negative box samples")
+    return data
+
+
+def generate_coco_negative_point_samples(
+    image_dir: str,
+    ann_file: str,
+    num_samples: int = 1000,
+    seed: int = 47,
+    candidate_categories: List[str] | None = None,
+) -> List[Dict]:
+    """Generate faithful-refusal negative point samples.
+
+    Asks the model to point to a category that is NOT present in the image.
+    Correct behavior: answer \boxed{False} / 'not found' and output no points.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    if not os.path.exists(ann_file):
+        logger.warning(f"COCO annotation file not found: {ann_file}. Returning empty list.")
+        return []
+
+    coco_data = load_coco_annotations(ann_file)
+    cat_map = build_category_map(coco_data)
+    name_to_cat = {name: cid for cid, name in cat_map.items()}
+    image_anns = build_image_annotations(coco_data)
+    images = {img["id"]: img for img in coco_data["images"]}
+
+    if candidate_categories is None:
+        candidate_categories = list(name_to_cat.keys())
+    candidate_cat_ids = {name_to_cat[name] for name in candidate_categories if name in name_to_cat}
+
+    valid_img_ids = [img_id for img_id in images if img_id in image_anns]
+    if not valid_img_ids:
+        logger.warning("No valid images with annotations found.")
+        return []
+
+    data = []
+    attempts = 0
+    max_attempts = num_samples * 10
+
+    while len(data) < num_samples and attempts < max_attempts:
+        attempts += 1
+        img_id = random.choice(valid_img_ids)
+        img_info = images[img_id]
+
+        img_path = os.path.join(image_dir, img_info["file_name"])
+        if not os.path.exists(img_path):
+            continue
+
+        present_cat_ids = {ann["category_id"] for ann in image_anns[img_id]}
+        absent_cat_ids = candidate_cat_ids - present_cat_ids
+        if not absent_cat_ids:
+            continue
+
+        cat_id = random.choice(list(absent_cat_ids))
+        cat_name = cat_map.get(cat_id, "object")
+
+        prompt = f"Point to the {cat_name} in this image."
+        intent = f"I need to locate the {cat_name} in the image."
+        reasoning = _build_thinking_3step(
+            intent,
+            ["I scanned the image and found no matching object."],
+            f"There is no {cat_name} visible in the image.",
+        )
+
+        data.append({
+            "image": img_path,
+            "prompt": prompt,
+            "reasoning": reasoning,
+            "answer": r"\boxed{False}",
+            "task_type": "point",
+        })
+
+    data = filter_verified_samples(data, logger=logger)
+    logger.info(f"Generated {len(data)} verified COCO negative point samples")
     return data

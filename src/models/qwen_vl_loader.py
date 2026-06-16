@@ -191,6 +191,9 @@ def load_qlora_model(
     new_tokenizer_len = len(processor.tokenizer)
     logger.info(f"Added {num_added} special tokens: {SPECIAL_TOKENS}")
 
+    # Decoder-only models need left padding for batched generation.
+    processor.tokenizer.padding_side = "left"
+
     # Explicitly align model config / generation_config with tokenizer token IDs
     # to suppress the auto-alignment warning from transformers.
     tokenizer = processor.tokenizer
@@ -346,6 +349,9 @@ def load_reference_model(
     num_added = processor.tokenizer.add_special_tokens(special_tokens_dict)
     new_tokenizer_len = len(processor.tokenizer)
     logger.info(f"Reference: added {num_added} special tokens, tokenizer len={new_tokenizer_len}")
+
+    # Decoder-only models need left padding for batched generation.
+    processor.tokenizer.padding_side = "left"
 
     # Explicitly align model config / generation_config with tokenizer token IDs
     ref_tokenizer = processor.tokenizer

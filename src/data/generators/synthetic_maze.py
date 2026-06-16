@@ -101,6 +101,76 @@ def break_path_middle(
     return new_grid
 
 
+def add_backtracking_trap(
+    maze_grid: np.ndarray,
+    solution_path: List[Tuple[int, int]],
+    trap_length: int = 3,
+) -> np.ndarray:
+    """Add a dead-end corridor adjacent to the solution path.
+
+    The solver must enter the trap, reach the dead end, and backtrack before
+    continuing along the real solution. This produces explicit backtracking
+    behavior in the exploration log.
+
+    Returns:
+        Modified maze grid with the trap carved in.
+    """
+    new_grid = maze_grid.copy()
+    if len(solution_path) < 4:
+        return new_grid
+
+    h, w = new_grid.shape
+
+    # Pick a cell on the solution path that is not the start/end and has
+    # at least one wall neighbor that can be turned into a dead-end corridor.
+    candidates = []
+    for i in range(1, len(solution_path) - 1):
+        x, y = solution_path[i]
+        # Neighbors that are currently walls
+        wall_neighbors = []
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < w and 0 <= ny < h and new_grid[ny, nx] == 0:
+                wall_neighbors.append((nx, ny, dx, dy))
+        if wall_neighbors:
+            candidates.append((x, y, wall_neighbors))
+
+    if not candidates:
+        return new_grid
+
+    import random
+    x, y, wall_neighbors = random.choice(candidates)
+    nx, ny, dx, dy = random.choice(wall_neighbors)
+
+    # Carve the first cell of the trap.
+    new_grid[ny, nx] = 1
+
+    # Continue straight as far as possible to create a corridor.
+    carved = 1
+    cx, cy = nx, ny
+    while carved < trap_length:
+        fx, fy = cx + dx, cy + dy
+        if 0 <= fx < w and 0 <= fy < h and new_grid[fy, fx] == 0:
+            # Only carve if it doesn't connect to another path cell.
+            side_neighbors = [
+                (fx + sx, fy + sy)
+                for sx, sy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
+                if (fx + sx, fy + sy) != (cx, cy)
+            ]
+            if any(
+                0 <= sx < w and 0 <= sy < h and new_grid[sy, sx] == 1
+                for sx, sy in side_neighbors
+            ):
+                break
+            new_grid[fy, fx] = 1
+            cx, cy = fx, fy
+            carved += 1
+        else:
+            break
+
+    return new_grid
+
+
 def dfs_exploration_with_backtracking(
     maze_grid: np.ndarray,
     start: Tuple[int, int],
@@ -278,10 +348,17 @@ def _limit_grounding_log(grounding: str, max_lines: int = 25) -> str:
 
 
 def generate_maze_dataset(
-    n: int = 100000, seed: int = 42, cache_dir: str = "data/cache/maze",
+    n: int = 100000,
+    seed: int = 42,
+    cache_dir: str = "data/cache/maze",
     max_grounding_lines: int = 25,
+    backtracking_trap_ratio: float = 0.5,
 ) -> List[Dict]:
     """Generate maze dataset with 50% solvable / 50% unsolvable and 3-step thinking.
+
+    Args:
+        backtracking_trap_ratio: Fraction of solvable mazes that get an explicit
+            dead-end trap carved next to the solution path, forcing backtracking.
 
     Images are saved to disk and image_path is returned to avoid OOM.
 
@@ -308,12 +385,11 @@ def generate_maze_dataset(
         if start is None or end is None:
             continue
 
-        img = render_maze_image(maze_grid, start, end)
-        img_path = os.path.join(cache_dir, f"maze_{seed}_{idx:06d}.png")
-        img.save(img_path)
-
         if random.random() < MAZE_SOLVABLE_RATIO:
-            # Solvable maze
+            # Solvable maze; optionally add a backtracking trap.
+            solution = solve_maze_dfs(maze_grid, start, end)
+            if solution and random.random() < backtracking_trap_ratio:
+                maze_grid = add_backtracking_trap(maze_grid, solution, trap_length=random.randint(2, 4))
             grounding = dfs_exploration_with_backtracking(maze_grid, start, end)
             grounding = _limit_grounding_log(grounding, max_grounding_lines)
             thinking = _build_maze_thinking_3step(grounding, solvable=True)
@@ -328,11 +404,16 @@ def generate_maze_dataset(
             thinking = _build_maze_thinking_3step(grounding, solvable=False)
             answer = r"\boxed{False}"
 
+        img = render_maze_image(maze_grid, start, end)
+        img_path = os.path.join(cache_dir, f"maze_{seed}_{idx:06d}.png")
+        img.save(img_path)
+
         data.append({
             "image": img_path,
             "prompt": "Is there a path from the green circle (start) to the red square (end)? Use <|point|> to show your exploration process step by step.",
             "reasoning": thinking,
             "answer": answer,
+            "maze_grid": maze_grid,
             "task_type": "maze",
         })
 

@@ -13,7 +13,7 @@ Algorithm per step:
 Key design (per paper):
   - On-policy: input sequence MUST be student-generated, not expert-generated
   - Reverse KL: D_KL(S || E) — student learns expert's high-probability regions
-  - Temperature: temp=1.0~1.5 to soften distributions
+  - Temperature: DEFAULT_DISTILL_TEMPERATURE (paper range 1.0~1.5) to soften distributions
 """
 
 import logging
@@ -28,6 +28,7 @@ from transformers import AutoProcessor
 from tqdm import tqdm
 
 from ..data.datasets.image_loader import load_image
+from ..utils.constants import DEFAULT_DISTILL_TEMPERATURE
 
 
 class OPDDataset(Dataset):
@@ -208,7 +209,7 @@ def train_opd(
     learning_rate: float = 1e-6,
     per_device_batch_size: int = 1,
     max_new_tokens: int = 512,
-    temperature: float = 1.0,
+    temperature: float = DEFAULT_DISTILL_TEMPERATURE,
     warmup_steps: int = 100,
     logging_steps: int = 20,
     save_steps: int = 500,

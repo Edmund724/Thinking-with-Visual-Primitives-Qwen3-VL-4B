@@ -12,7 +12,123 @@ Output: data/pretrain/pretrain_data.json (conversations format)
 import json
 import os
 import random
-from typing import List
+from typing import Dict, List, Tuple
+
+
+def _load_coco_annotations(ann_file: str) -> Dict:
+    """Load COCO annotations if available."""
+    with open(ann_file, "r") as f:
+        return json.load(f)
+
+
+def _bbox_to_normalized(bbox: List[float], img_w: int, img_h: int) -> Tuple[int, int, int, int]:
+    """Convert COCO bbox [x, y, w, h] to normalized [x1, y1, x2, y2] in 0-999."""
+    x1 = max(0, min(999, int(bbox[0] / img_w * 999)))
+    y1 = max(0, min(999, int(bbox[1] / img_h * 999)))
+    x2 = max(0, min(999, int((bbox[0] + bbox[2]) / img_w * 999)))
+    y2 = max(0, min(999, int((bbox[1] + bbox[3]) / img_h * 999)))
+    return (x1, y1, x2, y2)
+
+
+def _center_to_normalized(bbox: List[float], img_w: int, img_h: int) -> Tuple[int, int]:
+    """Convert COCO bbox to normalized center point."""
+    cx = max(0, min(999, int((bbox[0] + bbox[2] / 2) / img_w * 999)))
+    cy = max(0, min(999, int((bbox[1] + bbox[3] / 2) / img_h * 999)))
+    return (cx, cy)
+
+
+def generate_coco_grounding_pretrain_samples(
+    ann_file: str,
+    num_samples: int = 5000,
+    seed: int = 43,
+) -> List[dict]:
+    """Generate text-only pretrain samples using real COCO annotations.
+
+    Stage 1 is embedding-only and does not process images, but using real
+    category names + real bounding box coordinates helps the model learn
+    realistic coordinate distributions and vocabulary, moving closer to the
+    paper's large-scale grounding pretraining (Sec 2.3).
+    """
+    if not os.path.exists(ann_file):
+        print(f"COCO annotations not found at {ann_file}; skipping COCO grounding mix.")
+        return []
+
+    random.seed(seed)
+    coco_data = _load_coco_annotations(ann_file)
+    cat_map = {cat["id"]: cat["name"] for cat in coco_data["categories"]}
+    images = {img["id"]: img for img in coco_data["images"]}
+
+    # Group annotations by image.
+    image_anns: Dict[int, List[Dict]] = {}
+    for ann in coco_data["annotations"]:
+        img_id = ann["image_id"]
+        image_anns.setdefault(img_id, []).append(ann)
+
+    valid_img_ids = [img_id for img_id in images if img_id in image_anns]
+    if not valid_img_ids:
+        return []
+
+    data = []
+    attempts = 0
+    max_attempts = num_samples * 5
+
+    while len(data) < num_samples and attempts < max_attempts:
+        attempts += 1
+        img_id = random.choice(valid_img_ids)
+        img_info = images[img_id]
+        img_w, img_h = img_info["width"], img_info["height"]
+        anns = image_anns[img_id]
+        if not anns:
+            continue
+
+        # Build category groups for this image.
+        cat_groups: Dict[int, List[Dict]] = {}
+        for ann in anns:
+            cat_groups.setdefault(ann["category_id"], []).append(ann)
+
+        cat_id = random.choice(list(cat_groups.keys()))
+        cat_name = cat_map.get(cat_id, "object")
+        cat_anns = cat_groups[cat_id]
+
+        task_type = random.random()
+        if task_type < 0.5 and len(cat_anns) >= 1:
+            # Single box.
+            ann = random.choice(cat_anns)
+            x1, y1, x2, y2 = _bbox_to_normalized(ann["bbox"], img_w, img_h)
+            box_str = f"<|box|>[[{x1},{y1},{x2},{y2}]]<|/box|>"
+            user = random.choice(BOX_USER_TEMPLATES).format(obj=cat_name)
+            assistant = random.choice(BOX_ASSISTANT_TEMPLATES).format(obj=cat_name, box=box_str)
+        elif len(cat_anns) >= 2:
+            # Multiple boxes.
+            selected = random.sample(cat_anns, k=min(random.randint(2, 5), len(cat_anns)))
+            boxes = [_bbox_to_normalized(ann["bbox"], img_w, img_h) for ann in selected]
+            inner = "],[".join(f"{x1},{y1},{x2},{y2}" for x1, y1, x2, y2 in boxes)
+            box_str = f"<|box|>[[{inner}]]<|/box|>"
+            user = random.choice(BOX_MULTI_USER_TEMPLATES).format(obj=f"{cat_name}s")
+            assistant = random.choice(BOX_MULTI_ASSISTANT_TEMPLATES).format(
+                count=len(boxes), obj=f"{cat_name}s", boxes=box_str
+            )
+        else:
+            # Single point (center of the only box).
+            ann = cat_anns[0]
+            cx, cy = _center_to_normalized(ann["bbox"], img_w, img_h)
+            point_str = f"<|point|>[[{cx},{cy}]]<|/point|>"
+            user = random.choice(POINT_USER_TEMPLATES).format(obj=cat_name)
+            assistant = random.choice(POINT_ASSISTANT_TEMPLATES).format(obj=cat_name, point=point_str)
+
+        if not _validate_tags(user + " " + assistant):
+            continue
+        if len(assistant.split()) > 80:
+            continue
+
+        data.append({
+            "conversations": [
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": assistant},
+            ]
+        })
+
+    return data
 
 
 def random_box() -> str:
@@ -240,28 +356,73 @@ def _validate_tags(text: str) -> bool:
     )
 
 
-def generate_dataset(n: int = 25000, seed: int = 42) -> List[dict]:
+def _sample_complexity(sample: dict) -> int:
+    """Proxy complexity: number of tokens in the assistant message."""
+    convs = sample.get("conversations", [])
+    if not convs:
+        return 0
+    text = convs[-1].get("content", "")
+    # Count visual primitive tags and coordinate numbers.
+    tag_count = (
+        text.count("<|box|>")
+        + text.count("<|point|>")
+        + text.count("<|/box|>")
+        + text.count("<|/point|>")
+    )
+    num_count = len([c for c in text if c.isdigit()])
+    return len(text.split()) + tag_count * 2 + num_count // 4
+
+
+def generate_dataset(
+    n: int = 25000,
+    seed: int = 42,
+    coco_ann_file: str | None = None,
+    coco_grounding_ratio: float = 0.0,
+    curriculum: bool = False,
+) -> List[dict]:
     """Generate pretrain conversation dataset.
 
     Args:
         n: Target number of samples.
         seed: Random seed.
+        coco_ann_file: Optional COCO annotation file. If provided, a fraction
+            of the samples will use real COCO categories + coordinates.
+        coco_grounding_ratio: Fraction of samples to draw from COCO (0.0~0.5).
+        curriculum: If True, sort samples from short/simple to long/complex
+            (paper-style Stage 1/2 curriculum).
 
     Returns:
         List of conversation dicts.
     """
     random.seed(seed)
+    coco_count = int(n * max(0.0, min(coco_grounding_ratio, 0.5)))
+    synthetic_count = n - coco_count
+
+    # Synthetic samples.
     data = []
     attempts = 0
-    max_attempts = n * 3
+    max_attempts = synthetic_count * 3
 
-    while len(data) < n and attempts < max_attempts:
+    while len(data) < synthetic_count and attempts < max_attempts:
         attempts += 1
         sample = generate_sample()
         if sample is not None:
             data.append(sample)
 
-    return data
+    # COCO-derived samples (real categories + coordinates, still text-only).
+    if coco_count > 0 and coco_ann_file:
+        coco_data = generate_coco_grounding_pretrain_samples(
+            ann_file=coco_ann_file,
+            num_samples=coco_count,
+            seed=seed + 1,
+        )
+        data.extend(coco_data)
+
+    if curriculum:
+        data.sort(key=_sample_complexity)
+    else:
+        random.shuffle(data)
+    return data[:n]
 
 
 def export_for_training(data: List[dict], output_path: str):

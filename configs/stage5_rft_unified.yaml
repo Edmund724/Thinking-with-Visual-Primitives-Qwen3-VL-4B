@@ -19,10 +19,11 @@ save_steps: 500
 save_total_limit: 3
 gradient_checkpointing: true
 report_to: none
-num_box_prompts: 5000
+num_box_prompts: 4000
+num_counting_prompts: 3000
+num_clevr_prompts: 2000
 num_point_prompts: 3000
 num_maze_prompts: 3000
 num_rollouts: 5
 iou_threshold: 0.5
 point_dist_threshold: 10.0
-accept_threshold: 0.5

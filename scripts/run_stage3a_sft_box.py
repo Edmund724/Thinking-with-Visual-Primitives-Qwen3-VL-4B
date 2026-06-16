@@ -23,11 +23,13 @@ import torch
 from src.data.generators.coco_box_generator import (
     generate_coco_box_samples,
     generate_coco_counting_samples,
+    generate_coco_negative_box_samples,
 )
 from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
+from src.utils.config_utils import apply_yaml_defaults
 from src.utils.logging_utils import setup_logging
 
 logger = setup_logging(log_file="logs/stage3a_sft_box.log")
@@ -66,6 +68,7 @@ def main(args):
         image_dir=args.coco_image_dir,
         ann_file=args.coco_ann_file,
         num_samples=args.num_counting,
+        attribute_constraint_ratio=args.counting_attribute_ratio,
     )
     for d in counting_data:
         d["task_type"] = "box"
@@ -75,12 +78,24 @@ def main(args):
         n=args.num_clevr,
         seed=44,
         cache_dir=os.path.join(args.output_dir, "clevr_cache"),
+        negative_ratio=args.clevr_negative_ratio,
     )
     for d in clevr_data:
         d["task_type"] = "box"
     logger.info(f"  CLEVR spatial/VQA samples: {len(clevr_data)}")
 
-    visual_data = box_data + counting_data + clevr_data
+    negative_box_data = generate_coco_negative_box_samples(
+        image_dir=args.coco_image_dir,
+        ann_file=args.coco_ann_file,
+        num_samples=args.num_negative_box,
+        seed=46,
+    )
+    for d in negative_box_data:
+        d["task_type"] = "box"
+    all_data.extend(negative_box_data)
+    logger.info(f"  COCO negative box samples: {len(negative_box_data)}")
+
+    visual_data = box_data + counting_data + clevr_data + negative_box_data
 
     # 70% general data (text-only pretrain data)
     general_data = []
@@ -144,17 +159,25 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 3a: Box Expert SFT")
+    parser.add_argument("--config", type=str, default="configs/stage3a_sft_box.yaml",
+                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
     parser.add_argument("--model_path", type=str, default="outputs/stage2_merged_base")
     parser.add_argument("--output_dir", type=str, default="outputs/stage3a_sft_box")
     parser.add_argument("--general_data_path", type=str, default="data/pretrain/pretrain_data.json")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_box", type=int, default=10000)
+    parser.add_argument("--num_box", type=int, default=15000)
     parser.add_argument("--num_counting", type=int, default=10000,
                         help="Number of coarse-grained counting samples")
+    parser.add_argument("--counting_attribute_ratio", type=float, default=0.3,
+                        help="Fraction of counting samples with color/size attribute constraints")
     parser.add_argument("--num_clevr", type=int, default=5000,
                         help="Number of CLEVR-style spatial/VQA samples")
+    parser.add_argument("--clevr_negative_ratio", type=float, default=0.25,
+                        help="Fraction of CLEVR samples that are faithful-refusal negatives")
+    parser.add_argument("--num_negative_box", type=int, default=2000,
+                        help="Number of COCO negative box samples (category not present)")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -168,4 +191,5 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint dir to resume from, e.g. outputs/stage3a_sft_box/checkpoint-500")
     args = parser.parse_args()
+    apply_yaml_defaults(args, parser, args.config)
     main(args)

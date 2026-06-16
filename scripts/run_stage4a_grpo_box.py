@@ -32,7 +32,12 @@ from src.data.generators.coco_box_generator import (
 from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
 from src.training.memory_utils import log_memory_status, clear_memory, GPUMemoryMonitor
+from src.training.callbacks import (
+    ValidationSubsetEarlyStoppingCallback,
+    maybe_compile_model,
+)
 from src.utils.constants import GPU_MEMORY_WARNING_GB
+from src.utils.config_utils import apply_yaml_defaults
 from src.utils.logging_utils import setup_logging
 from src.utils.metrics import (
     compute_total_reward,
@@ -40,6 +45,7 @@ from src.utils.metrics import (
     length_reward,
     make_quality_reward_fn,
 )
+from src.utils.quality_rm_api import make_quality_reward_api_fn
 
 logger = logging.getLogger("stage4a_grpo_box")
 
@@ -131,6 +137,9 @@ def main(args):
     )
     log_memory_status("Policy loaded:")
 
+    # Optional torch.compile (best-effort).
+    policy_model = maybe_compile_model(policy_model, enable=args.compile_model)
+
     # 2. Generate or load cached GRPO data
     cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
     if os.path.exists(cache_path):
@@ -185,7 +194,9 @@ def main(args):
 
     # Difficulty filtering: keep only Normal-level samples (paper Sec 2.5.2).
     filtered_cache_path = os.path.join(args.output_dir, "filtered_train_data_cache.pkl")
-    if os.path.exists(filtered_cache_path):
+    if args.skip_difficulty_filter:
+        logger.info("--skip_difficulty_filter is set; using all samples without filtering")
+    elif os.path.exists(filtered_cache_path):
         logger.info(f"Loading filtered training data from {filtered_cache_path}")
         with open(filtered_cache_path, "rb") as f:
             all_data = pickle.load(f)
@@ -197,9 +208,11 @@ def main(args):
             processor=processor,
             data=all_data,
             num_generations=args.num_generations,
-            max_completion_length=args.max_completion_length,
+            max_completion_length=args.filter_max_completion_length,
             task_type="box",
             iou_threshold=iou_thresholds[0] if num_rounds > 0 else 0.5,
+            batch_size=args.filter_batch_size,
+            empty_cache_every=args.filter_empty_cache_every,
             logger=logger,
         )
         with open(filtered_cache_path, "wb") as f:
@@ -297,9 +310,28 @@ def main(args):
         )
         mem_threshold_gb = max(GPU_MEMORY_WARNING_GB, total_vram_gb * 0.85)
 
-        quality_fn = make_quality_reward_fn(
-            tokenizer=processor.tokenizer, task_type_default="box"
-        )
+        if args.use_quality_rm_api:
+            quality_fn = make_quality_reward_api_fn(
+                tokenizer=processor.tokenizer, task_type_default="box"
+            )
+        else:
+            quality_fn = make_quality_reward_fn(
+                tokenizer=processor.tokenizer, task_type_default="box"
+            )
+
+        callbacks = [GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb)]
+        if args.early_stopping_subset_size > 0:
+            callbacks.append(
+                ValidationSubsetEarlyStoppingCallback(
+                    model=policy_model,
+                    processor=processor,
+                    eval_data=all_data,
+                    reward_fn=reward_fn,
+                    eval_steps=args.early_stopping_eval_steps,
+                    patience=args.early_stopping_patience,
+                    subset_size=args.early_stopping_subset_size,
+                )
+            )
 
         trainer = GRPOTrainer(
             model=policy_model,
@@ -307,7 +339,7 @@ def main(args):
             args=grpo_config,
             train_dataset=dataset,
             processing_class=processor,
-            callbacks=[GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb)],
+            callbacks=callbacks,
         )
 
         logger.info("Training GRPO...")
@@ -339,12 +371,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 4a: Box Expert GRPO")
+    parser.add_argument("--config", type=str, default="configs/stage4a_grpo_box.yaml",
+                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
     parser.add_argument("--model_path", type=str, default="outputs/stage3a_sft_box")
     parser.add_argument("--output_dir", type=str, default="outputs/stage4a_grpo_box")
     parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_samples", type=int, default=3000)
+    parser.add_argument("--num_samples", type=int, default=5000)
     parser.add_argument("--num_counting", type=int, default=3000,
                         help="Number of coarse-grained counting samples")
     parser.add_argument("--num_clevr", type=int, default=2000,
@@ -360,9 +394,44 @@ if __name__ == "__main__":
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--num_generations", type=int, default=6)
+    parser.add_argument("--filter_batch_size", type=int, default=4,
+                        help="Batch size for difficulty-filter generation (prompts per batch)")
+    parser.add_argument("--filter_max_completion_length", type=int, default=384,
+                        help="Max completion length used only during difficulty filtering")
+    parser.add_argument("--filter_empty_cache_every", type=int, default=50)
+    parser.add_argument("--skip_difficulty_filter", action="store_true",
+                        help="Skip difficulty filtering and use all generated samples")
     parser.add_argument("--max_completion_length", type=int, default=384)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--use_quality_rm_api",
+        action="store_true",
+        help="Use OpenAI-compatible API for Quality RM (requires .env key).",
+    )
+    parser.add_argument(
+        "--compile_model",
+        action="store_true",
+        help="Try torch.compile on the policy model (best-effort).",
+    )
+    parser.add_argument(
+        "--early_stopping_subset_size",
+        type=int,
+        default=32,
+        help="Validation subset size for early stopping (0 to disable).",
+    )
+    parser.add_argument(
+        "--early_stopping_eval_steps",
+        type=int,
+        default=50,
+        help="Evaluate validation subset every N steps.",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=2,
+        help="Stop after this many evals without improvement.",
+    )
     parser.add_argument(
         "--no_console_log",
         action="store_true",
@@ -374,4 +443,5 @@ if __name__ == "__main__":
         help="Disable progress bars to reduce console output.",
     )
     args = parser.parse_args()
+    apply_yaml_defaults(args, parser, args.config)
     main(args)

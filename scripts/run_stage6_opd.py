@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 6: OPD (Offline Preference Distillation) — Reverse KL Distillation.
+"""Stage 6: OPD (On-Policy Distillation) — Reverse KL Distillation.
 
 Student = Unified RFT model (Stage 5 output)
 Experts = Box Expert + Point Expert (Stage 4 output, frozen teachers)
@@ -34,6 +34,7 @@ from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.opd_trainer import train_opd
 from src.training.memory_utils import log_memory_status, clear_memory
+from src.utils.constants import DEFAULT_DISTILL_TEMPERATURE
 from src.utils.logging_utils import setup_logging
 
 logger = setup_logging(log_file="logs/stage6_opd.log")
@@ -50,7 +51,7 @@ def _latest_opd_checkpoint(output_dir: str):
 
 def main(args):
     logger.info("=" * 60)
-    logger.info("Stage 6: OPD (Offline Preference Distillation)")
+    logger.info("Stage 6: OPD (On-Policy Distillation)")
     logger.info("=" * 60)
 
     torch.cuda.empty_cache()
@@ -211,6 +212,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 6: OPD")
+    parser.add_argument("--config", type=str, default="configs/stage6_opd.yaml",
+                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
     parser.add_argument("--student_path", type=str, default="outputs/stage5_rft_unified/final_model")
     parser.add_argument("--box_expert_path", type=str, default="outputs/stage4a_grpo_box")
     parser.add_argument("--point_expert_path", type=str, default="outputs/stage4b_grpo_point")
@@ -225,7 +228,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-6)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_DISTILL_TEMPERATURE)
     parser.add_argument("--lora_r", type=int, default=256)
     parser.add_argument("--lora_alpha", type=int, default=512)
     parser.add_argument("--logging_steps", type=int, default=20)
@@ -234,4 +237,5 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint dir to resume from, e.g. outputs/stage6_opd/checkpoint-500")
     args = parser.parse_args()
+    apply_yaml_defaults(args, parser, args.config)
     main(args)

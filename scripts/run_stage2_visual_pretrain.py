@@ -38,6 +38,7 @@ from src.data.generators.coco_box_generator import (
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
+from src.utils.config_utils import apply_yaml_defaults
 from src.utils.logging_utils import setup_logging
 from src.utils.constants import BASE_VOCAB_SIZE
 
@@ -96,7 +97,19 @@ def main(args):
     all_data.extend(point_data)
     logger.info(f"  COCO point samples: {len(point_data)}")
 
-    random.shuffle(all_data)
+    if args.curriculum:
+        # Sort from simple (few boxes/points) to complex.
+        def _visual_complexity(d):
+            text = d.get("reasoning", "") + " " + d.get("answer", "")
+            return (
+                text.count("<|box|>")
+                + text.count("<|point|>")
+                + len(text.split())
+            )
+        all_data.sort(key=_visual_complexity)
+        logger.info("Applied Stage 2 curriculum: short-to-long token sequences.")
+    else:
+        random.shuffle(all_data)
     logger.info(f"Total training samples: {len(all_data)}")
 
     # 3. Train
@@ -128,6 +141,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 2: Visual Pretrain")
+    parser.add_argument("--config", type=str, default="configs/stage2_visual_pretrain.yaml",
+                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
     parser.add_argument("--model_path", type=str, default="models/Qwen3-VL-4B-Thinking")
     parser.add_argument("--pretrain_embedding_path", type=str, default="outputs/stage1_pretrain")
     parser.add_argument("--output_dir", type=str, default="outputs/stage2_visual_pretrain")
@@ -136,6 +151,8 @@ if __name__ == "__main__":
                         default="data/coco/annotations/instances_train2017.json")
     parser.add_argument("--num_box", type=int, default=50000)
     parser.add_argument("--num_point", type=int, default=10000)
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Sort visual pretrain data from simple to complex")
     parser.add_argument("--num_epochs", type=int, default=2)
     parser.add_argument("--learning_rate", type=float, default=2e-6)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -147,4 +164,5 @@ if __name__ == "__main__":
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--warmup_steps", type=int, default=100)
     args = parser.parse_args()
+    apply_yaml_defaults(args, parser, args.config)
     main(args)

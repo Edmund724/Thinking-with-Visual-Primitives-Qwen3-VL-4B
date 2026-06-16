@@ -21,12 +21,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from src.data.generators.coco_box_generator import generate_coco_point_samples
+from src.data.generators.coco_box_generator import (
+    generate_coco_negative_point_samples,
+    generate_coco_point_samples,
+)
 from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
+from src.utils.config_utils import apply_yaml_defaults
 from src.utils.logging_utils import setup_logging
 
 logger = setup_logging(log_file="logs/stage3b_sft_point.log")
@@ -90,6 +94,16 @@ def main(args):
             d["task_type"] = "point"
         logger.info(f"  Path tracing samples: {len(path_data)}")
 
+        negative_point_data = generate_coco_negative_point_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_negative_point,
+            seed=47,
+        )
+        for d in negative_point_data:
+            d["task_type"] = "point"
+        logger.info(f"  COCO negative point samples: {len(negative_point_data)}")
+
         # 70% general data (text-only pretrain data)
         general_data = []
         if os.path.exists(args.general_data_path):
@@ -109,7 +123,7 @@ def main(args):
                     "task_type": "general",
                 })
             # 70% of total = general, 30% = visual primitives
-            visual_count = len(point_data) + len(maze_data) + len(path_data)
+            visual_count = len(point_data) + len(maze_data) + len(path_data) + len(negative_point_data)
             target_general = int(visual_count * 7 / 3)
             if len(general_data) > target_general:
                 general_data = general_data[:target_general]
@@ -117,7 +131,7 @@ def main(args):
         else:
             logger.warning(f"General data not found at {args.general_data_path}, using 100% visual")
 
-        all_data = general_data + point_data + maze_data + path_data
+        all_data = general_data + point_data + maze_data + path_data + negative_point_data
         random.seed(42)
         random.shuffle(all_data)
         logger.info(f"Total training samples: {len(all_data)}")
@@ -159,6 +173,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 3b: Point Expert SFT")
+    parser.add_argument("--config", type=str, default="configs/stage3b_sft_point.yaml",
+                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
     parser.add_argument("--model_path", type=str, default="outputs/stage2_merged_base")
     parser.add_argument("--output_dir", type=str, default="outputs/stage3b_sft_point")
     parser.add_argument("--general_data_path", type=str, default="data/pretrain/pretrain_data.json")
@@ -166,9 +182,11 @@ if __name__ == "__main__":
     parser.add_argument("--coco_ann_file", type=str,
                         default="data/coco/annotations/instances_train2017.json")
     parser.add_argument("--num_point", type=int, default=10000)
-    parser.add_argument("--num_maze", type=int, default=40000)
+    parser.add_argument("--num_maze", type=int, default=50000)
     parser.add_argument("--num_path", type=int, default=10000,
                         help="Number of path tracing samples")
+    parser.add_argument("--num_negative_point", type=int, default=1000,
+                        help="Number of COCO negative point samples (category not present)")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -182,4 +200,5 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint dir to resume from, e.g. outputs/stage3b_sft_point/checkpoint-500")
     args = parser.parse_args()
+    apply_yaml_defaults(args, parser, args.config)
     main(args)

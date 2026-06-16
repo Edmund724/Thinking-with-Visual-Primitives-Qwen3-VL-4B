@@ -1,5 +1,5 @@
 # Stage 3b: Specialized SFT — Point Expert
-stage2_merged_base: outputs/stage2_merged_base
+model_path: outputs/stage2_merged_base
 output_dir: outputs/stage3b_sft_point
 max_seq_length: 2048
 per_device_batch_size: 1
@@ -17,5 +17,7 @@ save_steps: 500
 save_total_limit: 3
 gradient_checkpointing: true
 report_to: none
-num_point: 10000
-num_maze: 50000
+num_point: 5000
+num_maze: 10000
+num_path: 5000
+num_negative_point: 500

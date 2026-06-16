@@ -1,9 +1,9 @@
 # Stage 4b: Specialized GRPO — Point Expert
-stage3b_checkpoint: outputs/stage3b_sft_point
+model_path: outputs/stage3b_sft_point
 output_dir: outputs/stage4b_grpo_point
-max_completion_length: 768
-per_device_batch_size: 3
-gradient_accumulation_steps: 1
+max_completion_length: 512
+per_device_batch_size: 2
+gradient_accumulation_steps: 2
 learning_rate: 1.0e-6
 num_train_epochs: 1
 lora_r: 256
@@ -17,10 +17,19 @@ save_steps: 200
 save_total_limit: 2
 gradient_checkpointing: true
 report_to: none
-num_point: 2000
-num_maze: 5000
-num_rounds: 3
-num_generations: 6
+num_point: 1000
+num_maze: 2000
+num_path: 1000
+num_rounds: 2
+num_generations: 2
 beta: 0.04
 temperature: 1.0
-point_dist_thresholds: [20.0, 10.0, 5.0]
+filter_batch_size: 4
+filter_empty_cache_every: 50
+skip_difficulty_filter: false
+point_dist_thresholds: [20.0, 10.0]
+use_quality_rm_api: false
+compile_model: false
+early_stopping_subset_size: 16
+early_stopping_eval_steps: 50
+early_stopping_patience: 2

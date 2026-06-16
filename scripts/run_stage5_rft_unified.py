@@ -35,6 +35,7 @@ from src.data.datasets.image_loader import load_image
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status, clear_memory
+from src.utils.config_utils import apply_yaml_defaults
 from src.utils.logging_utils import setup_logging
 from src.utils.metrics import compute_total_reward, extract_answer
 
@@ -89,10 +90,52 @@ def generate_with_expert(expert_model, processor, sample, num_rollouts, max_new_
 
 
 def difficulty_grading(rollouts, gt_text, task_type, maze_grid, iou_threshold, dist_threshold):
-    """Grade rollouts as Easy/Normal/Hard based on reward scores."""
-    scores = []
+    """Grade rollouts as Easy/Normal/Hard based on the number of correct rollouts.
+
+    Matches the paper's Specialized RL / Unified RFT data selection (Sec 2.5.2
+    and 2.5.3): a rollout is considered correct only when its final answer is
+    correct AND its output satisfies basic syntax constraints. We then classify
+    the prompt by the count of correct rollouts among the N generated samples.
+    """
+    from src.utils.metrics import is_rollout_correct
+
+    correct_flags = []
     for rollout in rollouts:
         try:
+            correct_flags.append(
+                is_rollout_correct(
+                    pred_text=rollout,
+                    gt_text=gt_text,
+                    task_type=task_type,
+                    iou_threshold=iou_threshold,
+                    point_dist_threshold=dist_threshold,
+                    maze_grid=maze_grid,
+                )
+            )
+        except Exception:
+            correct_flags.append(False)
+
+    if not correct_flags:
+        return "hard", None, 0.0
+
+    correct_count = sum(correct_flags)
+    avg_score = correct_count / len(correct_flags)
+
+    # Difficulty classification by correct rollout count (paper Sec 2.5.2):
+    #   Easy:   all rollouts correct.
+    #   Hard:   all rollouts incorrect.
+    #   Normal: at least one correct and at least one incorrect.
+    if correct_count == len(correct_flags):
+        difficulty = "easy"
+    elif correct_count == 0:
+        difficulty = "hard"
+    else:
+        difficulty = "normal"
+
+    # Pick the best rollout for SFT data (highest continuous reward as tie-breaker)
+    try:
+        scores = []
+        for rollout in rollouts:
             total = compute_total_reward(
                 pred_text=rollout,
                 gt_text=gt_text,
@@ -102,27 +145,10 @@ def difficulty_grading(rollouts, gt_text, task_type, maze_grid, iou_threshold, d
                 maze_grid=maze_grid,
             )
             scores.append(total["total_reward"])
-        except Exception:
-            scores.append(0.0)
+        best_idx = scores.index(max(scores))
+    except Exception:
+        best_idx = 0
 
-    if not scores:
-        return "hard", None, 0.0
-
-    avg_score = sum(scores) / len(scores)
-    # Difficulty classification
-    correct = sum(1 for s in scores if s >= 1.5)  # All correct
-    partial = sum(1 for s in scores if 0.5 <= s < 1.5)  # Partial
-    wrong = sum(1 for s in scores if s < 0.5)  # All wrong
-
-    if correct == len(scores):
-        difficulty = "easy"
-    elif wrong == len(scores):
-        difficulty = "hard"
-    else:
-        difficulty = "normal"
-
-    # Pick the best rollout for SFT data
-    best_idx = scores.index(max(scores))
     return difficulty, rollouts[best_idx], avg_score
 
 
@@ -334,6 +360,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 5: Unified RFT")
+    parser.add_argument("--config", type=str, default="configs/stage5_rft_unified.yaml",
+                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
     parser.add_argument("--model_path", type=str, default="outputs/stage2_merged_base")
     parser.add_argument("--output_dir", type=str, default="outputs/stage5_rft_unified")
     parser.add_argument("--box_expert_path", type=str, default="outputs/stage4a_grpo_box")
@@ -365,4 +393,5 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint dir to resume SFT training, e.g. outputs/stage5_rft_unified/checkpoint-500")
     args = parser.parse_args()
+    apply_yaml_defaults(args, parser, args.config)
     main(args)

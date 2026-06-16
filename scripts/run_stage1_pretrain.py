@@ -8,6 +8,9 @@ Following the paper's curriculum:
 Pure text-only training. No images. No QLoRA.
 Only embed_tokens (and lm_head if not tied) are trained.
 
+Optionally mix in real COCO categories + coordinates (--coco_grounding_ratio)
+to move beyond purely random coordinates while still keeping Stage 1 lightweight.
+
 Expected: ~30 min on RTX 5090D for 25K samples × 3 epochs.
 """
 
@@ -29,6 +32,7 @@ from src.models.pretrain_loader import (
     save_pretrain_state,
 )
 from src.training.pretrain_trainer import train_pretrain
+from src.utils.config_utils import apply_yaml_defaults
 from src.utils.logging_utils import setup_logging
 
 logger = setup_logging(log_file="logs/stage1_pretrain.log")
@@ -47,7 +51,13 @@ def main(args):
         from scripts.generate_pretrain_data import generate_dataset, export_for_training
 
         os.makedirs(os.path.dirname(args.data_path), exist_ok=True)
-        data = generate_dataset(n=args.num_samples, seed=42)
+        data = generate_dataset(
+            n=args.num_samples,
+            seed=42,
+            coco_ann_file=args.coco_ann_file,
+            coco_grounding_ratio=args.coco_grounding_ratio,
+            curriculum=args.curriculum,
+        )
         export_for_training(data, args.data_path)
     else:
         logger.info(f"Loading existing data from {args.data_path}...")
@@ -104,10 +114,19 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 1: Text Pretrain (Embedding)")
+    parser.add_argument("--config", type=str, default="configs/stage1_pretrain.yaml",
+                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
     parser.add_argument("--model_path", type=str, default="models/Qwen3-VL-4B-Thinking")
     parser.add_argument("--data_path", type=str, default="data/pretrain/pretrain_data.json")
     parser.add_argument("--output_dir", type=str, default="outputs/stage1_pretrain")
     parser.add_argument("--num_samples", type=int, default=25000)
+    parser.add_argument("--coco_ann_file", type=str,
+                        default="data/coco/annotations/instances_train2017.json",
+                        help="Optional COCO annotations to mix real categories/coordinates into pretrain data")
+    parser.add_argument("--coco_grounding_ratio", type=float, default=0.0,
+                        help="Fraction of pretrain samples to draw from COCO (0.0~0.5)")
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Sort pretrain data from short/simple to long/complex")
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -116,4 +135,5 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--warmup_steps", type=int, default=200)
     args = parser.parse_args()
+    apply_yaml_defaults(args, parser, args.config)
     main(args)

@@ -4,8 +4,69 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **API-based Quality RM (LLM-as-Judge)**
+  - New `src/utils/quality_rm_api.py` with `quality_reward_api()` and `make_quality_reward_api_fn()`.
+  - Reads `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `QUALITY_RM_MODEL` from `.env`.
+  - Falls back to rule-based `quality_reward_text` if API is unavailable or fails.
+  - Stage 4a/4b add `--use_quality_rm_api` flag and config key.
+  - Added `python-dotenv` and `openai` to `requirements.txt`.
+
+- **CLEVR question types extended**
+  - Added existence, compare-integer, query-material, and 2-hop multi-hop questions.
+  - Added `material` attribute with simple visual cues (metal highlight, matte border).
+  - File: `src/data/generators/clevr_spatial.py`
+
+- **Maze backtracking traps**
+  - `add_backtracking_trap()` carves dead-end corridors off the solution path.
+  - `generate_maze_dataset()` exposes `backtracking_trap_ratio`.
+  - File: `src/data/generators/synthetic_maze.py`
+
+- **COCO counting with attribute constraints**
+  - `generate_coco_counting_samples()` supports `attribute_constraint_ratio`.
+  - Adds color (dominant bbox color) and size (area ratio) constraints.
+  - Stage 3a exposes `--counting_attribute_ratio`.
+
+- **Offline CLEVR augmentation**
+  - `generate_scene()` supports mild brightness/contrast jitter and random occlusion patches.
+  - Enabled by default via `augment=True`.
+
+- **Stage 1/2 curriculum**
+  - `generate_dataset()` supports `curriculum` (sort by complexity).
+  - Stage 1/2 scripts add `--curriculum` flag; configs enable it.
+
+- **Repeat-token penalty in reward**
+  - `repeat_token_penalty()` detects repeated n-grams and duplicate coordinates.
+  - Integrated into `compute_total_reward()`.
+
+- **Batched generation helper**
+  - New `src/utils/batch_inference.py` with `batch_generate_completions()` and `generate_single_completion()`.
+  - `filter_normal_level_data()` now uses the helper and falls back to singles on failure.
+
+- **Early stopping + torch.compile support**
+  - `ValidationSubsetEarlyStoppingCallback` evaluates a small subset every N steps.
+  - `maybe_compile_model()` best-effort wraps model with `torch.compile`.
+  - Stage 4a/4b add `--compile_model`, `--early_stopping_subset_size`, etc.
+
+- **Stage 1 config file**
+  - Added `configs/stage1_pretrain.yaml`; Stage 1 script now supports `--config`.
+
+### Removed
+
+- **ModelScope upload section** removed from `README.md` and `README_zh.md`.
+
 ### Changed
 
+- **README disclaimer**: Added explicit note that default configs use small sample sizes for fast run-through and do not guarantee high-quality final weights.
+
+- **Stage 3 negative sample ratio raised** from 0.15 to 0.25.
+- **All stage configs trimmed** for faster run-through while preserving pipeline shape:
+  - Stage 1: 25K → 10K samples, 3 → 2 epochs.
+  - Stage 2: 50K box / 10K point → 15K box / 5K point, 2 → 1 epoch.
+  - Stage 3a: 15K box / 10K counting / 5K CLEVR → 8K / 5K / 3K.
+  - Stage 3b: 50K maze / 10K point / 10K path → 10K / 5K / 5K.
+  - Stage 4a/4b: `num_generations` 6 → 2, `num_rounds` 3 → 2, batch/GA tuned.
 - **Environment dependency version bump (2026-06)**
   - `torch`: 2.6.0 → 2.11.0
   - `torchvision`: 0.21.0 → 0.26.0
@@ -22,9 +83,18 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - `huggingface-hub`: 0.27.0 → 1.18.0 (major version bump)
   - CUDA install target: cu124 → cu130
 
+- **GRPO 难度筛选改为按“正确 rollout 数量”分级**
+  - `src/utils/metrics.py` 新增 `is_rollout_correct`，以“答案正确 + 语法合法”作为 binary correct 判定。
+  - `filter_normal_level_data` 和 `scripts/run_stage5_rft_unified.py` 的 `difficulty_grading` 不再使用 reward threshold，改为统计 correct rollout 数量来划分 Easy/Normal/Hard，对齐论文 Sec 2.5.2 / 2.5.3。
+  - 移除 `scripts/run_stage4a_grpo_box.py` 的 `--filter_correct_threshold` 参数。
+
+- **Quality RM 规则增强**
+  - `src/utils/metrics.py` 的 `quality_reward_text` 新增 self-contradiction（“没有 X”但输出 box/point）、更细粒度的 reward-hacking 与一致性检查，作为论文 LLM-based GRM 的单卡近似。
+
 - **stage4b max_completion_length 提升至 768** (`49be15f`)
   - 原因：maze GT 数据约 447 tokens，512 长度对早期训练 verbose 没有安全余量。
-  - 文件：`scripts/run_stage4b_grpo_point.py`, `configs/stage4b_grpo_point.yaml`
+  - stage4a 保持 384（box 任务较短即可容纳）。
+  - 文件：`scripts/run_stage4a_grpo_box.py`, `scripts/run_stage4b_grpo_point.py`, `configs/stage4a_grpo_box.yaml`, `configs/stage4b_grpo_point.yaml`
 
 - **stage4b batch_size 降为 3** (`8fde423`)
   - 在 max_completion_length=768 下平衡 5090D 显存。
@@ -109,9 +179,9 @@ All notable changes to the GRPO training pipeline are documented in this file.
     2. **General length penalty**: if completion exceeds 1.5× target length, apply linear penalty up to -0.1.
   - Files: `src/utils/metrics.py`, `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
 
-- **GRPO max_completion_length increased 512 → 768 → 1024**
+- **GRPO max_completion_length increased 512 → 768 (stage4b)**
   - Maze GT data reaches ~447 tokens; 512 left almost no safety margin for early-training verbosity.
-  - 1024 gives sufficient breathing room.
+  - stage4b 使用 768；stage4a 针对 box 任务保持 384。
   - Files: `scripts/run_stage4b_grpo_point.py`, `scripts/run_stage4a_grpo_box.py`
 
 - **GRPO VRAM growth / repeated OOM kills during long runs**
@@ -156,6 +226,13 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Added
 
+- **`src/training/grpo_utils.py` — GRPO helper utilities**
+  - 提供 `extract_completion_text` 等工具函数，统一从 TRL GRPO completion 中解码保留特殊 token 的文本，供 reward 函数和评估复用。
+  - 已在 Stage 4a/4b GRPO 脚本中导入使用。
+
+- **`src/utils/config_utils.py` — YAML 配置加载**
+  - 为所有带 YAML 配置的阶段脚本（stage2、3a、3b、4a、4b、5、6）提供 `apply_yaml_defaults`，使 `configs/*.yaml` 成为默认超参数来源，CLI 参数仍可覆盖。
+
 - **Round 内 checkpoint-* 断点续训**
   - 之前脚本只在整轮完成后跳过，round 内中途 OOM 会从头重跑。现在每轮开始前会自动查找 `round_N/checkpoint-*` 中 step 最大的目录：
     - 存在 checkpoint：从该 checkpoint 加载 policy model 和 processor，并把路径传给 `trainer.train(resume_from_checkpoint=...)` 恢复 optimizer / scheduler / rng / trainer_state。
@@ -167,6 +244,16 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - Fix 1: Rebuild `mm_token_type_ids` from actual `input_ids` to fix padding direction mismatch.
   - Fix 2: Strip orphan image/video pad tokens from `completion_ids`.
   - Fix 3: Log first completion every 5 steps for monitoring.
+
+- **Stage 1 可选 COCO grounding 混合**
+  - `scripts/generate_pretrain_data.py` 新增 `generate_coco_grounding_pretrain_samples`：从 COCO 标注中采样真实类别与坐标，生成文本-only 预训练样本。
+  - `scripts/run_stage1_pretrain.py` 新增 `--coco_grounding_ratio`（默认 0），在格式预训练阶段即可引入真实 grounding 分布，向论文 Sec 2.3 靠近。
+
+- **Cold-start 负样本增强（Faithful Refusal）**
+  - CLEVR spatial generator 新增 `negative_ratio` 参数，生成“查询不存在颜色/形状组合”的负样本，答案为 `\boxed{False}` 且不输出 box。
+  - COCO box/point generator 新增 `generate_coco_negative_box_samples` / `generate_coco_negative_point_samples`，询问图像中不存在的类别，训练模型忠实拒绝而非幻觉框/点。
+  - Stage 3a/3b 脚本默认混入负样本，对齐论文 Sec 2.4.2 的 negative sample augmentation。
+  - 文件：`src/data/generators/clevr_spatial.py`、`src/data/generators/coco_box_generator.py`、`scripts/run_stage3a_sft_box.py`、`scripts/run_stage3b_sft_point.py`
 
 - **COCO 几何过滤 (Geometric Filtering)**
   - 新增 `_filter_annotations_by_geometry`，过滤 mega box (>90% 图像面积)、tiny box (<0.01% 面积)、退化 box 和强贴边 box。

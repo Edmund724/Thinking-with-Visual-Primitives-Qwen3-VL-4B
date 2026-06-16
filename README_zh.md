@@ -27,7 +27,7 @@
 | 训练方法 | 大规模 GRPO + 自研训练框架 | **QLoRA + TRL GRPO + RFT** |
 | 视觉原语 | 自定义 tokens | `<|box|>` / `<|point|>` |
 | 显存要求 | 多卡 A100/H100 | **单卡 RTX 5090D 24GB** |
-| 数据规模 | 460K+ 迷宫 / 125K+ 路径 | 50K 迷宫 / 15K 路径 (可扩展) |
+| 数据规模 | 460K+ 迷宫 / 125K+ 路径 | 50K 迷宫 / 10K 路径 (可扩展) |
 
 由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级 Separated Experts（Specialist）架构 + On-Policy Distillation (OPD)**，在保持核心思想不变的前提下，通过 **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
 
@@ -145,6 +145,13 @@ python scripts/run_stage1_pretrain.py \
     --learning_rate 2e-4
 ```
 
+> **可选 COCO grounding 混合**：在保持 Stage 1 轻量的前提下，可混入真实 COCO 类别与坐标（仍为文本，不处理图像），让格式预训练更接近论文的真实 grounding 预训练：
+> ```bash
+> python scripts/run_stage1_pretrain.py \
+>     --coco_grounding_ratio 0.3 \
+>     --coco_ann_file data/coco/annotations/instances_train2017.json
+> ```
+
 **输出**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
 
 ---
@@ -204,7 +211,7 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **实测数据**: 47559 样本 (25K general + 7578 box 定位 + 10K 粗粒度计数 + 4981 CLEVR 空间/VQA)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5945 步，~2.1s/step，耗时 **~3h29min**。
+> **实测数据**: 约 109K 样本 (76K general + 15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box + 约 750 CLEVR 负样本)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，约 13.6K 步，~2.1s/step，耗时 **~8h** (含负样本预估)。
 >
 > **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
 
@@ -217,7 +224,7 @@ python scripts/run_stage3a_sft_box.py \
 
 ### Stage 3b: Point Expert SFT ✅
 
-> **实测数据**: 85000 样本 (25K general + 10K point + 50K maze)，1 epoch，batch_size=4, grad_accum=2 (有效 batch=8)，lr=1e-4，10625 步，~2.9s/step，耗时 **~8.5h** (含 resume)。
+> **实测数据**: 约 96K 样本 (25K general + 10K point + 50K maze + 10K path tracing + 1K 负样本 point)，1 epoch，batch_size=4, grad_accum=2 (有效 batch=8)，lr=1e-4，约 12K 步，~2.9s/step，耗时 **~9.7h** (含负样本预估，含 resume)。
 > 
 > 训练中途曾因显存碎片化导致速度从 3s/it 降至 30s/it，通过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` resume 后恢复正常。
 
@@ -533,8 +540,10 @@ tvp-4b-5090d/
 │   │   ├── pretrain_trainer.py       # Pretrain Trainer（仅训练 embedding）
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation 训练器
 │   │   ├── grpo_fixes.py             # GRPOTrainer 多模态猴补丁
+│   │   ├── grpo_utils.py             # GRPO 辅助工具（completion 文本提取）
 │   │   ├── callbacks.py              # 训练回调（内存监控）
-│   │   └── memory_utils.py           # GPU 显存工具
+│   │   ├── memory_utils.py           # GPU 显存工具
+│   │   └── config_utils.py           # 阶段脚本的 YAML 配置加载工具
 │   └── utils/
 │       ├── constants.py              # 特殊 token / 超参常量
 │       ├── metrics.py                # Format RM + Accuracy RM + 难度分级 + 长度惩罚
@@ -650,6 +659,41 @@ pytest tests/ -v
 
 ---
 
+## 🔧 进一步贴近原论文的优化方向
+
+本复现优先保证**核心思想**（视觉原语作为推理单元）在单卡约束下可跑。以下是在不重建万亿级预训练的前提下，仍可逐步缩小与原文差距的具体方向：
+
+### Stage 1 — 预训练
+- **当前**: 纯文本格式预训练（合成对话教会特殊 token 语法）。
+- **论文**: 在 4000 万+ 筛选后的网页 grounding 数据上进行万亿级多模态预训练。
+- **可行优化**:
+  1. 用真实图像-文本 grounding 数据（COCO grounding、Flickr30k Entities、RefCOCO 等）替换或增补合成文本数据；10 万~100 万真实样本即可让模型从“懂格式”迈向“有视觉 ground”。
+  2. 若无法做网页抓取，可在公开检测/grounding 数据集上复现论文的两步过滤（语义审查 + 几何质量审查）。
+  3. 保留特殊 token embedding 预热，但尽早加入真实图像训练，让视觉投影学到坐标语义。
+
+### Stage 2 — 视觉预训练
+- **当前**: 冻结 Qwen3-VL ViT，只训练 projection + LLM LoRA，数据为 COCO。
+- **论文**: DeepSeek-ViT + 3×3 token 压缩 + CSA 4× KV-cache 压缩，端到端海量数据训练。
+- **可行优化**:
+  1. 明确记录“冻结 ViT”是算力妥协；若显存允许，可尝试以极低学习率解冻部分 ViT 层。
+  2. 扩充视觉预训练数据来源（SA-1B、合成几何图形、领域 grounding 数据集等）。
+
+### Stage 3 — Cold-Start SFT
+- **当前**: COCO box/point/counting + 简化 CLEVR + 单算法矩形迷宫 + path tracing。
+- **论文**: MLLM 基于 GQA 场景图生成 thinking chain，46 万迷宫覆盖 DFS/Prim/Kruskal 与矩形/圆形/六边形拓扑，12.5 万 path tracing。
+- **可行优化**:
+  1. **细粒度计数**: 接入 GQA 场景图，用 MLLM/API 生成属性约束问题与 thinking chain，再用 `thinking_verifier.py` 校验。
+  2. **迷宫多样性**: 在现有 DFS 基础上增加 Prim、Kruskal 生成器，以及圆形、六边形拓扑。
+  3. **空间/VQA**: 把 CLEVR 问题扩展为多跳推理，并加入负样本（忠实拒绝）。
+  4. **MLLM 生成 thinking**: 在有标注的数据（GQA、COCO panoptic、SA-1B）上，用本地小 MLLM 或 API 合成“意图分析→Grounding→总结”三段式 thinking，替代手工模板。
+
+### Stage 4 — 专项 RL
+- **当前**: 规则化 Quality RM + 已改为按“正确 rollout 数量”分难度（与论文 Sec 2.5.2 对齐）。
+- **论文**: LLM-based Generative Reward Model 做 Quality RM。
+- **可行优化**:
+  1. 用本地小模型（如 Qwen2.5-3B-Instruct 或蒸馏后的 critic）替代规则 QM，或在边界样本上调用 API。
+  2. 规则 QM 作为快速预筛，LLM judge 负责难分样本的二次打分。
+
 ## ⚠️ 已知限制
 
 1. **GRPO 在线 rollout 开销**: 单卡 24GB 下 `num_generations=5` 已是极限，如需更多 rollout 需要梯度累积或 offload。
@@ -657,39 +701,10 @@ pytest tests/ -v
 3. **COCO 数据**: 首次下载约 18GB，训练时按需读取。
 4. **本实现为复现**: 论文原始 pipeline 包含更多阶段和更大规模数据，本项目在单卡约束下做了精简。
 5. **vLLM 不支持**: vLLM 与 TRL GRPO + Qwen3-VL 不兼容，所有 GRPO 阶段均使用 HuggingFace 原生生成。
+6. **样本量小、质量有限**: 默认配置为了快速跑通流程做了大幅裁剪（例如 Stage 1 仅 1 万条、Stage 2 视觉预训练仅 2 万张、GRPO 仅 2 轮 2 条 rollout）。**这些默认值无法保证最终精度或生产出可用权重，仅用于验证训练流程**。如需更好效果，请按硬件承受能力放大样本量和训练轮数。
 
 ---
 
 ## 📄 License
 
 MIT
-
----
-
-## 🤗 模型权重（训练完成后计划上传）
-
-**⚠️ 当前状态：训练进行中，权重尚未上传。**
-
-训练完成后，**完整模型权重**（基座 + LoRA 合并后的全量 bf16 参数）将上传至 **ModelScope**，开箱即用，无需额外加载基座模型。
-
-计划上传地址：
-
-```bash
-# 未来可用（当前不可用）
-modelscope download Edmund724/tvp-4b-5090d-qwen3-vl-4b --local_dir ./weights
-```
-
-上线后的使用方式：
-```python
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-
-model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "./weights",
-    torch_dtype="auto",
-    device_map="auto",
-    trust_remote_code=True,
-)
-processor = AutoProcessor.from_pretrained("./weights", trust_remote_code=True)
-```
-
-> 预计完整权重约 8-9GB（bf16），支持直接推理与继续微调。上线后会在此处更新实际下载链接。

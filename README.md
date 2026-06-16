@@ -27,7 +27,7 @@ Unlike conventional approaches that treat grounding as a post-hoc verification s
 | Training Method | Large-scale GRPO + custom framework | **QLoRA + TRL GRPO + RFT** |
 | Visual Primitives (Spatial Markers) | Custom tokens | `<\|box\|>` / `<\|point\|>` |
 | VRAM Requirement | Multi-GPU A100/H100 | **Single RTX 5090D 24GB** |
-| Data Scale | 460K+ mazes / 125K+ paths | 50K mazes / 15K paths (extensible) |
+| Data Scale | 460K+ mazes / 125K+ paths | 50K mazes / 10K paths (extensible) |
 
 Since 24GB VRAM cannot accommodate online multi-rollout training for a 284B MoE model, this project adopts a **lightweight Separated Experts (Specialist) architecture + On-Policy Distillation (OPD)**, preserving the core idea while achieving single-GPU feasibility through **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit**.
 
@@ -145,6 +145,13 @@ python scripts/run_stage1_pretrain.py \
     --learning_rate 2e-4
 ```
 
+> **Optional COCO grounding mix**: To move closer to the paper's real grounding pretraining while keeping Stage 1 lightweight, you can mix in real COCO categories + coordinates (still text-only, no images processed):
+> ```bash
+> python scripts/run_stage1_pretrain.py \
+>     --coco_grounding_ratio 0.3 \
+>     --coco_ann_file data/coco/annotations/instances_train2017.json
+> ```
+
 **Output**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
 
 ---
@@ -206,7 +213,7 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **Benchmark**: 47559 samples (25K general + 7578 box localization + 10K coarse-grained counting + 4981 CLEVR spatial/VQA), 1 epoch, batch_size=1, grad_accum=8 (effective batch=8), lr=1e-4, 5945 steps, ~2.1s/step, duration **~3h29min**.
+> **Benchmark**: ~109K samples (76K general + 15K box localization + 10K coarse-grained counting + 5K CLEVR spatial/VQA + 2K negative box + ~750 CLEVR negatives), 1 epoch, batch_size=1, grad_accum=8 (effective batch=8), lr=1e-4, ~13.6K steps, ~2.1s/step, duration **~8h** (estimated with negatives).
 >
 > **Note**: Stage 3a does not enable data caching (pickle cache) to preserve accurate timing data. From Stage 3b onward, all scripts support training data pickle caching — auto-saved on first run, loaded directly on subsequent runs.
 
@@ -219,7 +226,7 @@ python scripts/run_stage3a_sft_box.py \
 
 ### Stage 3b: Point Expert SFT ✅
 
-> **Benchmark**: 85000 samples (25K general + 10K point + 50K maze), 1 epoch, batch_size=4, grad_accum=2 (effective batch=8), lr=1e-4, 10625 steps, ~2.9s/step, duration **~8.5h** (including resume).
+> **Benchmark**: ~96K samples (25K general + 10K point + 50K maze + 10K path tracing + 1K negative point), 1 epoch, batch_size=4, grad_accum=2 (effective batch=8), lr=1e-4, ~12K steps, ~2.9s/step, duration **~9.7h** (estimated with negatives, including resume).
 >
 > Mid-training VRAM fragmentation once caused speed degradation from 3s/it to 30s/it, resolved by resuming with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
@@ -535,8 +542,10 @@ tvp-4b-5090d/
 │   │   ├── pretrain_trainer.py       # Pretrain Trainer (embedding only)
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation trainer
 │   │   ├── grpo_fixes.py             # GRPOTrainer multimodal monkey-patches
+│   │   ├── grpo_utils.py             # GRPO helper utilities (completion text extraction)
 │   │   ├── callbacks.py              # Training callbacks (memory monitoring)
-│   │   └── memory_utils.py           # GPU memory utilities
+│   │   ├── memory_utils.py           # GPU memory utilities
+│   │   └── config_utils.py           # YAML config loading helpers for stage scripts
 │   └── utils/
 │       ├── constants.py              # Special token / hyperparameter constants
 │       ├── metrics.py                # Format RM + Accuracy RM + difficulty grading + length penalty
@@ -652,6 +661,41 @@ And this project:
 
 ---
 
+## 🔧 Closing the Gap to the Original Paper
+
+This reproduction prioritizes the **core idea** (visual primitives as reasoning units) within single-GPU constraints. Below are the main remaining gaps and concrete ways to move closer to the paper without re-implementing trillion-scale pretraining:
+
+### Stage 1 — Pretraining
+- **Current**: Text-only format pretraining (synthetic dialogues teaching special-token syntax).
+- **Paper**: Large-scale multimodal pretraining on 40M+ curated web grounding samples.
+- **Practical next steps**:
+  1. Replace or augment the synthetic text data with real image-text grounding pairs (COCO grounding, Flickr30k Entities, RefCOCO, etc.). Even 100K–1M real samples would move the model from "format-aware" toward "visually grounded".
+  2. If web scraping is infeasible, use publicly available detection/grounding datasets and apply the same two-step filtering logic (semantic + geometric) described in Sec 2.3.3.
+  3. Keep the special-token embedding warm-up, but train on real images as soon as possible so the visual projection learns coordinate semantics.
+
+### Stage 2 — Visual Pretraining
+- **Current**: Qwen3-VL ViT is frozen; only projection + LLM LoRA are trained on COCO.
+- **Paper**: DeepSeek-ViT + 3×3 token compression + CSA 4× KV-cache compression, trained end-to-end on massive data.
+- **Practical next steps**:
+  1. Document that ViT freezing is a hardware concession: Qwen3-VL's ViT is already pretrained and we cannot reproduce CSA. Unfreezing the ViT (or parts of it) with an even lower LR is the closest approximation, but watch VRAM closely.
+  2. Increase the diversity of visual pretraining data beyond COCO (e.g., add SA-1B samples, synthetic shapes, or domain-specific grounding datasets).
+
+### Stage 3 — Cold-Start SFT
+- **Current**: COCO box/point/counting + synthetic CLEVR + recursive-backtracking mazes + path tracing.
+- **Paper**: MLLM-generated thinking chains on GQA scene graphs, 460K mazes with DFS/Prim/Kruskal and rectangular/circular/hexagonal topologies, 125K path-tracing samples.
+- **Practical next steps**:
+  1. **Fine-grained counting**: Integrate GQA scene-graph data and use an MLLM/API to generate attribute-constrained questions and thinking chains, then verify with `thinking_verifier.py`.
+  2. **Maze diversity**: Add Prim and Kruskal generators alongside the existing DFS generator, and add circular/hexagonal topologies. Even a few thousand extra samples per topology improves generalization.
+  3. **Spatial/VQA**: Expand CLEVR questions to multi-hop chains and add negative samples (faithful refusals) as the paper emphasizes.
+  4. **MLLM-generated thinking**: Wherever you have annotations (GQA, COCO panoptic, SA-1B), use a cheap local MLLM or API to synthesize "Intent Analysis → Grounding → Summarization" chains rather than hand-crafting templates.
+
+### Stage 4 — Specialized RL
+- **Current**: Rule-based Quality RM and binary-correctness difficulty grading (now aligned with the paper's "correct rollout count" criterion).
+- **Paper**: LLM-based Generative Reward Model (GRM) for Quality RM.
+- **Practical next steps**:
+  1. Replace `quality_reward_text` with a small local LLM judge (e.g., Qwen2.5-3B-Instruct or a distilled critic) called via a lightweight API, or call it only on a subset of rollouts to control cost.
+  2. Use the rule-based QM as a fast filter and the LLM judge for tie-breaking / borderline cases.
+
 ## ⚠️ Known Limitations
 
 1. **GRPO online rollout overhead**: `num_generations=5` is the limit on a single 24GB GPU; more rollouts require gradient accumulation or offloading.
@@ -659,39 +703,10 @@ And this project:
 3. **COCO data**: Initial download is ~18GB; loaded on-demand during training.
 4. **This is a reproduction**: The paper's original pipeline includes more stages and larger-scale data; this project is simplified for single-GPU constraints.
 5. **vLLM not supported**: vLLM is incompatible with TRL GRPO generation for Qwen3-VL; all GRPO stages use HuggingFace native generation exclusively.
+6. **Small sample sizes for fast run-through**: The default configs are intentionally trimmed (e.g., 10K pretrain samples, 15K visual pretrain samples, 2 GRPO rounds with 2 generations) to let the pipeline complete quickly on a single GPU. **Do not expect high final accuracy or production-quality weights** from these defaults; they are for verifying the training flow. Scale the numbers back up if you want better quality.
 
 ---
 
 ## 📄 License
 
 MIT
-
----
-
-## 🤗 Model Weights (Planned Upload After Training)
-
-**⚠️ Current status: Training in progress, weights not yet uploaded.**
-
-After training completes, **full model weights** (base + LoRA merged full bf16 parameters) will be uploaded to **ModelScope**, ready to use out-of-the-box without needing to separately load the base model.
-
-Planned upload location:
-
-```bash
-# Available in the future (not currently available)
-modelscope download Edmund724/tvp-4b-5090d-qwen3-vl-4b --local-dir ./weights
-```
-
-Usage after upload:
-```python
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-
-model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "./weights",
-    torch_dtype="auto",
-    device_map="auto",
-    trust_remote_code=True,
-)
-processor = AutoProcessor.from_pretrained("./weights", trust_remote_code=True)
-```
-
-> Estimated full weights ~8-9GB (bf16), supporting direct inference and continued fine-tuning. Actual download links will be updated here once available.

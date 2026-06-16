@@ -204,7 +204,7 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **实测数据**: 40000 样本 (25K general + 15K box)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5000 步，~3.0s/step，耗时 **~4h12min**。
+> **实测数据**: 47559 样本 (25K general + 7578 box 定位 + 10K 粗粒度计数 + 4981 CLEVR 空间/VQA)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，5945 步，~2.1s/step，耗时 **~3h29min**。
 >
 > **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
 

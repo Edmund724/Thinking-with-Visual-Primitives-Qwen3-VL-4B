@@ -206,7 +206,7 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **Benchmark**: 40000 samples (25K general + 15K box), 1 epoch, batch_size=1, grad_accum=8 (effective batch=8), lr=1e-4, 5000 steps, ~3.0s/step, duration **~4h12min**.
+> **Benchmark**: 47559 samples (25K general + 7578 box localization + 10K coarse-grained counting + 4981 CLEVR spatial/VQA), 1 epoch, batch_size=1, grad_accum=8 (effective batch=8), lr=1e-4, 5945 steps, ~2.1s/step, duration **~3h29min**.
 >
 > **Note**: Stage 3a does not enable data caching (pickle cache) to preserve accurate timing data. From Stage 3b onward, all scripts support training data pickle caching — auto-saved on first run, loaded directly on subsequent runs.
 

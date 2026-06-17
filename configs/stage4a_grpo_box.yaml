@@ -1,7 +1,7 @@
 # Stage 4a: Specialized GRPO — Box Expert
 model_path: outputs/stage3a_sft_box
 output_dir: outputs/stage4a_grpo_box
-max_completion_length: 256
+max_completion_length: 384
 per_device_batch_size: 2
 gradient_accumulation_steps: 2
 learning_rate: 1.0e-6
@@ -25,7 +25,7 @@ num_generations: 2
 beta: 0.04
 temperature: 1.0
 filter_batch_size: 4
-filter_max_completion_length: 256
+filter_max_completion_length: 384
 filter_empty_cache_every: 50
 skip_difficulty_filter: false
 iou_thresholds: [0.3, 0.5]

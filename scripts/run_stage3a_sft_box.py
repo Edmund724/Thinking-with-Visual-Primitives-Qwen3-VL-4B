@@ -92,7 +92,6 @@ def main(args):
     )
     for d in negative_box_data:
         d["task_type"] = "box"
-    all_data.extend(negative_box_data)
     logger.info(f"  COCO negative box samples: {len(negative_box_data)}")
 
     visual_data = box_data + counting_data + clevr_data + negative_box_data

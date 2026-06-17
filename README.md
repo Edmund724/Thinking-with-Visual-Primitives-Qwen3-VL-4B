@@ -47,7 +47,7 @@ Since 24GB VRAM cannot accommodate online multi-rollout training for a 284B MoE 
 |---------|----------------|
 | PyTorch | 2.11.0 |
 | transformers | 5.10.0 |
-| flash-attn | 2.8.0+ (auto fallback to eager) |
+| flash-attn | 2.8.3 (auto fallback to eager) |
 | bitsandbytes | 0.49.0 |
 | accelerate | 1.13.0 |
 | peft | 0.19.0 |
@@ -100,9 +100,9 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 Training Pipeline (Separated Experts + On-Policy Distillation)
 
 ```
-Stage 1:  Text Pretrain          Text-only embedding initialization           ~57min ✅
-Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~9.6h  ✅
-Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~22s   ✅
+Stage 1:  Text Pretrain          Text-only embedding initialization           ~23min ✅
+Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~2h23m ✅
+Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~27s   ✅
 Stage 3a: Box Expert SFT         70% general + 30% Box-specific SFT           ~4.2h  ✅
 Stage 3b: Point Expert SFT       70% general + 30% Point+Maze SFT            ~8.5h  ✅ (including resume)
 Stage 4a: Box Expert GRPO        Box expert GRPO (3 rounds, default)          ~6h    (est.)
@@ -123,13 +123,13 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student||expert)) 
 
 ### Stage 1: Text Pretrain (Format Pretraining) ✅
 
-**Text-only training, no images**. Only trains `embed_tokens` layers. 25K programmatically generated samples, 3 epochs.
+**Text-only training, no images**. Only trains `embed_tokens` layers. Programmatically generated samples.
 
 > **Actual run (this reproduction)**:
-> - Parameters: `num_samples=25000`, `num_epochs=3`, `batch_size=8`, `gradient_accumulation_steps=4` (effective batch=32), `max_length=256`, `learning_rate=2e-4`
+> - Parameters: `num_samples=10000`, `num_epochs=2`, `batch_size=4`, `gradient_accumulation_steps=1` (effective batch=4), `max_length=256`, `learning_rate=2e-4`
 > - Trainable params: ~389M
-> - Duration: **~57min** (Epoch 1 ~19min / Epoch 2 ~19min / Epoch 3 ~19min)
-> - Epoch avg loss: 1.1928 / 1.0072 / 1.0024
+> - Duration: **~23min** (Epoch 1 ~11.5min / Epoch 2 ~11.1min)
+> - Epoch avg loss: 1.0699 / 0.9940
 > - Output: `outputs/stage1_pretrain/pretrain_state_dict.pt`
 
 ```bash
@@ -161,9 +161,8 @@ python scripts/run_stage1_pretrain.py \
 **Training on COCO images** to establish real "visual features → coordinates" mapping. No random coordinate guessing.
 
 > **Actual run (this reproduction)**:
-> - Parameters: `num_box=50000`, `num_point=10000` (total 60K samples/epoch), `num_epochs=2`, `batch_size=2`, `gradient_accumulation_steps=4` (effective batch=8), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`
-> - Steps: ~7500 steps/epoch, 15000 steps total
-> - Duration: **~9h36min**
+> - Parameters: `num_box=15000`, `num_point=5000` (total 20K samples), `num_epochs=1`, `batch_size=2`, `gradient_accumulation_steps=4` (effective batch=8), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum (short-to-long)
+> - Duration: **~2h23min**
 > - Output: `outputs/stage2_visual_pretrain/`
 
 ```bash
@@ -187,7 +186,7 @@ python scripts/run_stage2_visual_pretrain.py \
 
 **Must merge!** Avoid stacking double LoRA layers.
 
-> **Actual run**: merge duration **~22s**.
+> **Actual run**: merge duration **~27s**.
 
 ```bash
 python scripts/merge_stage2.py \
@@ -699,7 +698,7 @@ This reproduction prioritizes the **core idea** (visual primitives as reasoning 
 ## ⚠️ Known Limitations
 
 1. **GRPO online rollout overhead**: `num_generations=5` is the limit on a single 24GB GPU; more rollouts require gradient accumulation or offloading.
-2. **Flash Attention compatibility**: Blackwell (RTX 5090D) support for flash-attn 2.8.0+ is still maturing; code has built-in `eager` fallback.
+2. **Flash Attention compatibility**: Blackwell (RTX 5090D) support for flash-attn 2.8.3 is still maturing; code has built-in `eager` fallback.
 3. **COCO data**: Initial download is ~18GB; loaded on-demand during training.
 4. **This is a reproduction**: The paper's original pipeline includes more stages and larger-scale data; this project is simplified for single-GPU constraints.
 5. **vLLM not supported**: vLLM is incompatible with TRL GRPO generation for Qwen3-VL; all GRPO stages use HuggingFace native generation exclusively.

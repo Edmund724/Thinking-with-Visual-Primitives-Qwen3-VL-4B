@@ -47,7 +47,7 @@
 |----|---------|
 | PyTorch | 2.11.0 |
 | transformers | 5.10.0 |
-| flash-attn | 2.8.0+ (自动 fallback 到 eager) |
+| flash-attn | 2.8.3 (自动 fallback 到 eager) |
 | bitsandbytes | 0.49.0 |
 | accelerate | 1.13.0 |
 | peft | 0.19.0 |
@@ -100,9 +100,9 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + On-Policy Distillation）
 
 ```
-Stage 1:  Text Pretrain          文本-only embedding 初始化               ~57min ✅
-Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~9.6h  ✅
-Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~22s   ✅
+Stage 1:  Text Pretrain          文本-only embedding 初始化               ~23min ✅
+Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~2h23m ✅
+Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~27s   ✅
 Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~4.2h  ✅
 Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8.5h  ✅ (含 resume)
 Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
@@ -123,13 +123,13 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student || expert)
 
 ### Stage 1: Text Pretrain（格式预训练）✅
 
-**纯文本训练，无图像**。只训练 `embed_tokens` 层。25K 条程序化生成样本，3 epochs。
+**纯文本训练，无图像**。只训练 `embed_tokens` 层。程序化生成样本。
 
 > **本次真实运行参数与结果**：
-> - 参数：`num_samples=25000`, `num_epochs=3`, `batch_size=8`, `gradient_accumulation_steps=4`（有效 batch=32）, `max_length=256`, `learning_rate=2e-4`
+> - 参数：`num_samples=10000`, `num_epochs=2`, `batch_size=4`, `gradient_accumulation_steps=1`（有效 batch=4）, `max_length=256`, `learning_rate=2e-4`
 > - 可训练参数量：~389M
-> - 耗时：**~57 min**（Epoch 1 ~19 min / Epoch 2 ~19 min / Epoch 3 ~19 min）
-> - Epoch 平均 loss：1.1928 / 1.0072 / 1.0024
+> - 耗时：**~23 min**（Epoch 1 ~11.5 min / Epoch 2 ~11.1 min）
+> - Epoch 平均 loss：1.0699 / 0.9940
 > - 输出：`outputs/stage1_pretrain/pretrain_state_dict.pt`
 
 ```bash
@@ -161,9 +161,8 @@ python scripts/run_stage1_pretrain.py \
 **在 COCO 图像上训练**，建立"视觉特征 → 坐标"的真实映射。不是随机猜坐标。
 
 > **本次真实运行参数与结果**：
-> - 参数：`num_box=50000`, `num_point=10000`（每 epoch 共 60K 样本）, `num_epochs=2`, `batch_size=2`, `gradient_accumulation_steps=4`（有效 batch=8）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`
-> - 步数：~7500 步/epoch，共 15000 步
-> - 耗时：**~9 h 36 min**
+> - 参数：`num_box=15000`, `num_point=5000`（共 20K 样本）, `num_epochs=1`, `batch_size=2`, `gradient_accumulation_steps=4`（有效 batch=8）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum (short-to-long)
+> - 耗时：**~2 h 23 min**
 > - 输出：`outputs/stage2_visual_pretrain/`
 
 ```bash
@@ -187,7 +186,7 @@ python scripts/run_stage2_visual_pretrain.py \
 
 **必须合并**！避免双层 LoRA 叠加。
 
-> **本次真实耗时**：**~22 s**。
+> **本次真实耗时**：**~27 s**。
 
 ```bash
 python scripts/merge_stage2.py \
@@ -697,7 +696,7 @@ pytest tests/ -v
 ## ⚠️ 已知限制
 
 1. **GRPO 在线 rollout 开销**: 单卡 24GB 下 `num_generations=5` 已是极限，如需更多 rollout 需要梯度累积或 offload。
-2. **Flash Attention 兼容性**: Blackwell (RTX 5090D) 对 flash-attn 2.8.0+ 支持仍在完善中，代码已内置 `eager` fallback。
+2. **Flash Attention 兼容性**: Blackwell (RTX 5090D) 对 flash-attn 2.8.3 支持仍在完善中，代码已内置 `eager` fallback。
 3. **COCO 数据**: 首次下载约 18GB，训练时按需读取。
 4. **本实现为复现**: 论文原始 pipeline 包含更多阶段和更大规模数据，本项目在单卡约束下做了精简。
 5. **vLLM 不支持**: vLLM 与 TRL GRPO + Qwen3-VL 不兼容，所有 GRPO 阶段均使用 HuggingFace 原生生成。

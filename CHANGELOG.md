@@ -4,6 +4,12 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **README 与 requirements.txt 版本标注修正**
+  - `flash-attn` 版本在 README.md、README_zh.md 和 requirements.txt 中明确标注为 `2.8.3`（实际安装版本为 `2.8.3.post1`）。
+  - `wandb` 最低版本从 `>=0.19.0` 修正为 `>=0.27.0`（与实际安装版本对齐）。
+
 ### Added
 
 - **API-based Quality RM (LLM-as-Judge)**
@@ -57,6 +63,12 @@ All notable changes to the GRPO training pipeline are documented in this file.
 - **ModelScope upload section** removed from `README.md` and `README_zh.md`.
 
 ### Changed
+
+- **Stage 1/2/Merge actual run times updated in README**
+  - Stage 1: 10K samples, 2 epochs, batch_size=4 → **~23min** (was ~57min with 25K/3epochs)
+  - Stage 2: 15K box + 5K point, 1 epoch, curriculum → **~2h23min** (was ~9h36min with 60K/2epochs)
+  - Merge Stage 2: **~27s** (was ~22s)
+  - Updated in both `README.md` and `README_zh.md`.
 
 - **README disclaimer**: Added explicit note that default configs use small sample sizes for fast run-through and do not guarantee high-quality final weights.
 

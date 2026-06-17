@@ -4,12 +4,16 @@ import numpy as np
 import pytest
 
 from src.utils.metrics import (
+    box_count_answer_consistency_reward,
     box_iou,
+    compute_total_reward,
     extract_answer,
     extract_reasoning,
+    format_reward,
     match_boxes,
     match_points,
     point_distance,
+    primitive_format_compliance_reward,
     process_reward,
     split_generated_text,
     syntax_valid,
@@ -194,3 +198,70 @@ class TestProcessReward:
         assert r["answer_correct"] is True
         assert r["point_avg_dist"] == 0.0
         assert "box_avg_iou" in r
+
+
+class TestPrimitiveFormatComplianceReward:
+    def test_valid_ordered_tags(self):
+        text = "<|box|>[[1,2,3,4]]<|/box|> <|point|>[[5,6]]<|/point|>"
+        assert primitive_format_compliance_reward(text) == pytest.approx(0.2)
+
+    def test_paired_but_wrong_order(self):
+        text = "<|/box|>[[1,2,3,4]]<|box|>"
+        score = primitive_format_compliance_reward(text)
+        assert 0.0 < score < 0.2
+
+    def test_unpaired_box(self):
+        text = "<|box|>[[1,2,3,4]]"
+        assert primitive_format_compliance_reward(text) < 0.0
+
+
+class TestBoxCountConsistencyReward:
+    def test_count_matches_boxes(self):
+        pred = "<think><|box|>[[1,2,3,4],[5,6,7,8]]<|/box|></think>\n\nThe answer is 2."
+        gt = "<think><|box|>[[1,2,3,4],[5,6,7,8]]<|/box|></think>\n\nThe answer is 2."
+        assert box_count_answer_consistency_reward(pred, gt, "box") == pytest.approx(0.2)
+
+    def test_count_mismatch(self):
+        pred = "<think><|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is 2."
+        gt = "<think><|box|>[[1,2,3,4],[5,6,7,8]]<|/box|></think>\n\nThe answer is 2."
+        assert box_count_answer_consistency_reward(pred, gt, "box") == pytest.approx(-0.1)
+
+    def test_negative_sample_no_boxes_expected(self):
+        pred = "<think>No objects found.</think>\n\nThe answer is \\boxed{0}."
+        gt = "<think>No objects found.</think>\n\nThe answer is \\boxed{0}."
+        assert box_count_answer_consistency_reward(pred, gt, "box") == pytest.approx(0.2)
+
+    def test_negative_sample_with_unexpected_boxes(self):
+        pred = "<think><|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is \\boxed{0}."
+        gt = "<think>No objects found.</think>\n\nThe answer is \\boxed{0}."
+        assert box_count_answer_consistency_reward(pred, gt, "box") == pytest.approx(-0.1)
+
+    def test_non_box_task(self):
+        pred = "<think></think>\n\nThe answer is 2."
+        gt = "<think></think>\n\nThe answer is 2."
+        assert box_count_answer_consistency_reward(pred, gt, "point") == pytest.approx(0.0)
+
+
+class TestFormatRewardNoNestedBug:
+    def test_valid_box_gets_no_nested_bonus(self):
+        text = "<think><|box|>[[1,2,3,4]]<|/box|></think>"
+        details = format_reward(text)
+        assert details["no_nested_tokens"] is True
+
+
+class TestComputeTotalReward:
+    def test_perfect_box_includes_new_rewards(self):
+        pred = "<think><|box|>[[0,0,10,10]]<|/box|></think>\n\nThe answer is 1."
+        gt = "<think><|box|>[[0,0,10,10]]<|/box|></think>\n\nThe answer is 1."
+        r = compute_total_reward(pred, gt, task_type="box")
+        assert "format_compliance_reward" in r
+        assert "box_count_consistency_reward" in r
+        assert r["box_count_consistency_reward"] == pytest.approx(0.2)
+        assert r["total_reward"] > 1.0
+
+    def test_wrong_tag_order_penalized(self):
+        pred = "<think><|box|>[[0,0,10,10]]<|box|></think>\n\nThe answer is 1."
+        gt = "<think><|box|>[[0,0,10,10]]<|/box|></think>\n\nThe answer is 1."
+        r = compute_total_reward(pred, gt, task_type="box")
+        assert r["format_compliance_reward"] < 0.2
+        assert r["box_count_consistency_reward"] == pytest.approx(-0.1)

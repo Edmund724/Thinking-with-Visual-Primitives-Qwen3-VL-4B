@@ -117,6 +117,72 @@ def parse_points(text: str) -> List[Tuple[int, int]]:
     return points
 
 
+_LENIENT_BOX_RE = re.compile(r"\[\[(.*?)\]\]")
+
+
+def lenient_parse_boxes(text: str) -> List[Tuple[int, int, int, int]]:
+    """Parse bounding boxes from text even when tags are missing/wrong.
+
+    Extracts every ``[[x1,y1,x2,y2]]`` coordinate array. This is intentionally
+    more forgiving than ``parse_boxes`` and is used for difficulty grading
+    after SFT, where the model may have learned coordinates but not the exact
+    tag order.
+    """
+    boxes = []
+    for match in _LENIENT_BOX_RE.finditer(text):
+        coords_str = match.group(1)
+        try:
+            if "],[" in coords_str:
+                parts = coords_str.split("],[")
+            else:
+                parts = [coords_str]
+            for part in parts:
+                part = part.strip("[]")
+                nums = [int(float(x.strip())) for x in part.split(",")]
+                if len(nums) == 4:
+                    boxes.append((nums[0], nums[1], nums[2], nums[3]))
+        except (ValueError, IndexError):
+            continue
+    return boxes
+
+
+def _normalize_answer_text(text: str | None) -> str | None:
+    """Normalize an extracted answer for robust comparison.
+
+    Handles:
+      - \\boxed{...}
+      - <answer>...</answer>
+      - Plain text after </think>
+      - Numeric extraction fallback
+      - Boolean normalization
+    """
+    if text is None:
+        return None
+
+    normalized = text.strip()
+    # Unwrap boxed / answer tags
+    match = re.search(r"\\boxed\{(.*?)\}", normalized)
+    if match:
+        normalized = match.group(1)
+    match = re.search(r"<answer>(.*?)</answer>", normalized, re.DOTALL)
+    if match:
+        normalized = match.group(1)
+
+    normalized = re.sub(r"<\|[^>]+\>", "", normalized)
+    normalized = re.sub(r"<think>|</think>|<answer>|</answer>", "", normalized)
+    normalized = normalized.strip().rstrip(".,;:!?")
+    lowered = normalized.lower()
+
+    if lowered in ("true", "false"):
+        return lowered
+
+    nums = re.findall(r"\d+", normalized)
+    if nums:
+        return nums[-1]
+
+    return lowered if lowered else None
+
+
 def box_iou(box_a: Tuple[int, ...], box_b: Tuple[int, ...]) -> float:
     """Compute IoU between two boxes [x1, y1, x2, y2]."""
     x1_a, y1_a, x2_a, y2_a = box_a
@@ -498,7 +564,11 @@ def process_reward(
     """
     pred_answer = extract_answer(pred_text)
     gt_answer = extract_answer(gt_text)
-    answer_correct = pred_answer is not None and pred_answer == gt_answer
+    answer_correct = (
+        _normalize_answer_text(pred_answer)
+        is not None
+        and _normalize_answer_text(pred_answer) == _normalize_answer_text(gt_answer)
+    )
 
     pred_reasoning = extract_reasoning(pred_text)
     gt_reasoning = extract_reasoning(gt_text)
@@ -653,7 +723,9 @@ def format_reward(text: str) -> dict:
         re.escape(BOX_OPEN) + r"(.*?)" + re.escape(BOX_CLOSE), text, re.DOTALL
     )
     for seg in box_segments:
-        if BOX_OPEN in seg or BOX_CLOSE in seg or "[[" in seg or "]]" in seg:
+        # Nested / duplicate tags inside a segment are wrong; the inner [[..]]
+        # bracket wrapper is part of the valid format and must not be flagged.
+        if BOX_OPEN in seg or BOX_CLOSE in seg:
             no_duplicates = False
             break
 
@@ -661,7 +733,7 @@ def format_reward(text: str) -> dict:
         re.escape(POINT_OPEN) + r"(.*?)" + re.escape(POINT_CLOSE), text, re.DOTALL
     )
     for seg in point_segments:
-        if POINT_OPEN in seg or POINT_CLOSE in seg or "[[" in seg or "]]" in seg:
+        if POINT_OPEN in seg or POINT_CLOSE in seg:
             no_duplicates = False
             break
 
@@ -682,6 +754,94 @@ def format_reward(text: str) -> dict:
 
     details["total_format_score"] = round(score, 2)
     return details
+
+
+def primitive_format_compliance_reward(text: str) -> float:
+    """Reward for correctly ordered and paired primitive tags.
+
+    Unlike ``format_reward`` which only checks equal open/close counts,
+    this reward explicitly checks that tags appear in the right order
+    (open ... close) and penalizes malformed / unpaired tags.
+
+    Returns:
+        Score in [-0.2, 0.2].
+    """
+    from .constants import BOX_OPEN, BOX_CLOSE, POINT_OPEN, POINT_CLOSE
+
+    box_open = text.count(BOX_OPEN)
+    box_close = text.count(BOX_CLOSE)
+    point_open = text.count(POINT_OPEN)
+    point_close = text.count(POINT_CLOSE)
+
+    score = 0.0
+
+    # 1) Paired counts
+    if box_open == box_close and point_open == point_close:
+        score += 0.1
+
+    # 2) Correct order: each open is followed by its close.
+    box_segments = re.findall(
+        re.escape(BOX_OPEN) + r"(.*?)" + re.escape(BOX_CLOSE), text, re.DOTALL
+    )
+    point_segments = re.findall(
+        re.escape(POINT_OPEN) + r"(.*?)" + re.escape(POINT_CLOSE), text, re.DOTALL
+    )
+    ordered_ok = len(box_segments) == box_open and len(point_segments) == point_open
+    if ordered_ok:
+        score += 0.1
+
+    # 3) Penalize malformed / unpaired tags
+    malformed = (
+        abs(box_open - box_close)
+        + abs(point_open - point_close)
+    )
+    if not ordered_ok:
+        # Additional penalty when open/close counts match but order is wrong
+        malformed += 1
+    score -= 0.05 * malformed
+
+    return float(max(min(score, 0.2), -0.2))
+
+
+def box_count_answer_consistency_reward(
+    pred_text: str,
+    gt_text: str,
+    task_type: str = "box",
+) -> float:
+    """Process reward: predicted box count should match the numeric answer.
+
+    For positive box/counting samples, the answer is the number of objects,
+    so the number of parseable boxes in the reasoning should equal that answer.
+    For negative samples, the expected box count is 0.
+
+    Returns:
+        Positive reward if counts match, negative penalty otherwise.
+        Zero if the task is not box-type or the GT answer is not a count/refusal.
+    """
+    if task_type != "box":
+        return 0.0
+
+    gt_answer = extract_answer(gt_text)
+    if gt_answer is None:
+        return 0.0
+
+    expected = _count_in_answer(gt_answer)
+    # Explicit refusal/negation means "0 boxes expected".
+    if expected is None and gt_answer.strip().lower() == "false":
+        expected = 0
+
+    if expected is None:
+        return 0.0
+
+    reasoning = extract_reasoning(pred_text) or ""
+    pred_boxes = parse_boxes(reasoning)
+    pred_count = len(pred_boxes)
+
+    if pred_count == expected:
+        return 0.2
+
+    diff = abs(pred_count - expected)
+    return -0.1 * min(diff, 3)
 
 
 def counting_reward(pred_count: int, gt_count: int) -> float:
@@ -804,10 +964,18 @@ def compute_total_reward(
     fmt = format_reward(pred_text)
     format_score = fmt["total_format_score"]
 
+    # Format compliance: paired and correctly ordered primitive tags
+    fmt_compliance_score = primitive_format_compliance_reward(pred_text)
+
     # Process reward (Accuracy RM base)
     proc = process_reward(
         pred_text, gt_text, task_type,
         iou_threshold, point_dist_threshold, maze_grid,
+    )
+
+    # Box-count should match numeric answer for box tasks
+    box_count_consistency = box_count_answer_consistency_reward(
+        pred_text, gt_text, task_type
     )
 
     accuracy_score = 0.0
@@ -891,7 +1059,13 @@ def compute_total_reward(
     repeat_penalty = repeat_token_penalty(pred_text)
 
     # Total reward
-    total = format_score + accuracy_score + repeat_penalty
+    total = (
+        format_score
+        + fmt_compliance_score
+        + accuracy_score
+        + box_count_consistency
+        + repeat_penalty
+    )
 
     # Difficulty grading
     # Easy: total >= 1.5 (both format and accuracy are good)
@@ -907,7 +1081,9 @@ def compute_total_reward(
     return {
         "total_reward": round(total, 4),
         "format_reward": round(format_score, 4),
+        "format_compliance_reward": round(fmt_compliance_score, 4),
         "accuracy_reward": round(accuracy_score, 4),
+        "box_count_consistency_reward": round(box_count_consistency, 4),
         "difficulty": difficulty,
         "process_metrics": proc,
         "format_details": fmt,
@@ -926,32 +1102,53 @@ def is_rollout_correct(
 
     The paper (Sec 2.5.2) categorizes rollouts by the *number of correct
     rollouts*, not by a continuous reward threshold. A rollout is considered
-    correct when its final answer is correct AND the output satisfies basic
-    syntax constraints.
+    correct when its final answer is correct AND the output contains at least
+    one valid visual primitive.
+
+    This is intentionally more lenient than ``format_reward`` on tag order:
+    after SFT the model often emits coordinates with reversed or duplicated
+    tags. As long as coordinates are parseable and the answer matches, the
+    rollout counts as correct for difficulty selection. GRPO's reward will
+    still penalize malformed tags.
     """
-    # Syntax must be valid (Format RM gate)
+    # Basic sanity gate: must have think tags and not be non-Latin garbage.
     fmt = format_reward(pred_text)
-    if not fmt.get("tokens_paired") or not fmt.get("coords_in_range"):
+    if not fmt.get("has_think_tags"):
+        return False
+    if fmt.get("non_latin_penalty", 0.0) <= -0.2:
         return False
 
-    # Answer must be correct (Accuracy RM gate)
-    proc = process_reward(
-        pred_text, gt_text, task_type,
-        iou_threshold, point_dist_threshold, maze_grid,
-    )
-    if not proc.get("answer_correct", False):
+    # Robust answer match (numeric / boolean / exact)
+    pred_answer = _normalize_answer_text(extract_answer(pred_text))
+    gt_answer = _normalize_answer_text(extract_answer(gt_text))
+    if pred_answer is None or gt_answer is None or pred_answer != gt_answer:
         return False
 
-    # For box/point tasks, additionally require at least one valid primitive
-    # to avoid empty-but-correct-format corner cases.
+    # For box/point tasks, require at least one parseable primitive with
+    # in-range coordinates. Be forgiving about tag order.
     if task_type in ("box", "point", "path"):
-        reasoning = extract_reasoning(pred_text) or ""
         if task_type == "box":
-            if not parse_boxes(reasoning):
+            boxes = parse_boxes(pred_text) or lenient_parse_boxes(pred_text)
+            if not boxes:
                 return False
+            coords = [c for b in boxes for c in b]
         else:
-            if not parse_points(reasoning):
+            points = parse_points(pred_text)
+            if not points:
                 return False
+            coords = [c for p in points for c in p]
+
+        if any(c < 0 or c > 999 for c in coords):
+            return False
+
+    # Maze-specific: reuse process_reward for wall/answer checks.
+    if task_type == "maze":
+        proc = process_reward(
+            pred_text, gt_text, task_type,
+            iou_threshold, point_dist_threshold, maze_grid,
+        )
+        if not proc.get("answer_correct", False):
+            return False
 
     return True
 
@@ -1232,8 +1429,8 @@ def filter_normal_level_data(
                 + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
             )
             rollouts = []
-            start = j * g
-            for offset in range(g):
+            start = j * num_generations
+            for offset in range(num_generations):
                 pred = processor.tokenizer.decode(
                     outputs[start + offset][input_len:], skip_special_tokens=False
                 )

@@ -10,6 +10,8 @@ from src.utils.metrics import (
     extract_answer,
     extract_reasoning,
     format_reward,
+    is_rollout_correct,
+    lenient_parse_boxes,
     match_boxes,
     match_points,
     point_distance,
@@ -247,6 +249,32 @@ class TestFormatRewardNoNestedBug:
         text = "<think><|box|>[[1,2,3,4]]<|/box|></think>"
         details = format_reward(text)
         assert details["no_nested_tokens"] is True
+
+
+class TestNonLatinPenalty:
+    def test_non_latin_penalty_heavy(self):
+        text = "<think><|box|>[[1,2,3,4]]<|/box|> อันตราย</think>"
+        details = format_reward(text)
+        assert details["non_latin_penalty"] <= -0.1
+
+    def test_is_rollout_correct_rejects_non_latin(self):
+        pred = "<think>อันตราย<|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is 1."
+        gt = "<think><|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is 1."
+        assert is_rollout_correct(pred, gt, "box") is False
+
+    def test_lenient_parse_boxes_handles_double_comma(self):
+        text = "[[300,581,,334,699]]"
+        boxes = lenient_parse_boxes(text)
+        assert len(boxes) == 1
+        assert boxes[0] == (300, 581, 334, 699)
+
+
+class TestQualityRewardNonLatin:
+    def test_non_latin_major_issue(self):
+        pred = "<think><|box|>[[1,2,3,4]]<|/box|> จีน</think>\n\nThe answer is 1."
+        gt = "<think><|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is 1."
+        from src.utils.metrics import quality_reward_text
+        assert quality_reward_text(pred, gt, "box") == 0.0
 
 
 class TestComputeTotalReward:

@@ -19,6 +19,45 @@ from ...utils.constants import MAX_GPU_MEMORY_GB
 logger = logging.getLogger(__name__)
 
 
+class WeightedSFTTrainer(Trainer):
+    """SFT Trainer that applies per-token loss weights.
+
+    Expects each sample to contain a ``loss_weight`` tensor aligned with
+    ``labels``. Prompt/padding positions should have weight 0 so they do not
+    contribute to the mean.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        loss_weight = inputs.pop("loss_weight", None)
+
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        # Shift so that logits predict the next token.
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        shift_weights = loss_weight[..., 1:].contiguous() if loss_weight is not None else None
+
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        losses = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+
+        if shift_weights is not None:
+            losses = losses * shift_weights.view(-1)
+
+        # Mean over non-masked assistant tokens.
+        mask = shift_labels != -100
+        if mask.any():
+            loss = losses[mask].sum() / mask.sum()
+        else:
+            loss = losses.sum() * 0.0
+
+        return (loss, outputs) if return_outputs else loss
+
+
 def create_sft_trainer(
     model: PeftModel,
     processor: AutoProcessor,
@@ -34,6 +73,7 @@ def create_sft_trainer(
     warmup_steps: int = 100,
     use_wandb: bool = True,
     additional_callbacks: Optional[list] = None,
+    format_token_weight: float = 5.0,
 ) -> Trainer:
     """Create a Trainer for SFT training."""
 
@@ -41,6 +81,7 @@ def create_sft_trainer(
         data=train_data,
         processor=processor,
         max_length=max_seq_length,
+        format_token_weight=format_token_weight,
     )
 
     training_args = TrainingArguments(
@@ -80,7 +121,7 @@ def create_sft_trainer(
     from ...models.qwen_vl_loader import _set_use_cache_deep
     _set_use_cache_deep(model)
 
-    trainer = Trainer(
+    trainer = WeightedSFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -109,7 +150,7 @@ def _collate_sft(features: list, pad_token_id: int = 0) -> Dict[str, torch.Tenso
         all_keys.update(f.keys())
 
     # Find max sequence length in this batch for dynamic padding
-    pad_keys = {"input_ids", "attention_mask", "labels", "position_ids", "mm_token_type_ids"}
+    pad_keys = {"input_ids", "attention_mask", "labels", "position_ids", "mm_token_type_ids", "loss_weight"}
     max_len = max(f["input_ids"].shape[0] for f in features)
 
     for key in all_keys:
@@ -135,6 +176,8 @@ def _collate_sft(features: list, pad_token_id: int = 0) -> Dict[str, torch.Tenso
                         pad_val = -100
                     elif key == "attention_mask":
                         pad_val = 0
+                    elif key == "loss_weight":
+                        pad_val = 0.0
                     else:
                         pad_val = pad_token_id
                     seq = F.pad(seq, (0, pad_len), value=pad_val)

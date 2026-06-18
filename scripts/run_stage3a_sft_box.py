@@ -25,6 +25,7 @@ from src.data.generators.coco_box_generator import (
     generate_coco_counting_samples,
     generate_coco_negative_box_samples,
 )
+from src.data.formatters.primitive_formatter import clean_primitive_tags
 from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
@@ -123,6 +124,20 @@ def main(args):
         logger.warning(f"General data not found at {args.general_data_path}, using 100% visual")
 
     all_data = general_data + visual_data
+
+    # Data cleaning: fix any wrong-order / duplicate primitive tags in the
+    # SFT targets so the model is not trained on corrupted syntax.
+    cleaned_count = 0
+    for d in all_data:
+        if d.get("task_type") in ("box", "point"):
+            original = d.get("reasoning", "")
+            cleaned = clean_primitive_tags(original, task_type=d.get("task_type", "box"))
+            if cleaned != original:
+                d["reasoning"] = cleaned
+                cleaned_count += 1
+    if cleaned_count > 0:
+        logger.info(f"  Cleaned primitive tags in {cleaned_count} samples")
+
     random.seed(42)
     random.shuffle(all_data)
     logger.info(f"Total training samples: {len(all_data)}")
@@ -142,6 +157,7 @@ def main(args):
         save_steps=args.save_steps,
         warmup_steps=args.warmup_steps,
         use_wandb=False,
+        format_token_weight=args.format_token_weight,
     )
 
     logger.info("Starting Box Expert SFT training...")
@@ -189,6 +205,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint dir to resume from, e.g. outputs/stage3a_sft_box/checkpoint-500")
+    parser.add_argument("--format_token_weight", type=float, default=5.0,
+                        help="Loss weight multiplier for visual-primitive / think format tokens.")
     args = parser.parse_args()
     apply_yaml_defaults(args, parser, args.config)
     main(args)

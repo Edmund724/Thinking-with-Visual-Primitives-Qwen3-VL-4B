@@ -2,8 +2,8 @@
 model_path: models/Qwen3-VL-4B-Thinking
 output_dir: outputs/stage1_pretrain
 data_path: data/pretrain/pretrain_data.json
-num_samples: 10000
-num_epochs: 2
+num_samples: 30000
+num_epochs: 3
 learning_rate: 2.0e-4
 batch_size: 4
 gradient_accumulation_steps: 1

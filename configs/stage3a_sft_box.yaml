@@ -1,11 +1,12 @@
 # Stage 3a: Specialized SFT — Box Expert
 model_path: outputs/stage2_merged_base
 output_dir: outputs/stage3a_sft_box
-max_seq_length: 2048
-per_device_batch_size: 1
+max_seq_length: 4096
+batch_size: 1
 gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
-num_train_epochs: 1
+num_epochs: 2
+format_token_weight: 5.0
 lora_r: 256
 lora_alpha: 512
 lora_dropout: 0.05
@@ -17,9 +18,9 @@ save_steps: 500
 save_total_limit: 3
 gradient_checkpointing: true
 report_to: none
-num_box: 8000
-num_counting: 5000
-num_clevr: 3000
+num_box: 15000
+num_counting: 10000
+num_clevr: 5000
 clevr_negative_ratio: 0.25
-num_negative_box: 1000
+num_negative_box: 2000
 counting_attribute_ratio: 0.3

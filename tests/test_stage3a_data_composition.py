@@ -47,6 +47,7 @@ def _make_args():
         save_steps=10,
         warmup_steps=0,
         resume_from_checkpoint=None,
+        format_token_weight=5.0,
     )
 
 

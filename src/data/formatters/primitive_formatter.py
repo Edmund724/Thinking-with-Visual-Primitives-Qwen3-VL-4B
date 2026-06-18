@@ -1,5 +1,6 @@
 """Format visual primitive tags for training data."""
 
+import re
 from typing import List, Tuple
 
 from ...utils.constants import BOX_CLOSE, BOX_OPEN, POINT_CLOSE, POINT_OPEN
@@ -33,6 +34,50 @@ def format_point(coords: List[Tuple[int, int]]) -> str:
     parts = [f"{c[0]},{c[1]}" for c in coords]
     inner = "[[" + "],[".join(parts) + "]]"
     return f"{POINT_OPEN}{inner}{POINT_CLOSE}"
+
+
+# Known bad token variants emitted by unstable models.
+_BAD_PRIMITIVE_TOKENS = {
+    "<|box_start|>": BOX_OPEN,
+    "<|box_end|>": BOX_CLOSE,
+    "<|point_start|>": POINT_OPEN,
+    "<|point_end|>": POINT_CLOSE,
+}
+
+# Match a coordinate array surrounded by mismatched / wrong-order tags of the
+# same primitive family, e.g. <|/box|>[[...]]<|box|> or <|box|>[[...]]<|box|>.
+_TAGGED_COORD_RE = re.compile(
+    r"<\|/?([^>|/]+)\|>(\[\[.*?\]\])<\|/?\1\|>", re.DOTALL
+)
+
+
+def clean_primitive_tags(text: str, task_type: str = "box") -> str:
+    """Clean and normalize visual primitive tags in generated text.
+
+    Fixes common SFT-data corruption patterns:
+      - Reversed open/close tags
+      - Duplicate open or duplicate close tags
+      - Bad token variants like ``<|box_start|>`` / ``<|box_end|>``
+
+    Args:
+        text: The text to clean (usually the ``reasoning`` field).
+        task_type: "box" or "point" — determines which tag family to use.
+
+    Returns:
+        Cleaned text with properly paired primitive tags.
+    """
+    for bad, good in _BAD_PRIMITIVE_TOKENS.items():
+        text = text.replace(bad, good)
+
+    def _fix_tagged(match: re.Match) -> str:
+        name = match.group(1).lower()
+        coords = match.group(2)
+        if "point" in name:
+            return f"{POINT_OPEN}{coords}{POINT_CLOSE}"
+        return f"{BOX_OPEN}{coords}{BOX_CLOSE}"
+
+    text = _TAGGED_COORD_RE.sub(_fix_tagged, text)
+    return text
 
 
 def normalize_coordinate(val: float, max_val: float = 1000.0) -> int:

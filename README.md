@@ -100,11 +100,11 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 Training Pipeline (Separated Experts + On-Policy Distillation)
 
 ```
-Stage 1:  Text Pretrain          Text-only embedding initialization           ~23min ✅
-Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~2h23m ✅
+Stage 1:  Text Pretrain          Text-only embedding initialization           ~?    ✅
+Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~?    ✅
 Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~27s   ✅
-Stage 3a: Box Expert SFT         70% general + 30% Box-specific SFT           ~4.2h  ✅
-Stage 3b: Point Expert SFT       70% general + 30% Point+Maze SFT            ~8.5h  ✅ (including resume)
+Stage 3a: Box Expert SFT         Box-specific SFT with format-token weighting ~?    ✅
+Stage 3b: Point Expert SFT       Point+Maze SFT                               ~?    ✅ (including resume)
 Stage 4a: Box Expert GRPO        Box expert GRPO (3 rounds, default)          ~6h    (est.)
 Stage 4b: Point Expert GRPO      Point expert GRPO (3 rounds, default)        ~6h    (est.)
 Stage 5:  Unified RFT            Expert-generated rollouts → Unified learning ~5h    (est.)
@@ -125,24 +125,13 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student||expert)) 
 
 **Text-only training, no images**. Only trains `embed_tokens` layers. Programmatically generated samples.
 
-> **Actual run (this reproduction)**:
-> - Parameters: `num_samples=10000`, `num_epochs=2`, `batch_size=4`, `gradient_accumulation_steps=1` (effective batch=4), `max_length=256`, `learning_rate=2e-4`
+> **Current config**: `num_samples=30000`, `num_epochs=3`, `batch_size=4`, `gradient_accumulation_steps=1` (effective batch=4), `max_length=256`, `learning_rate=2e-4`, curriculum enabled.
 > - Trainable params: ~389M
-> - Duration: **~23min** (Epoch 1 ~11.5min / Epoch 2 ~11.1min)
-> - Epoch avg loss: 1.0699 / 0.9940
 > - Output: `outputs/stage1_pretrain/pretrain_state_dict.pt`
+> - *Timings above reflect the previous 10K/2-epoch fast-run config and will be updated after the next full run.*
 
 ```bash
-python scripts/run_stage1_pretrain.py \
-    --model_path models/Qwen3-VL-4B-Thinking \
-    --data_path data/pretrain/pretrain_data.json \
-    --output_dir outputs/stage1_pretrain \
-    --num_samples 25000 \
-    --num_epochs 3 \
-    --batch_size 8 \
-    --gradient_accumulation_steps 4 \
-    --max_length 256 \
-    --learning_rate 2e-4
+python scripts/run_stage1_pretrain.py --config configs/stage1_pretrain.yaml
 ```
 
 > **Optional COCO grounding mix**: To move closer to the paper's real grounding pretraining while keeping Stage 1 lightweight, you can mix in real COCO categories + coordinates (still text-only, no images processed):
@@ -160,22 +149,12 @@ python scripts/run_stage1_pretrain.py \
 
 **Training on COCO images** to establish real "visual features → coordinates" mapping. No random coordinate guessing.
 
-> **Actual run (this reproduction)**:
-> - Parameters: `num_box=15000`, `num_point=5000` (total 20K samples), `num_epochs=1`, `batch_size=2`, `gradient_accumulation_steps=4` (effective batch=8), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum (short-to-long)
-> - Duration: **~2h23min**
+> **Current config**: `num_box=30000`, `num_point=10000` (total 40K samples), `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4` (effective batch=4), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum enabled.
 > - Output: `outputs/stage2_visual_pretrain/`
+> - *Timings above reflect the previous 20K/1-epoch fast-run config and will be updated after the next full run.*
 
 ```bash
-python scripts/run_stage2_visual_pretrain.py \
-    --model_path models/Qwen3-VL-4B-Thinking \
-    --pretrain_embedding_path outputs/stage1_pretrain \
-    --output_dir outputs/stage2_visual_pretrain \
-    --num_box 50000 --num_point 10000 \
-    --num_epochs 2 \
-    --batch_size 2 --gradient_accumulation_steps 4 \
-    --max_seq_length 2048 \
-    --lora_r 256 --lora_alpha 512 \
-    --learning_rate 2e-6
+python scripts/run_stage2_visual_pretrain.py --config configs/stage2_visual_pretrain.yaml
 ```
 
 **Output**: `outputs/stage2_visual_pretrain/`
@@ -186,12 +165,15 @@ python scripts/run_stage2_visual_pretrain.py \
 
 **Must merge!** Avoid stacking double LoRA layers.
 
+`merge_stage2.py` now also injects the Stage 1 pretrained special-token embeddings before merging, so the merged base keeps the `<|box|>` / `<|point|>` representations learned in Stage 1.
+
 > **Actual run**: merge duration **~27s**.
 
 ```bash
 python scripts/merge_stage2.py \
     --base_model models/Qwen3-VL-4B-Thinking \
     --adapter_path outputs/stage2_visual_pretrain \
+    --pretrain_embedding_path outputs/stage1_pretrain/pretrain_state_dict.pt \
     --output_dir outputs/stage2_merged_base
 ```
 
@@ -212,15 +194,23 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **Benchmark**: ~109K samples (76K general + 15K box localization + 10K coarse-grained counting + 5K CLEVR spatial/VQA + 2K negative box + ~750 CLEVR negatives), 1 epoch, batch_size=1, grad_accum=8 (effective batch=8), lr=1e-4, ~13.6K steps, ~2.1s/step, duration **~8h** (estimated with negatives).
+> **Current config**: 15K box localization + 10K coarse-grained counting + 5K CLEVR spatial/VQA + 2K negative box, plus general pretrain mix. `num_epochs=2`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8` (effective batch=8), `lr=1e-4`.
+>
+> **Recent improvements**:
+> - SFT targets are now passed through `clean_primitive_tags()` to fix any wrong-order / duplicate tags in the generated data.
+> - `WeightedSFTTrainer` up-weights visual-primitive and `<think>` tokens (`format_token_weight=5.0`) so the format syntax is learned faster.
+> - Supports `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` to continue training.
 >
 > **Note**: Stage 3a does not enable data caching (pickle cache) to preserve accurate timing data. From Stage 3b onward, all scripts support training data pickle caching — auto-saved on first run, loaded directly on subsequent runs.
 
 ```bash
+# From scratch
+python scripts/run_stage3a_sft_box.py --config configs/stage3a_sft_box.yaml
+
+# Resume from checkpoint
 python scripts/run_stage3a_sft_box.py \
-    --model_path outputs/stage2_merged_base \
-    --output_dir outputs/stage3a_sft_box \
-    --num_box 15000 --num_epochs 1 --learning_rate 1e-4
+    --config configs/stage3a_sft_box.yaml \
+    --resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-500
 ```
 
 ### Stage 3b: Point Expert SFT ✅

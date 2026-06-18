@@ -4,7 +4,68 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Weighted SFT loss for format tokens**
+  - New `WeightedSFTTrainer` in `src/training/trainers/sft_trainer.py` applies per-token loss weights.
+  - `SFTDataset` computes `loss_weight`: visual primitive tokens (`<|box|>`, `<|/box|>`, `<|point|>`, `<|/point|>`) and `<think>` / `</think>` are up-weighted (default `format_token_weight=5.0`).
+  - Stage 3a exposes `--format_token_weight`.
+
+- **SFT target data cleaning**
+  - `clean_primitive_tags()` in `src/data/formatters/primitive_formatter.py` fixes reversed, duplicate, or bad-variant primitive tags before training.
+  - Integrated into `scripts/run_stage3a_sft_box.py` for all box/point samples.
+
+- **Stage 3a resume-from-checkpoint support**
+  - Fixed `SFTDataset` attribute bug (`format_token_ids` → `_format_token_ids`) that broke resume.
+  - README documents resume command.
+
+- **Stricter non-Latin / format reward signals**
+  - `format_reward` non-Latin penalty increased from max -0.2 to max -1.0.
+  - `quality_reward_text` treats non-Latin script as a major issue (0 reward).
+  - `is_rollout_correct` rejects any output containing non-Latin characters.
+  - Added `primitive_format_compliance_reward` for paired/ordered tags and `box_count_answer_consistency_reward` for matching box count to numeric answer.
+
+- **Lenient box parsing for difficulty grading**
+  - `lenient_parse_boxes()` extracts `[[x1,y1,x2,y2]]` arrays even when tags are missing or wrong order.
+  - `is_rollout_correct` uses normalized numeric/boolean answer matching.
+
+- **Batched generation system prompt enforces English**
+  - `src/utils/batch_inference.py` now adds "Respond in English only; do not use characters from other languages."
+
+### Fixed
+
+- **`merge_stage2.py` now preserves Stage 1 embeddings**
+  - Adds special tokens, resizes embeddings, and injects `outputs/stage1_pretrain/pretrain_state_dict.pt` before loading/merging the Stage 2 LoRA adapter.
+  - Without this, special-token embeddings in the merged base were randomly initialized.
+
+- **`scripts/run_stage3a_sft_box.py` UnboundLocalError**
+  - Removed premature `all_data.extend(negative_box_data)` referencing `all_data` before assignment.
+
+- **`filter_normal_level_data` NameError**
+  - Undefined variable `g` replaced with `num_generations`.
+
+- **`format_reward` no_nested_tokens false positive**
+  - No longer flags valid inner `[[...]]` brackets as nested tags.
+
+- **GRPO `generation_batch_size` compatibility**
+  - Set to `args.batch_size` so it is divisible by per-device train batch size in TRL 1.6.0.
+
 ### Changed
+
+- **Stage 1/2 data scale increased**
+  - Stage 1: `num_samples` 10K → 30K, `num_epochs` 2 → 3.
+  - Stage 2: `num_box` 15K → 30K, `num_point` 5K → 10K, `num_epochs` 1 → 2.
+
+- **Stage 3a config restored and strengthened**
+  - `num_box` 8K → 15K, `num_counting` 5K → 10K, `num_clevr` 3K → 5K, `num_negative_box` 1K → 2K.
+  - `max_seq_length` 2048 → 4096, `num_epochs` 1 → 2.
+  - Fixed config keys so `num_epochs` and `batch_size` are actually applied.
+
+- **Stage 4a early stopping disabled by default**
+  - `early_stopping_subset_size: 0` in `configs/stage4a_grpo_box.yaml` to avoid premature stops on small/noisy validation subsets.
+  - `max_completion_length` and `filter_max_completion_length` raised to 384.
+
+### Documentation
 
 - **README 与 requirements.txt 版本标注修正**
   - `flash-attn` 版本在 README.md、README_zh.md 和 requirements.txt 中明确标注为 `2.8.3`（实际安装版本为 `2.8.3.post1`）。

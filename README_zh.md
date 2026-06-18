@@ -100,11 +100,11 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + On-Policy Distillation）
 
 ```
-Stage 1:  Text Pretrain          文本-only embedding 初始化               ~23min ✅
-Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~2h23m ✅
+Stage 1:  Text Pretrain          文本-only embedding 初始化               ~?    ✅
+Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~?    ✅
 Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~27s   ✅
-Stage 3a: Box Expert SFT         70% 通用 + 30% Box 专项 SFT             ~4.2h  ✅
-Stage 3b: Point Expert SFT       70% 通用 + 30% Point+Maze 专项 SFT      ~8.5h  ✅ (含 resume)
+Stage 3a: Box Expert SFT         格式 token 加权的 Box 专项 SFT           ~?    ✅
+Stage 3b: Point Expert SFT       Point+Maze 专项 SFT                      ~?    ✅ (含 resume)
 Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
 Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
 Stage 5:  Unified RFT            专家生成 rollout → Unified 学习         ~5h    (预计)
@@ -125,24 +125,13 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student || expert)
 
 **纯文本训练，无图像**。只训练 `embed_tokens` 层。程序化生成样本。
 
-> **本次真实运行参数与结果**：
-> - 参数：`num_samples=10000`, `num_epochs=2`, `batch_size=4`, `gradient_accumulation_steps=1`（有效 batch=4）, `max_length=256`, `learning_rate=2e-4`
+> **当前默认配置**：`num_samples=30000`, `num_epochs=3`, `batch_size=4`, `gradient_accumulation_steps=1`（有效 batch=4）, `max_length=256`, `learning_rate=2e-4`，启用 curriculum。
 > - 可训练参数量：~389M
-> - 耗时：**~23 min**（Epoch 1 ~11.5 min / Epoch 2 ~11.1 min）
-> - Epoch 平均 loss：1.0699 / 0.9940
 > - 输出：`outputs/stage1_pretrain/pretrain_state_dict.pt`
+> - *上方旧耗时为 10K/2 epoch 快速跑通配置，新配置耗时将在下次完整跑完后更新。*
 
 ```bash
-python scripts/run_stage1_pretrain.py \
-    --model_path models/Qwen3-VL-4B-Thinking \
-    --data_path data/pretrain/pretrain_data.json \
-    --output_dir outputs/stage1_pretrain \
-    --num_samples 25000 \
-    --num_epochs 3 \
-    --batch_size 8 \
-    --gradient_accumulation_steps 4 \
-    --max_length 256 \
-    --learning_rate 2e-4
+python scripts/run_stage1_pretrain.py --config configs/stage1_pretrain.yaml
 ```
 
 > **可选 COCO grounding 混合**：在保持 Stage 1 轻量的前提下，可混入真实 COCO 类别与坐标（仍为文本，不处理图像），让格式预训练更接近论文的真实 grounding 预训练：
@@ -160,22 +149,12 @@ python scripts/run_stage1_pretrain.py \
 
 **在 COCO 图像上训练**，建立"视觉特征 → 坐标"的真实映射。不是随机猜坐标。
 
-> **本次真实运行参数与结果**：
-> - 参数：`num_box=15000`, `num_point=5000`（共 20K 样本）, `num_epochs=1`, `batch_size=2`, `gradient_accumulation_steps=4`（有效 batch=8）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum (short-to-long)
-> - 耗时：**~2 h 23 min**
+> **当前默认配置**：`num_box=30000`, `num_point=10000`（共 40K 样本）, `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4`（有效 batch=4）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`，启用 curriculum。
 > - 输出：`outputs/stage2_visual_pretrain/`
+> - *上方旧耗时为 20K/1 epoch 快速跑通配置，新配置耗时将在下次完整跑完后更新。*
 
 ```bash
-python scripts/run_stage2_visual_pretrain.py \
-    --model_path models/Qwen3-VL-4B-Thinking \
-    --pretrain_embedding_path outputs/stage1_pretrain \
-    --output_dir outputs/stage2_visual_pretrain \
-    --num_box 50000 --num_point 10000 \
-    --num_epochs 2 \
-    --batch_size 2 --gradient_accumulation_steps 4 \
-    --max_seq_length 2048 \
-    --lora_r 256 --lora_alpha 512 \
-    --learning_rate 2e-6
+python scripts/run_stage2_visual_pretrain.py --config configs/stage2_visual_pretrain.yaml
 ```
 
 **输出**: `outputs/stage2_visual_pretrain/`
@@ -186,12 +165,15 @@ python scripts/run_stage2_visual_pretrain.py \
 
 **必须合并**！避免双层 LoRA 叠加。
 
+`merge_stage2.py` 现在会在合并前注入 Stage 1 预训练好的特殊 token embedding，保证合并后的基座模型保留 `<|box|>` / `<|point|>` 的表示能力。
+
 > **本次真实耗时**：**~27 s**。
 
 ```bash
 python scripts/merge_stage2.py \
     --base_model models/Qwen3-VL-4B-Thinking \
     --adapter_path outputs/stage2_visual_pretrain \
+    --pretrain_embedding_path outputs/stage1_pretrain/pretrain_state_dict.pt \
     --output_dir outputs/stage2_merged_base
 ```
 
@@ -210,15 +192,23 @@ python scripts/merge_stage2.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **实测数据**: 约 109K 样本 (76K general + 15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box + 约 750 CLEVR 负样本)，1 epoch，batch_size=1, grad_accum=8 (有效 batch=8)，lr=1e-4，约 13.6K 步，~2.1s/step，耗时 **~8h** (含负样本预估)。
+> **当前默认配置**：15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box，并混入 general pretrain 数据。`num_epochs=2`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8`（有效 batch=8），`lr=1e-4`。
+>
+> **近期改进**：
+> - SFT 目标会先经过 `clean_primitive_tags()` 清洗，修复生成数据中错序/重复的标签。
+> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=5.0`），让格式语法学得更快。
+> - 支持 `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` 断点续训。
 >
 > **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
 
 ```bash
+# 从头训练
+python scripts/run_stage3a_sft_box.py --config configs/stage3a_sft_box.yaml
+
+# 断点续训
 python scripts/run_stage3a_sft_box.py \
-    --model_path outputs/stage2_merged_base \
-    --output_dir outputs/stage3a_sft_box \
-    --num_box 15000 --num_epochs 1 --learning_rate 1e-4
+    --config configs/stage3a_sft_box.yaml \
+    --resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-500
 ```
 
 ### Stage 3b: Point Expert SFT ✅

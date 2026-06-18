@@ -32,10 +32,37 @@ class SFTDataset(Dataset):
         data: List[Dict[str, Any]],
         processor: AutoProcessor,
         max_length: int = 2048,
+        format_token_weight: float = 5.0,
     ):
         self.data = data
         self.processor = processor
         self.max_length = max_length
+        self.format_token_weight = format_token_weight
+        self._format_token_ids = self._build_format_token_ids()
+
+    def _build_format_token_ids(self) -> set:
+        """Token IDs that should receive higher loss weight."""
+        from ...utils.constants import BOX_CLOSE, BOX_OPEN, POINT_CLOSE, POINT_OPEN
+
+        tokens = [
+            BOX_OPEN,
+            BOX_CLOSE,
+            POINT_OPEN,
+            POINT_CLOSE,
+            "<think>",
+            "</think>",
+        ]
+        ids = set()
+        for tok in tokens:
+            try:
+                ids.add(self.processor.tokenizer.convert_tokens_to_ids(tok))
+            except Exception:
+                continue
+        # Remove possible UNK id
+        unk_id = getattr(self.processor.tokenizer, "unk_token_id", None)
+        if unk_id is not None:
+            ids.discard(unk_id)
+        return ids
 
     def __len__(self):
         return len(self.data)
@@ -202,5 +229,21 @@ class SFTDataset(Dataset):
             pad_mask = inputs["attention_mask"] == 0
             labels[pad_mask] = -100
 
+        # Per-token loss weights: up-weight format tokens (<|box|>, </think>, etc.)
+        # inside the assistant output so the model learns the syntax faster.
+        loss_weight = torch.ones_like(labels, dtype=torch.float)
+        if self._format_token_ids:
+            fmt_ids_tensor = torch.tensor(
+                list(self._format_token_ids),
+                dtype=inputs["input_ids"].dtype,
+                device=inputs["input_ids"].device,
+            )
+            is_format = (inputs["input_ids"].unsqueeze(1) == fmt_ids_tensor).any(dim=1)
+            is_assistant = labels != -100
+            loss_weight[is_assistant & is_format] = self.format_token_weight
+        # Prompt and padding positions should contribute zero to the weighted sum.
+        loss_weight[labels == -100] = 0.0
+
         inputs["labels"] = labels
+        inputs["loss_weight"] = loss_weight
         return inputs

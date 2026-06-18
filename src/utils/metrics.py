@@ -138,7 +138,7 @@ def lenient_parse_boxes(text: str) -> List[Tuple[int, int, int, int]]:
                 parts = [coords_str]
             for part in parts:
                 part = part.strip("[]")
-                nums = [int(float(x.strip())) for x in part.split(",")]
+                nums = [int(float(x.strip())) for x in part.split(",") if x.strip()]
                 if len(nums) == 4:
                     boxes.append((nums[0], nums[1], nums[2], nums[3]))
         except (ValueError, IndexError):
@@ -745,8 +745,9 @@ def format_reward(text: str) -> dict:
     non_latin_chars = len(_NON_LATIN_SCRIPT_RE.findall(text))
     details["non_latin_char_count"] = non_latin_chars
     if non_latin_chars > 0:
-        # Cap penalty at -0.2 to avoid over-punishing minor contamination
-        penalty = min(0.01 * non_latin_chars, 0.2)
+        # Heavy penalty: even one non-Latin character is a strong signal that
+        # the model is drifting out of the desired output distribution.
+        penalty = min(0.1 * non_latin_chars, 1.0)
         score -= penalty
         details["non_latin_penalty"] = round(-penalty, 2)
     else:
@@ -1115,7 +1116,7 @@ def is_rollout_correct(
     fmt = format_reward(pred_text)
     if not fmt.get("has_think_tags"):
         return False
-    if fmt.get("non_latin_penalty", 0.0) <= -0.2:
+    if _NON_LATIN_SCRIPT_RE.search(pred_text):
         return False
 
     # Robust answer match (numeric / boolean / exact)
@@ -1234,6 +1235,10 @@ def quality_reward_text(pred_text: str, gt_text: str, task_type: str = "box") ->
 
     issues = 0
     major_issue = False
+
+    # Non-Latin script is a major quality issue.
+    if _NON_LATIN_SCRIPT_RE.search(pred_text):
+        major_issue = True
 
     # 1. Redundancy: duplicate boxes/points in the thinking trace.
     pred_boxes = parse_boxes(pred_reasoning)

@@ -14,6 +14,7 @@ lora_alpha: 512
 warmup_steps: 100
 logging_steps: 50
 save_steps: 500
-num_box: 15000
-num_point: 5000
+num_box: 30000
+num_point: 10000
+num_epochs: 2
 curriculum: true

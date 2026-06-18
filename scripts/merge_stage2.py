@@ -13,7 +13,6 @@ Usage:
 """
 
 import argparse
-import logging
 import sys
 import os
 
@@ -23,6 +22,8 @@ import torch
 from peft import PeftModel
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
+from src.models.pretrain_loader import inject_pretrained_embeddings
+from src.utils.constants import BASE_VOCAB_SIZE, SPECIAL_TOKENS
 from src.utils.logging_utils import setup_logging
 
 logger = setup_logging(log_file="logs/merge_stage2.log")
@@ -46,6 +47,54 @@ def main(args):
         trust_remote_code=True,
     )
 
+    # Load tokenizer from adapter (has special tokens) and add them to base model
+    processor = AutoProcessor.from_pretrained(
+        args.adapter_path,
+        trust_remote_code=True,
+    )
+    special_tokens_dict = {"additional_special_tokens": SPECIAL_TOKENS}
+    num_added = processor.tokenizer.add_special_tokens(special_tokens_dict)
+    logger.info(f"Added {num_added} special tokens: {SPECIAL_TOKENS}")
+
+    current_embed_size = model.get_input_embeddings().num_embeddings
+    new_tokenizer_len = len(processor.tokenizer)
+    if new_tokenizer_len > current_embed_size:
+        model.resize_token_embeddings(new_tokenizer_len)
+        logger.info(f"Resized embeddings: {current_embed_size} → {new_tokenizer_len}")
+    else:
+        logger.info(
+            f"No resize needed: embedding ({current_embed_size}) covers tokenizer ({new_tokenizer_len})"
+        )
+
+    # CRITICAL: inject Stage 1 pretrained embeddings before merging. Stage 2 was
+    # trained on top of these embeddings, so losing them here would corrupt the
+    # special-token representations.
+    pretrain_path = (
+        os.path.abspath(args.pretrain_embedding_path)
+        if args.pretrain_embedding_path
+        else None
+    )
+    if pretrain_path is not None and os.path.exists(pretrain_path):
+        inject_pretrained_embeddings(
+            model=model,
+            pretrain_path=pretrain_path,
+            old_vocab_size=BASE_VOCAB_SIZE,
+        )
+    else:
+        logger.warning(
+            f"No pretrained embedding state found at {pretrain_path}. "
+            "Special-token embeddings will remain random."
+        )
+
+    # Align config with tokenizer
+    model.config.pad_token_id = processor.tokenizer.pad_token_id
+    model.config.bos_token_id = processor.tokenizer.bos_token_id
+    model.config.eos_token_id = processor.tokenizer.eos_token_id
+    if model.generation_config is not None:
+        model.generation_config.pad_token_id = processor.tokenizer.pad_token_id
+        model.generation_config.bos_token_id = processor.tokenizer.bos_token_id
+        model.generation_config.eos_token_id = processor.tokenizer.eos_token_id
+
     logger.info(f"Loading adapter: {args.adapter_path}")
     model = PeftModel.from_pretrained(model, args.adapter_path)
 
@@ -55,12 +104,6 @@ def main(args):
     logger.info(f"Saving merged model to {args.output_dir}")
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
-
-    # Also save tokenizer from adapter (has special tokens)
-    processor = AutoProcessor.from_pretrained(
-        args.adapter_path,
-        trust_remote_code=True,
-    )
     processor.save_pretrained(args.output_dir)
 
     logger.info(f"Merge complete. Merged model saved to {args.output_dir}")
@@ -71,6 +114,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge Stage 2 LoRA into base")
     parser.add_argument("--base_model", type=str, default="models/Qwen3-VL-4B-Thinking")
     parser.add_argument("--adapter_path", type=str, default="outputs/stage2_visual_pretrain")
+    parser.add_argument("--pretrain_embedding_path", type=str,
+                        default="outputs/stage1_pretrain/pretrain_state_dict.pt")
     parser.add_argument("--output_dir", type=str, default="outputs/stage2_merged_base")
     args = parser.parse_args()
     main(args)

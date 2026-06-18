@@ -28,6 +28,9 @@ filter_batch_size: 4
 filter_max_completion_length: 384
 filter_empty_cache_every: 50
 skip_difficulty_filter: false
+early_stopping_subset_size: 0
+early_stopping_eval_steps: 50
+early_stopping_patience: 2
 iou_thresholds: [0.3, 0.5]
 use_quality_rm_api: false
 compile_model: false

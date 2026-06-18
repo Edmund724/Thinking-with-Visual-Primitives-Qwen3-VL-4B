@@ -18,10 +18,17 @@ logger = logging.getLogger(__name__)
 
 def _build_messages(sample: Dict, image) -> List[Dict]:
     """Build chat messages for a single sample."""
+    system_content = (
+        "You are a helpful visual reasoning assistant. "
+        "Think step by step inside <think>...</think> tags, then provide your final answer. "
+        "Use visual primitives (<|box|>, <|point|>) when needed to mark locations. "
+        "Always close your reasoning with </think> before giving the answer. "
+        "Respond in English only; do not use characters from other languages."
+    )
     return [
         {
             "role": "system",
-            "content": "You are a helpful visual reasoning assistant. Think step by step.",
+            "content": system_content,
         },
         {
             "role": "user",

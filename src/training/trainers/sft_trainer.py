@@ -98,7 +98,7 @@ def create_sft_trainer(
         save_steps=save_steps,
         save_total_limit=3,
         eval_strategy="no",
-        report_to="wandb" if use_wandb else "none",
+        report_to="wandb" if use_wandb else "tensorboard",
         bf16=True,
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,

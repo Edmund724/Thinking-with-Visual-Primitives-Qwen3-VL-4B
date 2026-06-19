@@ -45,8 +45,10 @@ def make_box_reward_fn(iou_threshold: float, tokenizer=None):
             # Get gt_text from either format
             if i < len(inputs):
                 gt_text = inputs[i].get("gt_text", "")
+                question_type = inputs[i].get("question_type")
             elif i < len(gt_texts):
                 gt_text = gt_texts[i]
+                question_type = None
             else:
                 rewards.append(0.0)
                 continue
@@ -63,6 +65,7 @@ def make_box_reward_fn(iou_threshold: float, tokenizer=None):
                     gt_text=gt_text,
                     task_type="box",
                     iou_threshold=iou_threshold,
+                    question_type=question_type,
                 )
                 # Use raw total reward without difficulty-based collapsing to preserve
                 # within-group variance. Add a gentle length penalty to differentiate

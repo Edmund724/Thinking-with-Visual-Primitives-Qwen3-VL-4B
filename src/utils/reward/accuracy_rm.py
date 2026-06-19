@@ -239,6 +239,8 @@ def compute_total_reward(
     iou_threshold: float = 0.5,
     point_dist_threshold: float = 10.0,
     maze_grid: np.ndarray | None = None,
+    gt_curve: list | None = None,
+    question_type: str | None = None,
 ) -> Dict:
     """Compute total reward = Format RM + Accuracy RM for GRPO training.
 
@@ -275,36 +277,86 @@ def compute_total_reward(
         avg_iou = proc.get("box_avg_iou", 0.0)
         answer_correct = proc.get("answer_correct", False)
 
-        # Try to get counts for counting reward
-        pred_answer = PrimitiveParser.extract_answer(pred_text)
-        gt_answer = PrimitiveParser.extract_answer(gt_text)
-        both_are_counts = False
-        count_r = 0.0
-        if pred_answer is not None and gt_answer is not None:
-            try:
-                pred_count = int(pred_answer)
-                gt_count = int(gt_answer)
-                count_r = counting_reward(pred_count, gt_count)
-                both_are_counts = True
-            except ValueError:
-                count_r = 0.0
-
-        if both_are_counts:
-            # If counts match perfectly, use IoU; otherwise use counting reward
-            if count_r >= 0.7 * 0.99:  # Almost perfect count match
-                accuracy_score = avg_iou + 0.3  # Bonus for correct count
-            else:
-                accuracy_score = count_r + avg_iou * 0.3  # Weighted mix
+        # CLEVR complex questions: use LLM judge for accuracy
+        _SPATIAL_LLM_TYPES = {"multihop", "compare", "spatial_existence", "spatial_count"}
+        if question_type in _SPATIAL_LLM_TYPES:
+            from ..quality_rm_api import spatial_accuracy_rm_api
+            spatial_score = spatial_accuracy_rm_api(
+                pred_text, gt_text, question_type=question_type,
+            )
+            accuracy_score = spatial_score + avg_iou * 0.2
         else:
-            # Non-count answers (e.g., CLEVR color / TrueFalse): reward exact match
-            answer_r = 1.0 if answer_correct else 0.0
-            accuracy_score = answer_r + avg_iou * 0.3
+            # Standard box accuracy logic
+            # Try to get counts for counting reward
+            pred_answer = PrimitiveParser.extract_answer(pred_text)
+            gt_answer = PrimitiveParser.extract_answer(gt_text)
+            both_are_counts = False
+            count_r = 0.0
+            if pred_answer is not None and gt_answer is not None:
+                try:
+                    pred_count = int(pred_answer)
+                    gt_count = int(gt_answer)
+                    count_r = counting_reward(pred_count, gt_count)
+                    both_are_counts = True
+                except ValueError:
+                    count_r = 0.0
+
+            if both_are_counts:
+                if count_r >= 0.7 * 0.99:
+                    accuracy_score = avg_iou + 0.3
+                else:
+                    accuracy_score = count_r + avg_iou * 0.3
+            else:
+                answer_r = 1.0 if answer_correct else 0.0
+                accuracy_score = answer_r + avg_iou * 0.3
 
     elif task_type == "point":
         # Point: distance-based
         avg_dist = proc.get("point_avg_dist", float("inf"))
         if avg_dist != float("inf"):
             accuracy_score = max(0, 1.0 - min(avg_dist, 100.0) / 100.0)
+
+    elif task_type == "path":
+        # Path tracing: 4-component Accuracy RM (paper Sec 2.5.2)
+        pred_reasoning = PrimitiveParser.extract_reasoning(pred_text)
+        pred_points = PrimitiveParser.extract_points(pred_reasoning) if pred_reasoning else []
+        gt_reasoning = PrimitiveParser.extract_reasoning(gt_text)
+        gt_points = PrimitiveParser.extract_points(gt_reasoning) if gt_reasoning else []
+
+        # Use gt_curve (dense Bézier samples) if available, else fall back to gt_points
+        curve = gt_curve if gt_curve and len(gt_curve) >= 2 else gt_points
+
+        # 1. Forward accuracy (0.30): predicted points → GT curve
+        forward = PrimitiveParser.path_forward_accuracy(pred_points, curve)
+
+        # 2. Reverse accuracy (0.25): GT curve → predicted polyline
+        reverse = PrimitiveParser.path_reverse_accuracy(curve, pred_points)
+
+        # 3. Endpoint accuracy (0.20): start/end distance decay
+        pred_start = pred_points[0] if pred_points else None
+        pred_end = pred_points[-1] if pred_points else None
+        gt_start = curve[0] if curve else (0, 0)
+        gt_end = curve[-1] if curve else (0, 0)
+        endpoint = PrimitiveParser.path_endpoint_accuracy(
+            pred_start, pred_end, gt_start, gt_end
+        )
+
+        # 4. Answer correctness (0.25): binary
+        answer_r = 1.0 if proc.get("answer_correct", False) else 0.0
+
+        # 5. Continuity penalty: jump from last trajectory point to endpoint
+        continuity = PrimitiveParser.path_continuity_penalty(
+            pred_end if pred_points else None,
+            pred_end if pred_points else None,
+        )
+
+        accuracy_score = (
+            0.30 * forward
+            + 0.25 * reverse
+            + 0.20 * endpoint
+            + 0.25 * answer_r
+            + continuity
+        )
 
     elif task_type == "maze":
         # 5-component Maze Accuracy RM (paper-aligned):

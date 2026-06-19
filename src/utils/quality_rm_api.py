@@ -229,3 +229,107 @@ def make_quality_reward_api_fn(tokenizer=None, task_type_default: str = "box"):
         return rewards
 
     return quality_reward
+
+
+# ---------------------------------------------------------------------------
+# Spatial / VQA Accuracy RM (LLM-as-Judge for CLEVR complex questions)
+# ---------------------------------------------------------------------------
+
+
+def _build_spatial_judge_prompt(
+    pred_text: str,
+    gt_text: str,
+    question_type: str = "multihop",
+) -> str:
+    """Build a judge prompt for spatial/VQA accuracy evaluation.
+
+    The judge evaluates whether the model's reasoning chain is logically sound
+    and the final answer is semantically consistent with the ground truth.
+    """
+    return (
+        "You are an accuracy judge for visual spatial reasoning. "
+        "Evaluate the model's response against the ground truth.\n\n"
+        "Check these aspects:\n"
+        "1. Reasoning quality — does each reasoning step have visual evidence (primitives like "
+        "<|box|>, <|point|>) supporting it?\n"
+        "2. Logical consistency — is the reasoning chain internally consistent?\n"
+        "3. Answer correctness — does the final answer match the ground truth semantically "
+        "(not just string match, but meaning)?\n"
+        "4. Hallucination — does the model claim objects or relationships that don't exist?\n\n"
+        f"Question type: {question_type}\n\n"
+        "=== Ground Truth ===\n"
+        f"{gt_text}\n\n"
+        "=== Model Prediction ===\n"
+        f"{pred_text}\n\n"
+        "Briefly identify any issues found (one line per issue, or \"none\" if correct). "
+        "Then on the LAST line output exactly: Score: X.X\n"
+        "Where X.X is 1.0 (correct reasoning and answer), "
+        "0.5 (partially correct reasoning or minor answer deviation), "
+        "or 0.0 (wrong answer or fundamentally flawed reasoning)."
+    )
+
+
+def spatial_accuracy_rm_api(
+    pred_text: str,
+    gt_text: str,
+    question_type: str = "multihop",
+    client: "object | None" = None,
+) -> float:
+    """Call an OpenAI-compatible API to score spatial/VQA accuracy.
+
+    Used for complex CLEVR questions (multihop, compare, spatial_existence,
+    spatial_count) where rule-based accuracy RM is insufficient.
+
+    Args:
+        pred_text: Model-generated text.
+        gt_text: Ground truth text.
+        question_type: CLEVR question type string.
+        client: Optional pre-built OpenAI client.
+
+    Returns:
+        Score in {0.0, 0.5, 1.0}. Falls back to rule-based scoring on failure.
+    """
+    cfg = _load_api_config()
+    if not cfg:
+        # Fallback: simple answer match
+        from .reward.accuracy_rm import process_reward
+        proc = process_reward(pred_text, gt_text, task_type="box")
+        return 1.0 if proc.get("answer_correct", False) else 0.0
+
+    try:
+        if client is None:
+            from openai import OpenAI
+            client = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"])
+
+        prompt = _build_spatial_judge_prompt(pred_text, gt_text, question_type)
+        retries = cfg["max_retries"]
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=cfg["model"],
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=150,
+                    timeout=cfg["timeout"],
+                )
+                content = resp.choices[0].message.content
+                return _parse_score(content)
+            except Exception as e:
+                last_error = e
+                if attempt < retries:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                break
+
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Spatial accuracy RM API failed: {last_error}. Falling back to rule-based."
+        )
+        from .reward.accuracy_rm import process_reward
+        proc = process_reward(pred_text, gt_text, task_type="box")
+        return 1.0 if proc.get("answer_correct", False) else 0.0
+    except Exception:
+        from .reward.accuracy_rm import process_reward
+        proc = process_reward(pred_text, gt_text, task_type="box")
+        return 1.0 if proc.get("answer_correct", False) else 0.0

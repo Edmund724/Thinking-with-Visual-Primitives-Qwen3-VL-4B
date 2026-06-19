@@ -29,6 +29,7 @@ from src.data.generators.coco_box_generator import (
 )
 from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.data.generators.synthetic_maze import generate_maze_dataset
+from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.data.datasets.image_loader import load_image
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
@@ -204,6 +205,15 @@ def train(runner: StageRunner) -> None:
         prompts.extend(maze_prompts)
         logger.info(f"  Maze prompts: {len(maze_prompts)}")
 
+        path_prompts = generate_path_tracing_dataset(
+            n=args.num_path_prompts,
+            seed=46,
+            cache_dir=os.path.join(args.output_dir, "path_tracing_prompt_cache"),
+        )
+        # task_type is already "path" from generator
+        prompts.extend(path_prompts)
+        logger.info(f"  Path tracing prompts: {len(path_prompts)}")
+
         random.shuffle(prompts)
         logger.info(f"Total prompts: {len(prompts)}")
         return prompts
@@ -354,6 +364,7 @@ if __name__ == "__main__":
                    help="Number of CLEVR spatial/VQA prompts for rejection sampling")
     runner.add_arg("--num_point_prompts", type=int, default=None)
     runner.add_arg("--num_maze_prompts", type=int, default=None)
+    runner.add_arg("--num_path_prompts", type=int, default=None)
     runner.add_arg("--num_rollouts", type=int, default=None)
     runner.add_arg("--max_new_tokens", type=int, default=None)
     runner.add_arg("--iou_threshold", type=float, default=None)

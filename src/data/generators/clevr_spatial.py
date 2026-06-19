@@ -284,7 +284,7 @@ def _generate_counting_question(
     count = len(filtered)
     # Batch grounding for counting-style questions.
     bboxes = [obj.normalized_bbox(img_w, img_h) for obj in filtered]
-    grounding_parts = [f"objects are at {PrimitiveParser.format_box(bboxes)}"]
+    grounding_parts = [f"{PrimitiveParser.format_ref(f'{shape}s')}{PrimitiveParser.format_box(bboxes)}"]
     summarization = f"There are {count} matching objects in total."
     reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 
@@ -292,6 +292,7 @@ def _generate_counting_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": str(count),
+        "question_type": "counting",
     }
 
 
@@ -329,8 +330,8 @@ def _generate_spatial_existence_question(
     intent = f"I need to verify whether a {desc_a} is {relation} a {desc_b}."
 
     grounding_parts = [
-        f"the {desc_a} is at {PrimitiveParser.format_box([a.normalized_bbox(img_w, img_h)])}",
-        f"the {desc_b} is at {PrimitiveParser.format_box([b.normalized_bbox(img_w, img_h)])}",
+        f"{PrimitiveParser.format_ref(desc_a)}{PrimitiveParser.format_box([a.normalized_bbox(img_w, img_h)])}",
+        f"{PrimitiveParser.format_ref(desc_b)}{PrimitiveParser.format_box([b.normalized_bbox(img_w, img_h)])}",
     ]
     summarization = (
         f"Yes, the {desc_a} is {relation} the {desc_b}."
@@ -343,6 +344,7 @@ def _generate_spatial_existence_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": r"\boxed{True}" if answer_value else r"\boxed{False}",
+        "question_type": "spatial_existence",
     }
 
 
@@ -389,7 +391,7 @@ def _generate_spatial_count_question(
     count = len(filtered)
     # Batch grounding for spatial-count questions.
     bboxes = [obj.normalized_bbox(img_w, img_h) for obj in filtered]
-    grounding_parts = [f"objects are at {PrimitiveParser.format_box(bboxes)}"]
+    grounding_parts = [f"{PrimitiveParser.format_ref('objects')}{PrimitiveParser.format_box(bboxes)}"]
     summarization = f"There are {count} objects {direction} the {anchor_desc}."
     reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 
@@ -397,6 +399,7 @@ def _generate_spatial_count_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": str(count),
+        "question_type": "spatial_count",
     }
 
 
@@ -424,7 +427,7 @@ def _generate_attribute_query_question(
     prompt = f"What color is the {direction} {shape}? Put the color in \\boxed{{}}."
     intent = f"I need to identify the color of the {direction} {shape}."
     grounding_parts = [
-        f"the {direction} {shape} is at {PrimitiveParser.format_box([target.normalized_bbox(img_w, img_h)])}"
+        f"{PrimitiveParser.format_ref(f'{direction} {shape}')}{PrimitiveParser.format_box([target.normalized_bbox(img_w, img_h)])}"
     ]
     summarization = f"The {direction} {shape} is {target.color}."
     reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
@@ -433,6 +436,7 @@ def _generate_attribute_query_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": f"\\boxed{{{target.color}}}",
+        "question_type": "attribute_query",
     }
 
 
@@ -483,7 +487,7 @@ def _generate_existence_question(
     if exists:
         target = rng.choice(filtered)
         grounding_parts = [
-            f"the {desc} is at {PrimitiveParser.format_box([target.normalized_bbox(img_w, img_h)])}"
+            f"{PrimitiveParser.format_ref(desc)}{PrimitiveParser.format_box([target.normalized_bbox(img_w, img_h)])}"
         ]
         summarization = f"Yes, there is a {desc} in the image."
     else:
@@ -495,6 +499,7 @@ def _generate_existence_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": r"\boxed{True}" if exists else r"\boxed{False}",
+        "question_type": "existence",
     }
 
 
@@ -545,9 +550,9 @@ def _generate_compare_question(
     boxes2 = [o.normalized_bbox(img_w, img_h) for o in _filter_objects(objects, color=color2, shape=shape2)]
     grounding_parts = []
     if boxes1:
-        grounding_parts.append(f"{color1} {shape1}s are at {PrimitiveParser.format_box(boxes1)}")
+        grounding_parts.append(f"{PrimitiveParser.format_ref(f'{color1} {shape1}s')}{PrimitiveParser.format_box(boxes1)}")
     if boxes2:
-        grounding_parts.append(f"{color2} {shape2}s are at {PrimitiveParser.format_box(boxes2)}")
+        grounding_parts.append(f"{PrimitiveParser.format_ref(f'{color2} {shape2}s')}{PrimitiveParser.format_box(boxes2)}")
     if not grounding_parts:
         return None
 
@@ -560,6 +565,7 @@ def _generate_compare_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": r"\boxed{True}" if answer_value else r"\boxed{False}",
+        "question_type": "compare",
     }
 
 
@@ -592,7 +598,7 @@ def _generate_query_material_question(
     )
     intent = f"I need to identify the material of the {direction} {color} {shape}."
     grounding_parts = [
-        f"the {direction} {color} {shape} is at "
+        f"{PrimitiveParser.format_ref(f'{direction} {color} {shape}')}"
         f"{PrimitiveParser.format_box([target.normalized_bbox(img_w, img_h)])}"
     ]
     summarization = f"The {direction} {color} {shape} is {target.material}."
@@ -602,6 +608,7 @@ def _generate_query_material_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": f"\\boxed{{{target.material}}}",
+        "question_type": "query_material",
     }
 
 
@@ -656,8 +663,8 @@ def _generate_multihop_question(
         f"and report its color."
     )
     grounding_parts = [
-        f"the {anchor_color} {anchor_shape} is at {PrimitiveParser.format_box([anchor.normalized_bbox(img_w, img_h)])}",
-        f"the {target_shape} {direction} it is at {PrimitiveParser.format_box([target.normalized_bbox(img_w, img_h)])}",
+        f"{PrimitiveParser.format_ref(f'{anchor_color} {anchor_shape}')}{PrimitiveParser.format_box([anchor.normalized_bbox(img_w, img_h)])}",
+        f"{PrimitiveParser.format_ref(f'{target_shape} {direction} of anchor')}{PrimitiveParser.format_box([target.normalized_bbox(img_w, img_h)])}",
     ]
     summarization = f"The {target_shape} {direction} the {anchor_color} {anchor_shape} is {target.color}."
     reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
@@ -666,6 +673,7 @@ def _generate_multihop_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": f"\\boxed{{{target.color}}}",
+        "question_type": "multihop",
     }
 
 
@@ -715,6 +723,7 @@ def _generate_negative_existence_question(
         "prompt": prompt,
         "reasoning": reasoning,
         "answer": r"\boxed{False}",
+        "question_type": "existence",
     }
 
 
@@ -809,6 +818,7 @@ def generate_clevr_spatial_dataset(
             "reasoning": sample["reasoning"],
             "answer": sample["answer"],
             "task_type": "box",
+            "question_type": sample.get("question_type", "unknown"),
         })
 
     data = filter_verified_samples(data)

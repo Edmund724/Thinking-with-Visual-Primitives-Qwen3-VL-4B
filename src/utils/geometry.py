@@ -376,3 +376,159 @@ def _count_repeated_coordinates(coords: List[Tuple[int, ...]], tolerance: int = 
             if all(abs(a - b) <= tolerance for a, b in zip(coords[i], coords[j])):
                 duplicates += 1
     return duplicates
+
+
+# ---------------------------------------------------------------------------
+# Path Tracing Accuracy RM (paper Sec 2.5.2 — Accuracy RM for Path Tracing)
+# ---------------------------------------------------------------------------
+
+
+def point_to_segment_distance(
+    p: Tuple[float, float],
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+) -> float:
+    """Minimum distance from point *p* to line segment *a*–*b*."""
+    px, py = float(p[0]), float(p[1])
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    abx, aby = bx - ax, by - ay
+    ab_len_sq = abx ** 2 + aby ** 2
+    if ab_len_sq == 0:
+        return float(np.hypot(px - ax, py - ay))
+    t = max(0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby) / ab_len_sq))
+    proj_x = ax + t * abx
+    proj_y = ay + t * aby
+    return float(np.hypot(px - proj_x, py - proj_y))
+
+
+def point_to_polyline_distance(
+    point: Tuple[float, float],
+    polyline: List[Tuple[float, float]],
+) -> float:
+    """Minimum distance from *point* to any segment of *polyline*.
+
+    Args:
+        point: Query point (x, y).
+        polyline: Ordered list of (x, y) waypoints forming the polyline.
+
+    Returns:
+        Minimum L2 distance to the polyline. Returns ``inf`` if the
+        polyline has fewer than 2 points.
+    """
+    if len(polyline) < 2:
+        return float("inf")
+    min_dist = float("inf")
+    for i in range(len(polyline) - 1):
+        d = point_to_segment_distance(point, polyline[i], polyline[i + 1])
+        if d < min_dist:
+            min_dist = d
+    return min_dist
+
+
+def path_forward_accuracy(
+    pred_points: List[Tuple[int, int]],
+    gt_curve: List[Tuple[int, int]],
+    max_dist: float = 200.0,
+) -> float:
+    """Forward trajectory accuracy: how close predicted points are to GT curve.
+
+    For each predicted point, compute its minimum distance to the GT polyline,
+    then average. Normalise so that distance 0 → score 1, distance ≥ max_dist → 0.
+
+    Args:
+        pred_points: Model-predicted waypoints.
+        gt_curve: Dense ground-truth curve waypoints (from Bézier sampling).
+        max_dist: Distance at which score saturates to 0.
+
+    Returns:
+        Score in [0, 1]. Higher is better.
+    """
+    if not pred_points or len(gt_curve) < 2:
+        return 0.0
+    dists = [point_to_polyline_distance(p, gt_curve) for p in pred_points]
+    avg = float(np.mean(dists))
+    return max(0.0, 1.0 - avg / max_dist)
+
+
+def path_reverse_accuracy(
+    gt_curve: List[Tuple[int, int]],
+    pred_points: List[Tuple[int, int]],
+    max_dist: float = 200.0,
+) -> float:
+    """Reverse trajectory accuracy: how well GT curve is covered by predicted polyline.
+
+    For each GT point, compute its minimum distance to the predicted polyline.
+    Penalises incomplete coverage where the model skips portions of the curve.
+
+    Args:
+        gt_curve: Dense ground-truth curve waypoints.
+        pred_points: Model-predicted waypoints forming the predicted polyline.
+        max_dist: Distance at which score saturates to 0.
+
+    Returns:
+        Score in [0, 1]. Higher is better.
+    """
+    if not gt_curve or len(pred_points) < 2:
+        return 0.0
+    dists = [point_to_polyline_distance(p, pred_points) for p in gt_curve]
+    avg = float(np.mean(dists))
+    return max(0.0, 1.0 - avg / max_dist)
+
+
+def path_endpoint_accuracy(
+    pred_start: Tuple[int, int] | None,
+    pred_end: Tuple[int, int] | None,
+    gt_start: Tuple[int, int],
+    gt_end: Tuple[int, int],
+    tolerance: float = 50.0,
+) -> float:
+    """Endpoint accuracy: how well the model identifies start and end locations.
+
+    Score decays linearly with distance, reaching 0 beyond *tolerance*.
+
+    Args:
+        pred_start: Model's predicted start coordinate (or None).
+        pred_end: Model's predicted end coordinate (or None).
+        gt_start: Ground-truth start coordinate.
+        gt_end: Ground-truth end coordinate.
+        tolerance: Distance beyond which score is 0.
+
+    Returns:
+        Score in [0, 1]. Average of start and end scores.
+    """
+    scores = []
+    if pred_start is not None:
+        d = point_distance(pred_start, gt_start)
+        scores.append(max(0.0, 1.0 - d / tolerance))
+    else:
+        scores.append(0.0)
+    if pred_end is not None:
+        d = point_distance(pred_end, gt_end)
+        scores.append(max(0.0, 1.0 - d / tolerance))
+    else:
+        scores.append(0.0)
+    return float(np.mean(scores))
+
+
+def path_continuity_penalty(
+    pred_trajectory_last_point: Tuple[int, int] | None,
+    pred_endpoint: Tuple[int, int] | None,
+    threshold: float = 80.0,
+    penalty: float = 0.1,
+) -> float:
+    """Trajectory continuity penalty: detect 'jump to guessed endpoint'.
+
+    If the distance between the last point of the model's trajectory and its
+    predicted endpoint exceeds *threshold*, apply a fixed negative penalty.
+    This discourages outputting a partial trajectory and jumping to the end.
+
+    Returns:
+        0.0 if within threshold or points missing, -penalty otherwise.
+    """
+    if pred_trajectory_last_point is None or pred_endpoint is None:
+        return 0.0
+    d = point_distance(pred_trajectory_last_point, pred_endpoint)
+    if d > threshold:
+        return -penalty
+    return 0.0

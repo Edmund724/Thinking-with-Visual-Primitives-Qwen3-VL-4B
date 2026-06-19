@@ -147,7 +147,7 @@ def run_grpo_rounds(
             gradient_checkpointing_kwargs={"use_reentrant": False},
             dataloader_num_workers=0,
             remove_unused_columns=False,
-            report_to="none",
+            report_to="tensorboard",
             max_grad_norm=0.3,
             lr_scheduler_type="cosine",
             num_generations=args.num_generations,

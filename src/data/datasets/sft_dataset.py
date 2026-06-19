@@ -44,13 +44,15 @@ class SFTDataset(Dataset):
 
     def _build_format_token_ids(self) -> set:
         """Token IDs that should receive higher loss weight."""
-        from ...utils.constants import BOX_CLOSE, BOX_OPEN, POINT_CLOSE, POINT_OPEN
+        from ...utils.constants import BOX_CLOSE, BOX_OPEN, POINT_CLOSE, POINT_OPEN, REF_CLOSE, REF_OPEN
 
         tokens = [
             BOX_OPEN,
             BOX_CLOSE,
             POINT_OPEN,
             POINT_CLOSE,
+            REF_OPEN,
+            REF_CLOSE,
             "<think>",
             "</think>",
         ]

@@ -45,10 +45,12 @@ def make_point_reward_fn(point_dist_threshold: float, tokenizer=None, logger=Non
                 gt_text = inputs[i].get("gt_text", "")
                 task_type = inputs[i].get("task_type", "point")
                 maze_grid = inputs[i].get("maze_grid")
+                gt_curve = inputs[i].get("gt_curve")
             elif i < len(gt_texts):
                 gt_text = gt_texts[i]
                 task_type = task_types[i] if i < len(task_types) else "point"
                 maze_grid = maze_grids[i] if i < len(maze_grids) else None
+                gt_curve = None
             else:
                 rewards.append(0.0)
                 continue
@@ -66,13 +68,14 @@ def make_point_reward_fn(point_dist_threshold: float, tokenizer=None, logger=Non
                     task_type=task_type,
                     point_dist_threshold=point_dist_threshold,
                     maze_grid=maze_grid,
+                    gt_curve=gt_curve,
                 )
                 # Use raw total reward without difficulty-based collapsing to preserve
                 # within-group variance. Add a gentle length penalty to differentiate
                 # completions of different conciseness.
                 comp_id = completion_ids_list[i] if i < len(completion_ids_list) else None
                 comp_len = len(comp_id) if comp_id is not None else len(pred_text.split())
-                target_len = 150 if task_type == "maze" else 80
+                target_len = 150 if task_type == "maze" else (120 if task_type == "path" else 80)
                 length_r = length_reward(comp_len, target_length=target_len, max_penalty=0.1)
                 rewards.append(total["total_reward"] + length_r)
             except Exception as e:
@@ -128,8 +131,7 @@ def train(runner: StageRunner) -> None:
             seed=43,
             cache_dir=os.path.join(args.output_dir, "path_tracing_cache"),
         )
-        for d in path_data:
-            d["task_type"] = "point"
+        # task_type is already "path" from generator; no override needed
         all_data.extend(path_data)
         logger.info(f"  Path tracing samples: {len(path_data)}")
 

@@ -212,7 +212,7 @@ def generate_coco_box_samples(
 
             if boxes:
                 grounding_parts.append(
-                    f"the {cat_name} is at {PrimitiveParser.format_box(boxes)}"
+                    f"{PrimitiveParser.format_ref(cat_name)}{PrimitiveParser.format_box(boxes)}"
                 )
 
         if total_count == 0:
@@ -333,7 +333,7 @@ def generate_coco_point_samples(
 
         prompt = f"Point to the {cat_name} in this image."
         intent = f"I need to locate the {cat_name} in the image."
-        grounding = f"the {cat_name} is centered at {PrimitiveParser.format_point([(cx, cy)])}"
+        grounding = f"{PrimitiveParser.format_ref(cat_name)}{PrimitiveParser.format_point([(cx, cy)])}"
         summarization = f"The {cat_name} is located at coordinates ({cx}, {cy})."
         answer = f"({cx}, {cy})"
 
@@ -389,7 +389,7 @@ def generate_synthetic_dense_counting(
 
         intent = "I need to count all small objects in the image."
         # Batch grounding: all objects in one tag to match coarse-grained counting.
-        grounding_parts = [f"objects are at {PrimitiveParser.format_box(boxes)}"]
+        grounding_parts = [f"{PrimitiveParser.format_ref('small objects')}{PrimitiveParser.format_box(boxes)}"]
         summarization = f"There are {num_objects} small objects in total."
         reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 
@@ -600,8 +600,13 @@ def generate_coco_counting_samples(
         boxes = [bbox_to_normalized(ann["bbox"], img_w, img_h) for ann in cat_anns]
         count = len(boxes)
 
-        # Batch grounding: all target boxes in a single visual primitive tag.
-        grounding_parts = [f"the {cat_name}s are at {PrimitiveParser.format_box(boxes)}"]
+        # Batch grounding: batch ref + all target boxes in a single visual primitive tag.
+        ref_name = f"{cat_name}s"
+        if attr_type == "color":
+            ref_name = f"{attr_value} {cat_name}s"
+        elif attr_type == "size":
+            ref_name = f"{attr_value} {cat_name}s"
+        grounding_parts = [f"{PrimitiveParser.format_ref(ref_name)}{PrimitiveParser.format_box(boxes)}"]
 
         if attr_type == "color":
             prompt = (

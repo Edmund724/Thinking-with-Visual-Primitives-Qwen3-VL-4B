@@ -27,6 +27,9 @@ BOX_PATTERN = re.compile(
 POINT_PATTERN = re.compile(
     r"<\|point\|>\[\[(.*?)\]\]<\|/point\|>"
 )
+REF_PATTERN = re.compile(
+    r"<\|ref\|>(.*?)<\|/ref\|>"
+)
 
 # QLoRA defaults (aligned with reproduction hyperparameters)
 DEFAULT_LORA_R = 256
@@ -53,7 +56,7 @@ HN_POINT_DIST_THRESHOLD_PX = 10.0
 DEFAULT_DPO_BETA = 0.1
 
 # OPD distillation temperature (paper Sec 2.5.4 uses 1.0~1.5)
-DEFAULT_DISTILL_TEMPERATURE = 1.0
+DEFAULT_DISTILL_TEMPERATURE = 1.2
 
 # Maze dataset ratio
 MAZE_SOLVABLE_RATIO = 0.5

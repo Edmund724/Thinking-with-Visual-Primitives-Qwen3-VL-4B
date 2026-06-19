@@ -26,6 +26,7 @@ from ..data.formatters.primitive_formatter import (
     denormalize_coordinate,
     format_box,
     format_point,
+    format_ref,
     normalize_coordinate,
 )
 from ..utils.constants import (
@@ -47,17 +48,24 @@ from ..utils.geometry import (
     maze_exploration_completeness,
     maze_path_validity,
     maze_wall_violation_penalty,
+    path_continuity_penalty,
+    path_endpoint_accuracy,
+    path_forward_accuracy,
+    path_reverse_accuracy,
     point_distance,
+    point_to_polyline_distance,
 )
 from ..utils.text_parsing import (
     _normalize_answer_text,
     extract_answer,
     extract_reasoning,
+    extract_refs,
     lenient_parse_boxes,
     parse_boxes,
     parse_points,
     split_generated_text,
     syntax_valid,
+    validate_ref_box_pairing,
 )
 
 
@@ -116,6 +124,16 @@ class PrimitiveParser:
         Returns list of (x, y) tuples.
         """
         return parse_points(text)
+
+    @staticmethod
+    def extract_refs(text: str) -> List[str]:
+        """Extract all ``<|ref|>...<|/ref|>`` reference names from text."""
+        return extract_refs(text)
+
+    @staticmethod
+    def validate_ref_box_pairing(text: str) -> dict:
+        """Check whether every ``<|box|>`` tag is preceded by a ``<|ref|>`` tag."""
+        return validate_ref_box_pairing(text)
 
     @staticmethod
     def lenient_extract_boxes(text: str) -> List[Tuple[int, int, int, int]]:
@@ -211,6 +229,11 @@ class PrimitiveParser:
     def format_point(coords: List[Tuple[int, int]]) -> str:
         """Format point(s) as a visual primitive tag."""
         return format_point(coords)
+
+    @staticmethod
+    def format_ref(name: str) -> str:
+        """Format a reference tag: ``<|ref|>name<|/ref|>``."""
+        return format_ref(name)
 
     @staticmethod
     def clean_primitive_tags(text: str, task_type: str = "box") -> str:
@@ -322,3 +345,54 @@ class PrimitiveParser:
     ) -> int:
         """Count coordinate clusters that appear multiple times."""
         return _count_repeated_coordinates(coords, tolerance)
+
+    # ── Path Tracing RM ───────────────────────────────────────────────
+
+    @staticmethod
+    def point_to_polyline_distance(
+        point: Tuple[float, float],
+        polyline: List[Tuple[float, float]],
+    ) -> float:
+        """Minimum distance from *point* to any segment of *polyline*."""
+        return point_to_polyline_distance(point, polyline)
+
+    @staticmethod
+    def path_forward_accuracy(
+        pred_points: List[Tuple[int, int]],
+        gt_curve: List[Tuple[int, int]],
+        max_dist: float = 200.0,
+    ) -> float:
+        """Forward trajectory accuracy: predicted points → GT curve."""
+        return path_forward_accuracy(pred_points, gt_curve, max_dist)
+
+    @staticmethod
+    def path_reverse_accuracy(
+        gt_curve: List[Tuple[int, int]],
+        pred_points: List[Tuple[int, int]],
+        max_dist: float = 200.0,
+    ) -> float:
+        """Reverse trajectory accuracy: GT curve → predicted polyline."""
+        return path_reverse_accuracy(gt_curve, pred_points, max_dist)
+
+    @staticmethod
+    def path_endpoint_accuracy(
+        pred_start,
+        pred_end,
+        gt_start: Tuple[int, int],
+        gt_end: Tuple[int, int],
+        tolerance: float = 50.0,
+    ) -> float:
+        """Endpoint accuracy with linear distance decay."""
+        return path_endpoint_accuracy(pred_start, pred_end, gt_start, gt_end, tolerance)
+
+    @staticmethod
+    def path_continuity_penalty(
+        pred_trajectory_last_point,
+        pred_endpoint,
+        threshold: float = 80.0,
+        penalty: float = 0.1,
+    ) -> float:
+        """Trajectory continuity penalty: detect endpoint jumping."""
+        return path_continuity_penalty(
+            pred_trajectory_last_point, pred_endpoint, threshold, penalty
+        )

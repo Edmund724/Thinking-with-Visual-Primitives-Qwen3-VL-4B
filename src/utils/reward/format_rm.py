@@ -3,7 +3,7 @@
 import re
 from typing import Dict
 
-from ..constants import BOX_OPEN, BOX_CLOSE, POINT_OPEN, POINT_CLOSE, BOX_PATTERN, POINT_PATTERN
+from ..constants import BOX_OPEN, BOX_CLOSE, POINT_OPEN, POINT_CLOSE, BOX_PATTERN, POINT_PATTERN, REF_OPEN, REF_CLOSE, REF_PATTERN
 
 
 # Regex matching characters from non-Latin scripts (Cyrillic, Arabic, CJK, Thai, etc.)
@@ -132,8 +132,62 @@ def format_reward(text: str) -> Dict:
     else:
         details["non_latin_penalty"] = 0.0
 
+    # 6. Check ref-box pairing: every <|box|> should be preceded by a <|ref|>
+    ref_pairing = _check_ref_box_pairing(text)
+    details["ref_box_pairing"] = ref_pairing
+    score += ref_pairing["score"]
+
     details["total_format_score"] = round(score, 2)
     return details
+
+
+def _check_ref_box_pairing(text: str) -> Dict:
+    """Check whether <|box|> tags are preceded by <|ref|> tags.
+
+    Returns dict with:
+        - score: float in [-0.15, 0.0]
+        - num_boxes: int
+        - num_refs: int
+        - unpaired_boxes: int
+    """
+    box_positions = [m.start() for m in BOX_PATTERN.finditer(text)]
+    ref_positions = [m.start() for m in REF_PATTERN.finditer(text)]
+
+    num_boxes = len(box_positions)
+    num_refs = len(ref_positions)
+
+    if num_boxes == 0:
+        # No boxes — no pairing requirement
+        return {"score": 0.0, "num_boxes": 0, "num_refs": num_refs, "unpaired_boxes": 0}
+
+    # Count boxes without a preceding ref
+    unpaired = 0
+    for bp in box_positions:
+        has_ref_before = any(rp < bp for rp in ref_positions)
+        if not has_ref_before:
+            unpaired += 1
+
+    # Also check ref content quality
+    bad_refs = 0
+    for m in REF_PATTERN.finditer(text):
+        content = m.group(1).strip()
+        if not content or content.isdigit():
+            bad_refs += 1
+
+    # Scoring
+    score = 0.0
+    if unpaired > 0:
+        score -= min(0.1 * unpaired, 0.1)  # max -0.1 for unpaired boxes
+    if bad_refs > 0:
+        score -= min(0.05 * bad_refs, 0.05)  # max -0.05 for bad ref content
+
+    return {
+        "score": round(score, 2),
+        "num_boxes": num_boxes,
+        "num_refs": num_refs,
+        "unpaired_boxes": unpaired,
+        "bad_refs": bad_refs,
+    }
 
 
 def primitive_format_compliance_reward(text: str) -> float:

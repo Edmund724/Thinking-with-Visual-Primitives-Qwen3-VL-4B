@@ -340,7 +340,8 @@ def generate_path_tracing_dataset(
             "prompt": prompt,
             "reasoning": reasoning,
             "answer": answer,
-            "task_type": "point",
+            "task_type": "path",
+            "gt_curve": normalized_waypoints,
         })
 
     data = filter_verified_samples(data)

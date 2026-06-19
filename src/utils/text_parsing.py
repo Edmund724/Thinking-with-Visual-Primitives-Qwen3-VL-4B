@@ -3,7 +3,7 @@
 import re
 from typing import List, Tuple
 
-from .constants import BOX_PATTERN, POINT_PATTERN
+from .constants import BOX_PATTERN, POINT_PATTERN, REF_PATTERN
 
 
 def extract_answer(text: str) -> str | None:
@@ -112,6 +112,47 @@ def parse_points(text: str) -> List[Tuple[int, int]]:
         except (ValueError, IndexError):
             continue
     return points
+
+
+def extract_refs(text: str) -> List[str]:
+    """Extract all ``<|ref|>...<|/ref|>`` reference names from text.
+
+    Returns:
+        List of reference name strings (may be empty).
+    """
+    return [m.group(1).strip() for m in REF_PATTERN.finditer(text)]
+
+
+def validate_ref_box_pairing(text: str) -> dict:
+    """Check whether every ``<|box|>`` tag is preceded by a ``<|ref|>`` tag.
+
+    Returns a dict with:
+        - ``paired`` (bool): True if every box has a preceding ref.
+        - ``num_boxes`` (int): total box tags found.
+        - ``num_refs`` (int): total ref tags found.
+        - ``unpaired_boxes`` (int): box tags without a preceding ref.
+    """
+    import re as _re
+    # Find all ref and box tag positions
+    ref_positions = [m.start() for m in REF_PATTERN.finditer(text)]
+    box_positions = [m.start() for m in BOX_PATTERN.finditer(text)]
+
+    num_refs = len(ref_positions)
+    num_boxes = len(box_positions)
+
+    # A box is "paired" if there is at least one ref tag before it
+    unpaired = 0
+    for bp in box_positions:
+        has_preceding_ref = any(rp < bp for rp in ref_positions)
+        if not has_preceding_ref:
+            unpaired += 1
+
+    return {
+        "paired": unpaired == 0 and num_boxes > 0,
+        "num_boxes": num_boxes,
+        "num_refs": num_refs,
+        "unpaired_boxes": unpaired,
+    }
 
 
 _LENIENT_BOX_RE = re.compile(r"\[\[(.*?)\]\]")

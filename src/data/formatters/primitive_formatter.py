@@ -3,7 +3,7 @@
 import re
 from typing import List, Tuple
 
-from ...utils.constants import BOX_CLOSE, BOX_OPEN, POINT_CLOSE, POINT_OPEN
+from ...utils.constants import BOX_CLOSE, BOX_OPEN, POINT_CLOSE, POINT_OPEN, REF_OPEN, REF_CLOSE
 
 
 def format_box(coords: List[Tuple[int, int, int, int]]) -> str:
@@ -34,6 +34,23 @@ def format_point(coords: List[Tuple[int, int]]) -> str:
     parts = [f"{c[0]},{c[1]}" for c in coords]
     inner = "[[" + "],[".join(parts) + "]]"
     return f"{POINT_OPEN}{inner}{POINT_CLOSE}"
+
+
+def format_ref(name: str) -> str:
+    """Format a reference tag for an object name.
+
+    The paper uses ``<|ref|>TARGET<|/ref|>`` before ``<|box|>`` tags to
+    identify the object being referenced.  For example::
+
+        <|ref|>small gray metal sphere<|/ref|><|box|>[[502,209,555,288]]<|/box|>
+
+    Args:
+        name: Human-readable object / category name.
+
+    Returns:
+        Formatted ref tag string.
+    """
+    return f"{REF_OPEN}{name}{REF_CLOSE}"
 
 
 # Known bad token variants emitted by unstable models.

@@ -81,8 +81,7 @@ def train(runner: StageRunner) -> None:
             seed=43,
             cache_dir=os.path.join(args.output_dir, "path_tracing_cache"),
         )
-        for d in path_data:
-            d["task_type"] = "point"
+        # task_type is already "path" from generator; no override needed
         logger.info(f"  Path tracing samples: {len(path_data)}")
 
         negative_point_data = generate_coco_negative_point_samples(

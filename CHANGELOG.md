@@ -4,6 +4,47 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Path Tracing 4-component Accuracy RM** — Stage 4b GRPO now uses the full paper reward decomposition:
+  - `path_forward_accuracy` (0.30): each predicted waypoint → GT Bézier curve distance.
+  - `path_reverse_accuracy` (0.25): each GT point → predicted polyline distance, catching skipped segments.
+  - `path_endpoint_accuracy` (0.20): start/end coordinate distance decay.
+  - `path_continuity_penalty` (−0.1): penalises jumping from a partial trace to a guessed endpoint.
+  - `path_answer_correctness` (0.25): endpoint label binary match.
+  - New functions in `src/utils/geometry.py` (`point_to_segment_distance`, `point_to_polyline_distance`, `path_forward_accuracy`, `path_reverse_accuracy`, `path_endpoint_accuracy`, `path_continuity_penalty`) and proxy methods in `PrimitiveParser`.
+  - `task_type` changed from `"point"` to `"path"` in `path_tracing.py`; GT data now stores dense `gt_curve` of 30 Bézier waypoints.
+  - Stage 4b reward function routes `"path"` tasks to the 4-component RM; `gt_curve` passed through `GRPODataset`.
+  - Stage 3b/5 scripts updated: no override of path `task_type`, Stage 5 prompt pool expanded with path tracing data.
+
+### Changed
+
+- **`<|ref|>` token full-pipeline integration** — 6 special tokens were already defined in `constants.py` but never used by data generators. Now every box/point primitive in COCO and CLEVR data is preceded by a `<|ref|>target_name<|/ref|>` tag, matching the paper's reference-before-grounding format.
+  - `format_ref(name)` added to `primitive_formatter.py` and `PrimitiveParser.format_ref()`.
+  - `extract_refs(text)` and `validate_ref_box_pairing(text)` added to `text_parsing.py` and `PrimitiveParser`.
+  - `REF_PATTERN` regex added to `constants.py`.
+  - COCO generators: coarse-grained counting → batch ref (`<|ref|>dogs<|/ref|><|box|>[[...],[...]]<|/box|>`); fine-grained/localization → individual ref (one ref+box per category). Negative samples → no ref.
+  - CLEVR `clevr_spatial.py`: all 8 question types updated with individual ref tags. Each sample now carries a `question_type` field (`counting`/`existence`/`spatial_existence`/`spatial_count`/`attribute_query`/`query_material`/`compare`/`multihop`).
+  - `format_reward()` in `format_rm.py` adds a ref-box pairing check (deduct 0.1 for unpaired boxes, 0.05 for bad ref content).
+  - `SFTDataset` now applies `format_token_weight` to `<|ref|>` / `<|/ref|>` tokens.
+
+- **Spatial/VQA Accuracy RM (LLM API)** — for complex CLEVR questions, accuracy is now scored by an LLM judge rather than simple answer matching.
+  - `_build_spatial_judge_prompt()` and `spatial_accuracy_rm_api()` added to `quality_rm_api.py`.
+  - `compute_total_reward()` reroutes CLEVR `multihop`/`compare`/`spatial_existence`/`spatial_count` tasks to the API judge; simpler question types stay rule-based.
+  - Stage 4a GRPO reward function passes `question_type` through to `compute_total_reward()`.
+  - No API key required — gracefully falls back to rule-based answer matching when API is unavailable.
+
+- **TensorBoard primitive metrics callback** — replaced the empty `WandBLogPrimitiveMetricsCallback` with `TensorBoardPrimitiveMetricsCallback`.
+  - Every N steps logs: `primitive/format_compliance_rate`, `coord_validity_rate`, `ref_usage_rate`, `avg_total_reward`, and a sample completion text.
+  - All stage config YAMLs: `report_to: none` → `report_to: tensorboard`.
+  - `grpo_runner.py` and `sft_trainer.py`: default `report_to` changed from `"none"` to `"tensorboard"`.
+
+- **OPD gradient-accumulation parallel distillation** — replaced the sequential Box→Point OPD with gradient accumulation that approximates the paper's parallel KL-sum formula.
+  - New `train_opd_parallel()` in `opd_trainer.py`: processes box batches → accumulates gradients → swaps to point expert → accumulates → single `optimizer.step()`.
+  - Only one expert in GPU memory at a time; gradient direction is the sum of both experts' signals.
+  - `run_stage6_opd.py` updated to use `train_opd_parallel()`; both experts loaded at start and released together after training.
+  - `DEFAULT_DISTILL_TEMPERATURE` raised from 1.0 → 1.2 (paper range 1.0~1.5).
+
 ### Changed
 
 - **Merged Stage 1+2 into Unified Visual Grounding Pretrain**

@@ -701,20 +701,29 @@ pytest tests/ -v
   2. 若显存允许，以极低学习率解冻部分 ViT 层（`--unfreeze_vit_layers 2-4`）。
 
 ### Stage 3 — Cold-Start SFT
-- **当前**: COCO box/point/counting + 简化 CLEVR + 单算法矩形迷宫 + path tracing。
+- **当前**: COCO box/point/counting + 简化 CLEVR + 单算法矩形迷宫 + path tracing。**✅ 已实现 `<|ref|>` token 全链路：粗粒度计数用 batch ref，细粒度/Spatial 用逐个 ref，负样本无 ref**。
 - **论文**: MLLM 基于 GQA 场景图生成 thinking chain，46 万迷宫覆盖 DFS/Prim/Kruskal 与矩形/圆形/六边形拓扑，12.5 万 path tracing。
 - **可行优化**:
   1. **细粒度计数**: 接入 GQA 场景图，用 MLLM/API 生成属性约束问题与 thinking chain，再用 `thinking_verifier.py` 校验。
   2. **迷宫多样性**: 在现有 DFS 基础上增加 Prim、Kruskal 生成器，以及圆形、六边形拓扑。
   3. **空间/VQA**: 把 CLEVR 问题扩展为多跳推理，并加入负样本（忠实拒绝）。
-  4. **MLLM 生成 thinking**: 在有标注的数据（GQA、COCO panoptic、SA-1B）上，用本地小 MLLM 或 API 合成“意图分析→Grounding→总结”三段式 thinking，替代手工模板。
+  4. **MLLM 生成 thinking**: 在有标注的数据（GQA、COCO panoptic、SA-1B）上，用本地小 MLLM 或 API 合成"意图分析→Grounding→总结"三段式 thinking，替代手工模板。
 
 ### Stage 4 — 专项 RL
-- **当前**: 规则化 Quality RM + 已改为按“正确 rollout 数量”分难度（与论文 Sec 2.5.2 对齐）。
+- **当前**: 规则化 Quality RM + 已改为按"正确 rollout 数量"分难度（与论文 Sec 2.5.2 对齐）。**✅ Path Tracing 已实现论文 4 组件 Accuracy RM**（forward/reverse/endpoint/continuity + answer correctness）。**✅ 复杂 CLEVR 问题（multihop/compare/spatial_existence/spatial_count）已接入 LLM API judge** 替代简单答案匹配。
 - **论文**: LLM-based Generative Reward Model 做 Quality RM。
 - **可行优化**:
   1. 用本地小模型（如 Qwen2.5-3B-Instruct 或蒸馏后的 critic）替代规则 QM，或在边界样本上调用 API。
   2. 规则 QM 作为快速预筛，LLM judge 负责难分样本的二次打分。
+
+### Stage 5 — RFT
+- **当前**: Expert rollout → 难度分级 → Normal + 5% Easy → SFT。**✅ Prompt pool 已扩展包含 path tracing 数据**。
+
+### Stage 6 — OPD
+- **当前**: **✅ 双专家梯度累积并行蒸馏**（`train_opd_parallel()`），每 epoch 内 Box 专家处理 box 数据累积梯度 → 切换到 Point 专家处理 point/maze 数据 → 一次 optimizer.step()，梯度方向为两个专家信号的合成。蒸馏温度从 1.0 上调到 1.2。仅单专家驻留显存。
+
+### 可观测性
+- **当前**: **✅ TensorBoard 原语指标回调** 已实现，每 N 步记录 format compliance rate、坐标有效率、ref 使用率、平均 reward 等指标。所有 stage config YAML 已将 `report_to` 设置为 `tensorboard`。启动 TensorBoard: `tensorboard --logdir outputs/stageX_xxx/tb_primitive_logs`
 
 ## ⚠️ 已知限制
 

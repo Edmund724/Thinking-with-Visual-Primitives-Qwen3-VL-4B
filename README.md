@@ -692,7 +692,7 @@ This reproduction prioritizes the **core idea** (visual primitives as reasoning 
   2. Unfreeze the last few ViT layers (`--unfreeze_vit_layers 2-4`) with a very low LR for better coordinate precision.
 
 ### Stage 3 — Cold-Start SFT
-- **Current**: COCO box/point/counting + synthetic CLEVR + recursive-backtracking mazes + path tracing.
+- **Current**: COCO box/point/counting + synthetic CLEVR + recursive-backtracking mazes + path tracing. **✅ Implemented `<|ref|>` tokens end-to-end: coarse-counting uses batch ref, fine-grained/Spatial uses individual ref, negative samples use no ref.**
 - **Paper**: MLLM-generated thinking chains on GQA scene graphs, 460K mazes with DFS/Prim/Kruskal and rectangular/circular/hexagonal topologies, 125K path-tracing samples.
 - **Practical next steps**:
   1. **Fine-grained counting**: Integrate GQA scene-graph data and use an MLLM/API to generate attribute-constrained questions and thinking chains, then verify with `thinking_verifier.py`.
@@ -701,11 +701,20 @@ This reproduction prioritizes the **core idea** (visual primitives as reasoning 
   4. **MLLM-generated thinking**: Wherever you have annotations (GQA, COCO panoptic, SA-1B), use a cheap local MLLM or API to synthesize "Intent Analysis → Grounding → Summarization" chains rather than hand-crafting templates.
 
 ### Stage 4 — Specialized RL
-- **Current**: Rule-based Quality RM and binary-correctness difficulty grading (now aligned with the paper's "correct rollout count" criterion).
+- **Current**: Rule-based Quality RM and binary-correctness difficulty grading (now aligned with the paper's "correct rollout count" criterion). **✅ Path Tracing now uses the full paper 4-component Accuracy RM** (forward/reverse/endpoint/continuity + answer correctness). **✅ Complex CLEVR questions (multihop/compare/spatial_existence/spatial_count) use LLM API judge** instead of simple answer matching.
 - **Paper**: LLM-based Generative Reward Model (GRM) for Quality RM.
 - **Practical next steps**:
   1. Replace `quality_reward_text` with a small local LLM judge (e.g., Qwen2.5-3B-Instruct or a distilled critic) called via a lightweight API, or call it only on a subset of rollouts to control cost.
   2. Use the rule-based QM as a fast filter and the LLM judge for tie-breaking / borderline cases.
+
+### Stage 5 — RFT
+- **Current**: Expert rollout → difficulty grading → Normal + 5% Easy → SFT. **✅ Prompt pool now includes path tracing data.**
+
+### Stage 6 — OPD
+- **Current**: **✅ Gradient-accumulation parallel distillation** (`train_opd_parallel()`). Within each epoch: Box Expert processes box data → accumulates gradients → swaps to Point Expert for point/maze data → single `optimizer.step()`. Gradient direction is the sum of both expert signals. Only one expert in GPU at a time. Distillation temperature raised from 1.0 → 1.2.
+
+### Observability
+- **Current**: **✅ TensorBoard primitive metrics callback** implemented. Every N steps logs format compliance rate, coordinate validity, ref usage rate, and average rewards. All stage config YAMLs set `report_to: tensorboard`. Launch: `tensorboard --logdir outputs/stageX_xxx/tb_primitive_logs`
 
 ## ⚠️ Known Limitations
 

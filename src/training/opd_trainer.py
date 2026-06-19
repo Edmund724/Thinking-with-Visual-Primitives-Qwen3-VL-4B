@@ -382,3 +382,232 @@ def train_opd(
             torch.cuda.empty_cache()
 
     logger.info("OPD training complete.")
+
+
+def train_opd_parallel(
+    student_model,
+    box_expert,
+    point_expert,
+    processor: AutoProcessor,
+    box_data: List[Dict[str, Any]],
+    point_data: List[Dict[str, Any]],
+    output_dir: str,
+    num_epochs: int = 2,
+    learning_rate: float = 1e-6,
+    per_device_batch_size: int = 1,
+    max_new_tokens: int = 512,
+    temperature: float = DEFAULT_DISTILL_TEMPERATURE,
+    warmup_steps: int = 100,
+    logging_steps: int = 20,
+    save_steps: int = 500,
+    resume_from_checkpoint: Optional[str] = None,
+    logger: logging.Logger | None = None,
+):
+    """Run OPD with gradient accumulation simulating parallel distillation.
+
+    The paper (Sec 2.5.4) defines: L = w1*D_KL(π_θ||π_E_box) + w2*D_KL(π_θ||π_E_point).
+    This function approximates that by:
+      1. Process box batches with box expert → backward (accumulate, no step)
+      2. Swap to point expert → process point batches → backward (accumulate)
+      3. optimizer.step() — gradient is the sum of both expert signals
+    Only one expert is in GPU memory at a time, keeping VRAM constant.
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    # Freeze both experts
+    for expert in (box_expert, point_expert):
+        for param in expert.parameters():
+            param.requires_grad = False
+        expert.eval()
+
+    student_model.train()
+
+    # Build datasets
+    box_dataset = OPDDataset(data=box_data, processor=processor)
+    point_dataset = OPDDataset(data=point_data, processor=processor)
+    box_loader = DataLoader(box_dataset, batch_size=per_device_batch_size, shuffle=True,
+                            drop_last=False, collate_fn=_opd_collate)
+    point_loader = DataLoader(point_dataset, batch_size=per_device_batch_size, shuffle=True,
+                              drop_last=False, collate_fn=_opd_collate)
+
+    total_steps_per_epoch = len(box_loader) + len(point_loader)
+    logger.info(
+        f"OPD parallel: {len(box_dataset)} box + {len(point_dataset)} point samples, "
+        f"{total_steps_per_epoch} batches/epoch"
+    )
+
+    # Optimizer: only student LoRA params
+    trainable_params = [p for p in student_model.parameters() if p.requires_grad]
+    n_params = sum(p.numel() for p in trainable_params)
+    logger.info(f"Trainable student params: {n_params:,} ({n_params/1e6:.1f}M)")
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps_per_epoch * num_epochs
+    )
+
+    pad_token_id = processor.tokenizer.pad_token_id or 0
+    eos_token_id = processor.tokenizer.eos_token_id
+
+    global_step = 0
+    start_epoch = 0
+
+    for epoch in range(start_epoch, num_epochs):
+        epoch_kl = 0.0
+        epoch_t0 = time.time()
+        batch_count = 0
+
+        # Phase 1: Box expert on box data (accumulate gradients, no step)
+        logger.info(f"Epoch {epoch+1}: Box expert phase...")
+        box_expert.to(student_model.device)
+        pbar = tqdm(box_loader, desc=f"OPD Box E{epoch+1}", unit="batch")
+        for step, batch in enumerate(pbar):
+            kl_val = _opd_single_batch(
+                student_model, box_expert, batch, processor,
+                max_new_tokens, temperature, pad_token_id, eos_token_id,
+                do_step=False,  # accumulate only
+            )
+            global_step += 1
+            batch_count += 1
+            epoch_kl += kl_val
+            if global_step <= warmup_steps:
+                lr = learning_rate * global_step / warmup_steps
+                for g in optimizer.param_groups:
+                    g["lr"] = lr
+            if global_step > warmup_steps:
+                scheduler.step()
+            pbar.set_postfix({"kl": f"{kl_val:.4f}", "phase": "box"})
+
+        # Release box expert, load point expert
+        box_expert.cpu()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        point_expert.to(student_model.device)
+
+        # Phase 2: Point expert on point data (accumulate, then step)
+        logger.info(f"Epoch {epoch+1}: Point expert phase...")
+        pbar = tqdm(point_loader, desc=f"OPD Point E{epoch+1}", unit="batch")
+        for step, batch in enumerate(pbar):
+            is_last_batch = (step == len(point_loader) - 1)
+            kl_val = _opd_single_batch(
+                student_model, point_expert, batch, processor,
+                max_new_tokens, temperature, pad_token_id, eos_token_id,
+                do_step=is_last_batch,  # step on last batch of epoch
+                optimizer=optimizer if is_last_batch else None,
+                trainable_params=trainable_params,
+            )
+            global_step += 1
+            batch_count += 1
+            epoch_kl += kl_val
+            if global_step <= warmup_steps:
+                lr = learning_rate * global_step / warmup_steps
+                for g in optimizer.param_groups:
+                    g["lr"] = lr
+            if global_step > warmup_steps:
+                scheduler.step()
+            pbar.set_postfix({"kl": f"{kl_val:.4f}", "phase": "point"})
+
+            if global_step % logging_steps == 0:
+                logger.info(
+                    f"  Epoch {epoch+1} | Step {global_step} | "
+                    f"KL: {kl_val:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+                )
+
+            if global_step % save_steps == 0:
+                _save_opd_checkpoint(
+                    student_model, optimizer, scheduler,
+                    global_step, epoch, step + 1,
+                    output_dir, logger,
+                )
+
+        # Release point expert for next epoch
+        point_expert.cpu()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        avg_kl = epoch_kl / max(batch_count, 1)
+        logger.info(
+            f"OPD Epoch {epoch+1}/{num_epochs} complete. "
+            f"Avg KL: {avg_kl:.4f} | Time: {time.time() - epoch_t0:.1f}s"
+        )
+
+    logger.info("OPD parallel training complete.")
+
+
+def _opd_single_batch(
+    student_model,
+    expert,
+    batch,
+    processor,
+    max_new_tokens,
+    temperature,
+    pad_token_id,
+    eos_token_id,
+    do_step: bool = False,
+    optimizer=None,
+    trainable_params=None,
+) -> float:
+    """Process a single OPD batch: generate, forward, compute KL, backward.
+
+    Returns the KL loss value.
+    """
+    prompt_inputs = {
+        k: v[0].to(student_model.device)
+        for k, v in batch.items()
+        if k not in ("task_type", "prompt_text")
+    }
+    prompt_ids = prompt_inputs["input_ids"]
+    image_kwargs = {
+        k: v for k, v in prompt_inputs.items()
+        if k in ("pixel_values", "image_grid_thw")
+    }
+
+    # 1. Student generates (on-policy)
+    with torch.no_grad():
+        generated = student_model.generate(
+            input_ids=prompt_ids.unsqueeze(0),
+            max_new_tokens=max_new_tokens,
+            temperature=max(temperature, 0.1),
+            do_sample=True,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            **image_kwargs,
+        )
+    full_ids = generated[0]
+
+    # 2. Forward student
+    student_outputs = student_model(
+        input_ids=full_ids.unsqueeze(0),
+        labels=full_ids.unsqueeze(0),
+        **image_kwargs,
+    )
+    student_logits = student_outputs.logits[:, :-1, :]
+
+    # 3. Forward expert (frozen)
+    with torch.no_grad():
+        expert_outputs = expert(
+            input_ids=full_ids.unsqueeze(0),
+            **image_kwargs,
+        )
+        expert_logits = expert_outputs.logits[:, :-1, :]
+
+    # Align lengths
+    min_len = min(student_logits.shape[1], expert_logits.shape[1])
+    student_logits = student_logits[:, :min_len, :]
+    expert_logits = expert_logits[:, :min_len, :]
+
+    # 4. Reverse KL
+    temp = max(temperature, 0.1)
+    log_p_s = F.log_softmax(student_logits / temp, dim=-1)
+    log_p_e = F.log_softmax(expert_logits / temp, dim=-1)
+    p_s = F.softmax(student_logits / temp, dim=-1)
+    kl_per_token = (p_s * (log_p_s - log_p_e)).sum(dim=-1)
+    kl_loss = kl_per_token.mean()
+
+    # 5. Backward (accumulate if not stepping)
+    kl_loss.backward()
+
+    if do_step and optimizer is not None and trainable_params is not None:
+        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.3)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return kl_loss.item()

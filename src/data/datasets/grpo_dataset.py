@@ -59,4 +59,6 @@ class GRPODataset(Dataset):
             ),
             "task_type": sample.get("task_type", "box"),
             "maze_grid": sample.get("maze_grid"),
+            "gt_curve": sample.get("gt_curve"),
+            "question_type": sample.get("question_type"),
         }

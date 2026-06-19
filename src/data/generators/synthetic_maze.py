@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw
 
 from ...utils.constants import MAZE_SOLVABLE_RATIO
 from ...utils.thinking_verifier import filter_verified_samples
-from ..formatters.primitive_formatter import format_point, normalize_coordinate
+from ...models.visual_primitive_parser import PrimitiveParser
 
 
 def generate_maze_grid(rows: int, cols: int) -> np.ndarray:
@@ -187,12 +187,12 @@ def dfs_exploration_with_backtracking(
 
     while stack:
         (x, y), path = stack.pop()
-        norm_x = normalize_coordinate(x, w)
-        norm_y = normalize_coordinate(y, h)
+        norm_x = PrimitiveParser.normalize_coordinate(x, w)
+        norm_y = PrimitiveParser.normalize_coordinate(y, h)
 
         if (x, y) == end:
             thinking_lines.append(
-                f"Reached destination at {format_point([(norm_x, norm_y)])}"
+                f"Reached destination at {PrimitiveParser.format_point([(norm_x, norm_y)])}"
             )
             break
 
@@ -208,14 +208,14 @@ def dfs_exploration_with_backtracking(
 
         if not neighbors:
             thinking_lines.append(
-                f"Dead end at {format_point([(norm_x, norm_y)])}, backtracking..."
+                f"Dead end at {PrimitiveParser.format_point([(norm_x, norm_y)])}, backtracking..."
             )
             continue
 
         for nx, ny in reversed(neighbors):
             stack.append(((nx, ny), path + [(nx, ny)]))
             thinking_lines.append(
-                f"Move to {format_point([(normalize_coordinate(nx, w), normalize_coordinate(ny, h))])}"
+                f"Move to {PrimitiveParser.format_point([(PrimitiveParser.normalize_coordinate(nx, w), PrimitiveParser.normalize_coordinate(ny, h))])}"
             )
 
     return "\n".join(thinking_lines)
@@ -236,15 +236,15 @@ def dfs_exhaustive_search_proving_unreachable(
 
     while stack:
         x, y = stack.pop()
-        norm_x = normalize_coordinate(x, w)
-        norm_y = normalize_coordinate(y, h)
+        norm_x = PrimitiveParser.normalize_coordinate(x, w)
+        norm_y = PrimitiveParser.normalize_coordinate(y, h)
 
         if (x, y) in visited:
             continue
         visited.add((x, y))
 
         thinking_lines.append(
-            f"Exploring {format_point([(norm_x, norm_y)])}"
+            f"Exploring {PrimitiveParser.format_point([(norm_x, norm_y)])}"
         )
 
         neighbors = []
@@ -255,7 +255,7 @@ def dfs_exhaustive_search_proving_unreachable(
 
         if not neighbors:
             thinking_lines.append(
-                f"Dead end at {format_point([(norm_x, norm_y)])}, backtracking..."
+                f"Dead end at {PrimitiveParser.format_point([(norm_x, norm_y)])}, backtracking..."
             )
         else:
             for nx, ny in reversed(neighbors):

@@ -4,7 +4,98 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **YAML duplicate keys cleaned + argparse defaults unified to `None`**
+  - Fixed duplicate `num_epochs` in `configs/stage2_visual_pretrain.yaml` (was `1` then `2`; removed the dead `1`).
+  - Fixed duplicate `early_stopping_*` block in `configs/stage4a_grpo_box.yaml` (was `0/50/2` then `16/50/2`; removed the dead first set).
+  - All 8 stage scripts: `add_arg(default=<concrete>)` → `default=None` (~120 arguments). YAML configs are now the sole default source; `action="store_true"` flags unchanged.
+  - Fixed latent bug in `run_stage1_pretrain.py`: only 5 args were registered but `train()` accessed ~17 — now all registered; `configs/stage1_pretrain.yaml` expanded with visual-phase, ViT, and `max_seq_length` keys.
+  - 5 standalone scripts (`merge_stage2`, `smoke_test_stage2`, `eval_stage2_structure`, `eval_stage3a_paradigm`, `diagnose_stage2_resume_loss`): all `default=<concrete>` → `default=None`.
+  - Fixed `--config` CLI override in `StageRunner.parse_args()`: `self.args.config` was never read, so CLI `--config` was effectively dead. Now correctly synced and defaults to `None`.
+  - `apply_yaml_defaults` correctly handles `None == None` comparison for the three-layer default cascade (argparse `None` → YAML value → CLI override).
+
+- **PrimitiveParser upgraded to a true domain seam**
+  - Extended `PrimitiveParser` from 7 methods to 32 methods, now covering all concerns:
+    - **Parsing**: `extract_answer`, `extract_reasoning`, `split_generated_text`, `normalize_answer_text`, `lenient_extract_boxes`
+    - **Formatting**: `format_box`, `format_point`, `clean_primitive_tags`, `normalize_coordinate`, `denormalize_coordinate`
+    - **Geometry**: `box_iou`, `match_boxes`, `point_distance`, `match_points`, 5 maze scoring functions, `has_duplicate_coords`, `count_repeated_coordinates`, `check_backtracking_missing`
+    - **Existing**: `extract_boxes`, `extract_points`, `validate_syntax`, `validate_coordinates`, `check_wall_collision`, `check_wall_collision_points`, `count_tags`, `has_backtracking_keywords`
+  - Updated 11 production files to route through `PrimitiveParser` instead of directly importing `text_parsing.py` / `geometry.py` / `primitive_formatter.py`:
+    - `src/utils/reward/accuracy_rm.py`, `quality_rm.py`, `difficulty.py`
+    - `scripts/eval_stage2_structure.py`, `scripts/run_stage5_rft_unified.py`
+    - 5 generator files (`coco_box_generator`, `clevr_spatial`, `path_tracing`, `synthetic_path`, `synthetic_maze`)
+  - `src/utils/metrics.py` now re-exports `PrimitiveParser` alongside the legacy flat functions for backward compatibility.
+  - Added 18 new test cases in `tests/test_primitive_parser.py`.
+
+- **Upgraded Quality RM LLM Judge (API-based)**
+  - Improved judge prompt in `src/utils/quality_rm_api.py`: chain-of-thought evaluation with 6 quality dimensions (redundancy, consistency, contradiction, reward hacking, self-contradiction, meaningful references) → structured `Score: X.X` output.
+  - Score parser updated to handle both new `Score: X.X` format and legacy bare-number format.
+  - **Subset sampling** via `QUALITY_RM_SAMPLE_RATIO` env var (default 0.3): only a random fraction of completions go through the API judge; the rest use the fast rule-based fallback. Reduces API cost by ~70%.
+  - Increased API `max_tokens` from 10 → 150 to accommodate brief reasoning output.
+  - `.env.example` updated with `QUALITY_RM_SAMPLE_RATIO` documentation.
+
+- **Stage 1 now supports real images (visual grounding pretrain)**
+  - New `train_pretrain_visual()` in `src/training/pretrain_trainer.py` — uses `SFTDataset` for image handling in a custom PyTorch loop.
+  - Stage 1 CLI flags: `--visual_data_ratio`, `--visual_num_box`, `--visual_num_point`, `--visual_epochs`, `--visual_learning_rate`, `--visual_batch_size`.
+  - When `--visual_data_ratio > 0`, COCO box/point samples are generated and trained after text pretrain.
+  - Closer to the paper's "large-scale grounding pretraining" Stage 1.
+
+- **ViT last-layer unfreezing (experimental)**
+  - `load_pretrain_model()` and `load_qlora_model()` now accept `unfreeze_vit_layers: int = 0`.
+  - When > 0, unfreezes `model.visual.blocks[-N:]` + `model.visual.merger`.
+  - New `build_param_groups()` helper in `src/training/memory_utils.py` assigns per-group LRs (ViT blocks: 1e-6, merger: 1e-5, LLM: normal).
+  - CLI flags: `--unfreeze_vit_layers`, `--vit_lr` added to stages 1 and 2.
+
+- **Refactored `src/utils/metrics.py` into focused modules**
+  - Split the 1500+ line file into:
+    - `src/utils/text_parsing.py`: answer / reasoning / box / point parsing
+    - `src/utils/geometry.py`: IoU, point distance, maze geometry
+    - `src/utils/reward/format_rm.py`: Format RM
+    - `src/utils/reward/quality_rm.py`: Quality RM
+    - `src/utils/reward/accuracy_rm.py`: Accuracy RM (`process_reward`, `compute_total_reward`)
+    - `src/utils/difficulty.py`: Easy/Normal/Hard difficulty grading
+  - `src/utils/metrics.py` remains as a backward-compatible shim re-exporting the public API.
+  - Updated internal imports in stage scripts, `visual_primitive_parser.py`, and `quality_rm_api.py` to use the new modules directly.
+  - Fixed incorrect `extract_completion_text` import in `src/utils/quality_rm_api.py` (was imported from `.metrics`, now from `..training.grpo_utils`).
+  - Updated `tests/test_filter_normal_level_data.py` patch targets to match the new module locations.
+
+- **Introduced `ConversationBuilder` to unify message construction**
+  - New `src/utils/conversation_builder.py` with mode-based system messages (`sft`, `grpo`, `opd`, `pretrain`) and composable methods: `build_prompt()`, `build_sft()`, `build_pretrain()`, `build_gt_text()`, `build_user_content()`.
+  - Wired into: `sft_dataset.py`, `grpo_dataset.py`, `batch_inference.py`, `opd_trainer.py`, `generate_pretrain_data.py`, `eval_stage2_structure.py`, `eval_stage3a_paradigm.py`, `smoke_test_stage2.py`, `run_stage5_rft_unified.py`.
+  - Eliminates ~110 lines of duplicated message-building across 9 files.
+
+- **Introduced `StageRunner` to eliminate stage script boilerplate**
+  - New `src/training/stage_runner.py` handles: `PYTORCH_CUDA_ALLOC_CONF`, `sys.path`, argparse + YAML defaults, logging setup, `torch.cuda.empty_cache()` banners, and `pickle` data-cache pattern (via `runner.cached_data()`).
+  - All 8 stage scripts (`run_stage1..6*.py`) refactored to use `StageRunner` with callback-driven `train(runner)` functions.
+  - Eliminates ~220 lines of duplicated boilerplate across stage scripts.
+
+- **Added unified generator registry**
+  - `src/data/generators/__init__.py` now exports a `GENERATORS` dict mapping task names to generator functions, and re-exports all public generator APIs.
+  - Backward-compatible: direct imports from individual generator modules still work.
+
 ### Added
+
+- **Stage integration tests** (`tests/test_stage_integration.py`)
+  - 14 tests covering all 8 training stages: each test generates data with minimal sample counts and verifies data shape, task types, and (for Stage 1) runs an actual forward pass.
+  - Stage 1: text pretrain generation + forward pass through 4-bit base model.
+  - Stage 2: COCO box/point sample generation.
+  - Stage 3a: box/counting/CLEVR sample generation.
+  - Stage 3b: point/maze/path sample generation.
+  - Stage 4a: GRPO Box data type mixture.
+  - Stage 4b: GRPO Point data type mixture.
+  - Stage 5: Unified RFT all-prompt-type generation (box/counting/CLEVR/point/maze/path).
+  - Stage 6: OPD box/point/maze sample generation.
+  - All tests use `pytest.mark.skipif` to gracefully skip when models or COCO data are not present.
+
+- **Stage 1 lightweight format SFT**
+  - `load_pretrain_model()` in `src/models/pretrain_loader.py` now unfreezes the last 2 decoder layers in addition to `embed_tokens` / `lm_head`.
+  - This moves Stage 1 from pure embedding initialization to a lightweight format pretrain that learns the conditional pattern of emitting visual primitives inside `<think>` chains, better matching the paper's pretraining objective.
+
+- **Stage 1/2 data format alignment with paper**
+  - `scripts/generate_pretrain_data.py`: samples now include a system message and wrap the assistant reply in `<think>...</think>`, with a natural-language sentence plus the primitive tags.
+  - `src/data/generators/coco_box_generator.py` and `coco_point_generator`: `use_thinking=False` (Stage 2 visual pretrain) now emits natural-language reasoning that introduces the primitive tags, instead of bare `<|ref|>...<|box|>...` strings.
+  - `src/training/pretrain_trainer.py`: prompt masking now uses the last message as the assistant target, supporting the new 3-message format.
 
 - **Weighted SFT loss for format tokens**
   - New `WeightedSFTTrainer` in `src/training/trainers/sft_trainer.py` applies per-token loss weights.

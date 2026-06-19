@@ -6,42 +6,18 @@ falls back to single-sample generation if batched generation fails.
 """
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
 from ..data.datasets.image_loader import load_image
+from .conversation_builder import ConversationBuilder
 
 
 logger = logging.getLogger(__name__)
 
-
-def _build_messages(sample: Dict, image) -> List[Dict]:
-    """Build chat messages for a single sample."""
-    system_content = (
-        "You are a helpful visual reasoning assistant. "
-        "Think step by step inside <think>...</think> tags, then provide your final answer. "
-        "Use visual primitives (<|box|>, <|point|>) when needed to mark locations. "
-        "Always close your reasoning with </think> before giving the answer. "
-        "Respond in English only; do not use characters from other languages."
-    )
-    return [
-        {
-            "role": "system",
-            "content": system_content,
-        },
-        {
-            "role": "user",
-            "content": (
-                [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": sample["prompt"]},
-                ]
-                if image is not None
-                else sample["prompt"]
-            ),
-        },
-    ]
+# Shared builder for batched / single generation (GRPO-style system message).
+_conv_builder = ConversationBuilder("grpo")
 
 
 def batch_generate_completions(
@@ -73,7 +49,7 @@ def batch_generate_completions(
     images = []
     for sample in samples:
         image = load_image(sample.get("image"))
-        messages = _build_messages(sample, image)
+        messages = _conv_builder.build_prompt(sample["prompt"], image)
         prompt_text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -126,7 +102,7 @@ def generate_single_completion(
 ) -> Tuple[torch.Tensor, int]:
     """Generate one completion for a single sample."""
     image = load_image(sample.get("image"))
-    messages = _build_messages(sample, image)
+    messages = _conv_builder.build_prompt(sample["prompt"], image)
     prompt_text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )

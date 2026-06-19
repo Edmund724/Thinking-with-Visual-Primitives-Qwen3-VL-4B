@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from ..data.datasets.image_loader import load_image
 from ..utils.constants import DEFAULT_DISTILL_TEMPERATURE
+from ..utils.conversation_builder import ConversationBuilder
 
 
 class OPDDataset(Dataset):
@@ -42,6 +43,7 @@ class OPDDataset(Dataset):
     def __init__(self, data: List[Dict[str, Any]], processor: AutoProcessor):
         self.data = data
         self.processor = processor
+        self._conv_builder = ConversationBuilder("opd")
 
     def __len__(self):
         return len(self.data)
@@ -52,19 +54,7 @@ class OPDDataset(Dataset):
         image = load_image(sample.get("image"))
 
         # Build prompt messages with image embedded in multimodal content blocks
-        system_content = "You are a helpful visual reasoning assistant. Think step by step."
-        if image is not None:
-            user_content = [
-                {"type": "image", "image": image},
-                {"type": "text", "text": sample["prompt"]},
-            ]
-        else:
-            user_content = sample["prompt"]
-
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
-        ]
+        messages = self._conv_builder.build_prompt(sample["prompt"], image)
 
         prompt_text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,

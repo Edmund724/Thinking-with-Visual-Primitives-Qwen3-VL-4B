@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 
-from ..formatters.primitive_formatter import format_point, normalize_coordinate
+from ...models.visual_primitive_parser import PrimitiveParser
 
 
 def generate_smooth_curve(
@@ -102,7 +102,7 @@ def generate_path_tracing_image(
         # Sample waypoints for GT (every 5th point)
         waypoints = curve_points[::5]
         norm_waypoints = [
-            (normalize_coordinate(p[0], image_size[0]), normalize_coordinate(p[1], image_size[1]))
+            (PrimitiveParser.normalize_coordinate(p[0], image_size[0]), PrimitiveParser.normalize_coordinate(p[1], image_size[1]))
             for p in waypoints
         ]
 
@@ -151,7 +151,7 @@ def generate_path_dataset(
         ]
 
         for wp in target["waypoints"]:
-            thinking_parts.append(f"Waypoint: {format_point([wp])}")
+            thinking_parts.append(f"Waypoint: {PrimitiveParser.format_point([wp])}")
         thinking_parts.append("Path complete.")
 
         data.append({

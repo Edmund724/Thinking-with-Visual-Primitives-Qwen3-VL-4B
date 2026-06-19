@@ -113,6 +113,7 @@ def load_qlora_model(
     use_gradient_checkpointing: bool = True,
     pretrain_embedding_path: str | None = None,
     old_vocab_size: int | None = None,
+    unfreeze_vit_layers: int = 0,
 ) -> Tuple[Qwen3VLForConditionalGeneration, AutoProcessor]:
     """Load Qwen3-VL with QLoRA (4-bit NF4, double quantization).
 
@@ -270,6 +271,33 @@ def load_qlora_model(
     #   → Qwen3VLModel → Qwen3VLTextModel (the one with @merge_with_config_defaults
     #   decorator that reads self.config.use_cache during forward).
     _set_use_cache_deep(model)
+
+    # Optionally unfreeze the last N ViT blocks + merger.
+    # Access the base model through the PeftModel wrapper if present.
+    if unfreeze_vit_layers > 0:
+        base = model.base_model.model if hasattr(model, "base_model") else model
+        visual = getattr(base, "visual", None)
+        if visual is not None:
+            blocks = getattr(visual, "blocks", None)
+            if blocks is not None and len(blocks) >= unfreeze_vit_layers:
+                for block in blocks[-unfreeze_vit_layers:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+                n_params = sum(
+                    p.numel() for b in blocks[-unfreeze_vit_layers:]
+                    for p in b.parameters()
+                )
+                logger.info(
+                    f"Unfroze last {unfreeze_vit_layers} ViT blocks "
+                    f"(blocks {len(blocks)-unfreeze_vit_layers}-{len(blocks)-1}, "
+                    f"{n_params:,} params)"
+                )
+            merger = getattr(visual, "merger", None)
+            if merger is not None:
+                for param in merger.parameters():
+                    param.requires_grad = True
+                n_params = sum(p.numel() for p in merger.parameters())
+                logger.info(f"Unfroze ViT merger (vision→language projection, {n_params:,} params)")
 
     model.print_trainable_parameters()
     return model, processor

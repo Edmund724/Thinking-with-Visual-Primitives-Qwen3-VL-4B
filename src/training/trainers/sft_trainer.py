@@ -48,10 +48,13 @@ class WeightedSFTTrainer(Trainer):
         if shift_weights is not None:
             losses = losses * shift_weights.view(-1)
 
-        # Mean over non-masked assistant tokens.
-        mask = shift_labels != -100
+        # Mean over non-masked assistant tokens, weighted by per-token loss_weight.
+        # Use the sum of weights as denominator so that up-weighting format tokens
+        # changes the gradient emphasis without inflating the reported loss value.
+        mask = (shift_labels != -100).view(-1)
         if mask.any():
-            loss = losses[mask].sum() / mask.sum()
+            weights = shift_weights.view(-1)[mask] if shift_weights is not None else torch.ones_like(losses[mask])
+            loss = losses[mask].sum() / weights.sum()
         else:
             loss = losses.sum() * 0.0
 

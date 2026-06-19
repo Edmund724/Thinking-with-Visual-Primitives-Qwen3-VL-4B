@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from src.utils.metrics import filter_normal_level_data
+from src.utils.difficulty import filter_normal_level_data
 
 
 class FakeModel:
@@ -79,10 +79,10 @@ def test_filter_keeps_normal_samples(fake_setup):
     model, processor, samples = fake_setup
 
     with (
-        patch("src.utils.batch_inference.batch_generate_completions", side_effect=_fake_batch_generate),
-        patch("src.utils.batch_inference.generate_single_completion") as single_mock,
-        patch("src.utils.metrics.compute_total_reward", return_value={"total_reward": 1.0}),
-        patch("src.utils.metrics.is_rollout_correct", side_effect=_fake_is_rollout_correct),
+        patch("src.utils.difficulty.batch_generate_completions", side_effect=_fake_batch_generate),
+        patch("src.utils.difficulty.generate_single_completion") as single_mock,
+        patch("src.utils.difficulty.compute_total_reward", return_value={"total_reward": 1.0}),
+        patch("src.utils.difficulty.is_rollout_correct", side_effect=_fake_is_rollout_correct),
     ):
         result = filter_normal_level_data(
             model=model,
@@ -106,10 +106,10 @@ def test_filter_skips_easy_and_hard(fake_setup):
         return True
 
     with (
-        patch("src.utils.batch_inference.batch_generate_completions", side_effect=_fake_batch_generate),
-        patch("src.utils.batch_inference.generate_single_completion") as single_mock,
-        patch("src.utils.metrics.compute_total_reward", return_value={"total_reward": 1.0}),
-        patch("src.utils.metrics.is_rollout_correct", side_effect=all_correct),
+        patch("src.utils.difficulty.batch_generate_completions", side_effect=_fake_batch_generate),
+        patch("src.utils.difficulty.generate_single_completion") as single_mock,
+        patch("src.utils.difficulty.compute_total_reward", return_value={"total_reward": 1.0}),
+        patch("src.utils.difficulty.is_rollout_correct", side_effect=all_correct),
     ):
         result = filter_normal_level_data(
             model=model,

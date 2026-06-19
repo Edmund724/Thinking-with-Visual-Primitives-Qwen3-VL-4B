@@ -5,46 +5,31 @@ Continues training the Point Expert LoRA adapter with GRPO on point+maze data.
 Uses Format RM + Accuracy RM with difficulty grading (Normal only).
 """
 
-import os
-
-# Mitigate CUDA memory fragmentation from variable-length GRPO completions.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-import argparse
 import gc
-import pickle
-import sys
+import os
 from pathlib import Path
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from trl import GRPOConfig, GRPOTrainer
 
 from src.data.datasets.grpo_dataset import GRPODataset
-from src.training.grpo_fixes import apply_grpo_fixes
-from src.training.grpo_utils import extract_completion_text
 from src.data.generators.coco_box_generator import generate_coco_point_samples
-from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.data.generators.path_tracing import generate_path_tracing_dataset
-from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
-from src.training.memory_utils import log_memory_status, clear_memory, GPUMemoryMonitor
-from src.utils.constants import GPU_MEMORY_WARNING_GB
-from src.utils.config_utils import apply_yaml_defaults
-from src.utils.logging_utils import setup_logging
-from src.utils.metrics import (
-    compute_total_reward,
-    filter_normal_level_data,
-    length_reward,
-    make_quality_reward_fn,
-)
-from src.utils.quality_rm_api import make_quality_reward_api_fn
+from src.data.generators.synthetic_maze import generate_maze_dataset
+from src.models.qwen_vl_loader import _set_use_cache_deep, load_qlora_model
 from src.training.callbacks import (
     ValidationSubsetEarlyStoppingCallback,
     maybe_compile_model,
 )
-
-logger = setup_logging(log_file="logs/stage4b_grpo_point.log")
+from src.training.grpo_fixes import apply_grpo_fixes
+from src.training.grpo_utils import extract_completion_text
+from src.training.memory_utils import GPUMemoryMonitor, clear_memory, log_memory_status
+from src.training.stage_runner import StageRunner
+from src.utils.constants import GPU_MEMORY_WARNING_GB
+from src.utils.difficulty import filter_normal_level_data
+from src.utils.quality_rm_api import make_quality_reward_api_fn
+from src.utils.reward.accuracy_rm import compute_total_reward, length_reward
+from src.utils.reward.quality_rm import make_quality_reward_fn
 
 
 def _latest_checkpoint(round_dir: Path) -> Path | None:
@@ -62,7 +47,7 @@ def _latest_checkpoint(round_dir: Path) -> Path | None:
     return max(checkpoints, key=_step)
 
 
-def make_point_reward_fn(point_dist_threshold: float, tokenizer=None):
+def make_point_reward_fn(point_dist_threshold: float, tokenizer=None, logger=None):
     """Factory: point+maze reward with Format RM + Point/Maze Accuracy RM."""
 
     def grpo_reward(completions, prompts=None, **kwargs):
@@ -118,12 +103,8 @@ def make_point_reward_fn(point_dist_threshold: float, tokenizer=None):
     return grpo_reward
 
 
-def main(args):
-    logger.info("=" * 60)
-    logger.info("Stage 4b: Specialized GRPO — Point Expert")
-    logger.info("=" * 60)
-
-    torch.cuda.empty_cache()
+def train(runner: StageRunner) -> None:
+    args, logger = runner.args, runner.logger
 
     # 1. Load Point Expert from Stage 3b
     policy_path = args.model_path
@@ -139,13 +120,7 @@ def main(args):
     policy_model = maybe_compile_model(policy_model, enable=args.compile_model)
 
     # 2. Generate or load cached GRPO data
-    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
-    if os.path.exists(cache_path):
-        logger.info(f"Loading cached training data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            all_data = pickle.load(f)
-        logger.info(f"  Loaded {len(all_data)} samples from cache")
-    else:
+    def _generate_raw_data():
         logger.info("Generating GRPO training data (point+maze+path)...")
         all_data = []
 
@@ -179,42 +154,39 @@ def main(args):
         logger.info(f"  Path tracing samples: {len(path_data)}")
 
         logger.info(f"Total GRPO samples: {len(all_data)}")
+        return all_data
 
-        # Save cache for future runs
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(all_data, f)
-        logger.info(f"Cached training data to {cache_path}")
+    all_data = runner.cached_data(
+        os.path.join(args.output_dir, "train_data_cache.pkl"),
+        _generate_raw_data,
+    )
 
     num_rounds = args.num_rounds
     dist_thresholds = [20.0, 10.0, 5.0]
 
     # Difficulty filtering: keep only Normal-level samples (paper Sec 2.5.2).
-    filtered_cache_path = os.path.join(args.output_dir, "filtered_train_data_cache.pkl")
     if args.skip_difficulty_filter:
         logger.info("--skip_difficulty_filter is set; using all samples without filtering")
-    elif os.path.exists(filtered_cache_path):
-        logger.info(f"Loading filtered training data from {filtered_cache_path}")
-        with open(filtered_cache_path, "rb") as f:
-            all_data = pickle.load(f)
-        logger.info(f"  Loaded {len(all_data)} Normal-difficulty samples")
     else:
-        logger.info("Difficulty filtering: retaining only Normal-level samples...")
-        all_data = filter_normal_level_data(
-            model=policy_model,
-            processor=processor,
-            data=all_data,
-            num_generations=args.num_generations,
-            max_completion_length=args.max_completion_length,
-            task_type="point",
-            point_dist_threshold=dist_thresholds[0] if num_rounds > 0 else 10.0,
-            batch_size=args.filter_batch_size,
-            empty_cache_every=args.filter_empty_cache_every,
-            logger=logger,
+        def _filter_data():
+            logger.info("Difficulty filtering: retaining only Normal-level samples...")
+            return filter_normal_level_data(
+                model=policy_model,
+                processor=processor,
+                data=all_data,
+                num_generations=args.num_generations,
+                max_completion_length=args.max_completion_length,
+                task_type="point",
+                point_dist_threshold=dist_thresholds[0] if num_rounds > 0 else 10.0,
+                batch_size=args.filter_batch_size,
+                empty_cache_every=args.filter_empty_cache_every,
+                logger=logger,
+            )
+
+        all_data = runner.cached_data(
+            os.path.join(args.output_dir, "filtered_train_data_cache.pkl"),
+            _filter_data,
         )
-        with open(filtered_cache_path, "wb") as f:
-            pickle.dump(all_data, f)
-        logger.info(f"Cached filtered training data to {filtered_cache_path}")
 
     # Apply monkey-patches once, before training. Applying inside the round loop
     # would nest wrappers on each iteration.
@@ -262,7 +234,7 @@ def main(args):
                 logger.warning(f"Could not load checkpoint {resume_from}: {e}, starting from scratch.")
                 resume_from = None
 
-        reward_fn = make_point_reward_fn(dist_th, tokenizer=processor.tokenizer)
+        reward_fn = make_point_reward_fn(dist_th, tokenizer=processor.tokenizer, logger=logger)
 
         grpo_config = GRPOConfig(
             output_dir=str(round_dir),
@@ -364,65 +336,65 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 4b: Point Expert GRPO")
-    parser.add_argument("--config", type=str, default="configs/stage4b_grpo_point.yaml",
-                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
-    parser.add_argument("--model_path", type=str, default="outputs/stage3b_sft_point")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage4b_grpo_point")
-    parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
-    parser.add_argument("--coco_ann_file", type=str,
-                        default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_point", type=int, default=2000)
-    parser.add_argument("--num_maze", type=int, default=5000)
-    parser.add_argument("--num_path", type=int, default=2000,
-                        help="Number of path tracing samples")
-    parser.add_argument("--num_rounds", type=int, default=3)
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-6)
-    parser.add_argument("--batch_size", type=int, default=3)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--lora_r", type=int, default=256)
-    parser.add_argument("--lora_alpha", type=int, default=512)
-    parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=200)
-    parser.add_argument("--warmup_steps", type=int, default=50)
-    parser.add_argument("--num_generations", type=int, default=6)
-    parser.add_argument("--filter_batch_size", type=int, default=4,
-                        help="Batch size for difficulty-filter generation (prompts per batch)")
-    parser.add_argument("--filter_empty_cache_every", type=int, default=50)
-    parser.add_argument("--skip_difficulty_filter", action="store_true",
-                        help="Skip difficulty filtering and use all generated samples")
-    parser.add_argument("--max_completion_length", type=int, default=768)
-    parser.add_argument("--beta", type=float, default=0.04)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument(
+    runner = StageRunner(
+        "stage4b_grpo_point",
+        "configs/stage4b_grpo_point.yaml",
+        description="Stage 4b: Point Expert GRPO",
+    )
+    runner.add_arg("--model_path", type=str, default=None)
+    runner.add_arg("--output_dir", type=str, default=None)
+    runner.add_arg("--coco_image_dir", type=str, default=None)
+    runner.add_arg("--coco_ann_file", type=str,
+                   default=None)
+    runner.add_arg("--num_point", type=int, default=None)
+    runner.add_arg("--num_maze", type=int, default=None)
+    runner.add_arg("--num_path", type=int, default=None,
+                   help="Number of path tracing samples")
+    runner.add_arg("--num_rounds", type=int, default=None)
+    runner.add_arg("--num_epochs", type=int, default=None)
+    runner.add_arg("--learning_rate", type=float, default=None)
+    runner.add_arg("--batch_size", type=int, default=None)
+    runner.add_arg("--gradient_accumulation_steps", type=int, default=None)
+    runner.add_arg("--lora_r", type=int, default=None)
+    runner.add_arg("--lora_alpha", type=int, default=None)
+    runner.add_arg("--logging_steps", type=int, default=None)
+    runner.add_arg("--save_steps", type=int, default=None)
+    runner.add_arg("--warmup_steps", type=int, default=None)
+    runner.add_arg("--num_generations", type=int, default=None)
+    runner.add_arg("--filter_batch_size", type=int, default=None,
+                   help="Batch size for difficulty-filter generation (prompts per batch)")
+    runner.add_arg("--filter_empty_cache_every", type=int, default=None)
+    runner.add_arg("--skip_difficulty_filter", action="store_true",
+                   help="Skip difficulty filtering and use all generated samples")
+    runner.add_arg("--max_completion_length", type=int, default=None)
+    runner.add_arg("--beta", type=float, default=None)
+    runner.add_arg("--temperature", type=float, default=None)
+    runner.add_arg(
         "--use_quality_rm_api",
         action="store_true",
         help="Use OpenAI-compatible API for Quality RM (requires .env key).",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--compile_model",
         action="store_true",
         help="Try torch.compile on the policy model (best-effort).",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--early_stopping_subset_size",
         type=int,
-        default=32,
+        default=None,
         help="Validation subset size for early stopping (0 to disable).",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--early_stopping_eval_steps",
         type=int,
-        default=50,
+        default=None,
         help="Evaluate validation subset every N steps.",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--early_stopping_patience",
         type=int,
-        default=2,
+        default=None,
         help="Stop after this many evals without improvement.",
     )
-    args = parser.parse_args()
-    apply_yaml_defaults(args, parser, args.config)
-    main(args)
+    runner.run(train)

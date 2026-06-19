@@ -14,6 +14,10 @@ import os
 import random
 from typing import Dict, List, Tuple
 
+from src.utils.conversation_builder import ConversationBuilder
+
+_pretrain_builder = ConversationBuilder("pretrain")
+
 
 def _load_coco_annotations(ann_file: str) -> Dict:
     """Load COCO annotations if available."""
@@ -121,11 +125,14 @@ def generate_coco_grounding_pretrain_samples(
         if len(assistant.split()) > 80:
             continue
 
+        # Wrap the assistant reply in <think>...</think> so that Stage 1 learns
+        # to emit visual primitives inside the thinking chain, matching the
+        # format used in Stage 2 / inference.
+        reasoning = f"I need to respond using visual primitives. {assistant}"
+        thinking_assistant = f"<think>\n{reasoning}\n</think>\n\n{assistant}"
+
         data.append({
-            "conversations": [
-                {"role": "user", "content": user},
-                {"role": "assistant", "content": assistant},
-            ]
+            "conversations": _pretrain_builder.build_pretrain(user, thinking_assistant),
         })
 
     return data
@@ -335,11 +342,14 @@ def generate_sample() -> dict | None:
     if len(assistant.split()) > 80:
         return None
 
+    # Wrap the assistant reply in <think>...</think> so that Stage 1 learns to
+    # emit visual primitives inside the thinking chain, matching the format used
+    # in Stage 2 / inference.
+    reasoning = f"I need to respond using visual primitives. {assistant}"
+    thinking_assistant = f"<think>\n{reasoning}\n</think>\n\n{assistant}"
+
     return {
-        "conversations": [
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": assistant},
-        ]
+        "conversations": _pretrain_builder.build_pretrain(user, thinking_assistant),
     }
 
 

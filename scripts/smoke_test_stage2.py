@@ -14,6 +14,8 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+from src.utils.conversation_builder import ConversationBuilder
+
 
 def find_coco_image():
     coco_dir = "data/coco/train2017"
@@ -26,10 +28,10 @@ def find_coco_image():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", default="outputs/stage2_merged_base")
+    parser.add_argument("--model_path", default=None)
     parser.add_argument("--image_path", default=None)
-    parser.add_argument("--question", default="Locate the main object in the image. Mark it with a box.")
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--question", default=None)
+    parser.add_argument("--max_new_tokens", type=int, default=None)
     args = parser.parse_args()
 
     # Use expandable segments to avoid fragmentation during load/generate.
@@ -54,13 +56,7 @@ def main():
     print(f"Model loaded in {time.time() - t0:.1f}s")
 
     image = Image.open(image_path).convert("RGB")
-    messages = [
-        {"role": "system", "content": "You are a helpful visual reasoning assistant. Think step by step."},
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": args.question},
-        ]},
-    ]
+    messages = ConversationBuilder("opd").build_prompt(args.question, image)
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[text], images=[image], return_tensors="pt")

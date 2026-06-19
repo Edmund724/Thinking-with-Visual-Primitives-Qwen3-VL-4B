@@ -19,15 +19,7 @@ After training: run scripts/merge_stage2.py to merge LoRA into base.
 """
 
 import os
-
-# Mitigate CUDA memory fragmentation from variable-length visual sequences.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-import argparse
 import random
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
@@ -36,36 +28,44 @@ from src.data.generators.coco_box_generator import (
     generate_coco_point_samples,
 )
 from src.models.qwen_vl_loader import load_qlora_model
-from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
-from src.utils.config_utils import apply_yaml_defaults
-from src.utils.logging_utils import setup_logging
+from src.training.stage_runner import StageRunner
+from src.training.trainers.sft_trainer import create_sft_trainer
 from src.utils.constants import BASE_VOCAB_SIZE
 
-logger = setup_logging(log_file="logs/stage2_visual_pretrain.log")
 
+def train(runner: StageRunner) -> None:
+    args, logger = runner.args, runner.logger
 
-def main(args):
-    logger.info("=" * 60)
-    logger.info("Stage 2: Visual Pretrain")
-    logger.info("=" * 60)
-
-    torch.cuda.empty_cache()
-
-    # 1. Load base model + inject Stage 1 pretrain embeddings
-    base_model = args.model_path
-    pretrain_path = args.pretrain_embedding_path
-
-    logger.info(
-        f"Loading from {base_model} + injecting pretrained embeddings from {pretrain_path}..."
-    )
-    model, processor = load_qlora_model(
-        model_name=base_model,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        pretrain_embedding_path=os.path.join(pretrain_path, "pretrain_state_dict.pt"),
-        old_vocab_size=BASE_VOCAB_SIZE,
-    )
+    # 1. Load model. If resuming, load from the adapter checkpoint so that
+    #    special-token embeddings remain as trained in Stage 2 instead of
+    #    being overwritten by Stage 1 embeddings.
+    resume_ckpt = getattr(args, "resume_from_checkpoint", None)
+    vit_unfreeze = getattr(args, "unfreeze_vit_layers", 0)
+    if resume_ckpt:
+        logger.info(f"Resuming Stage 2 from checkpoint: {resume_ckpt}")
+        model, processor = load_qlora_model(
+            model_name=resume_ckpt,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            pretrain_embedding_path=None,
+            old_vocab_size=None,
+            unfreeze_vit_layers=vit_unfreeze,
+        )
+    else:
+        base_model = args.model_path
+        pretrain_path = args.pretrain_embedding_path
+        logger.info(
+            f"Loading from {base_model} + injecting pretrained embeddings from {pretrain_path}..."
+        )
+        model, processor = load_qlora_model(
+            model_name=base_model,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            pretrain_embedding_path=os.path.join(pretrain_path, "pretrain_state_dict.pt"),
+            old_vocab_size=BASE_VOCAB_SIZE,
+            unfreeze_vit_layers=vit_unfreeze,
+        )
     log_memory_status("After model loading:")
 
     # 2. Generate visual pretrain data
@@ -130,7 +130,7 @@ def main(args):
     )
 
     logger.info("Starting visual pretrain...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_ckpt if resume_ckpt else None)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
@@ -140,29 +140,35 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 2: Visual Pretrain")
-    parser.add_argument("--config", type=str, default="configs/stage2_visual_pretrain.yaml",
-                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
-    parser.add_argument("--model_path", type=str, default="models/Qwen3-VL-4B-Thinking")
-    parser.add_argument("--pretrain_embedding_path", type=str, default="outputs/stage1_pretrain")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage2_visual_pretrain")
-    parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
-    parser.add_argument("--coco_ann_file", type=str,
-                        default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_box", type=int, default=50000)
-    parser.add_argument("--num_point", type=int, default=10000)
-    parser.add_argument("--curriculum", action="store_true",
-                        help="Sort visual pretrain data from simple to complex")
-    parser.add_argument("--num_epochs", type=int, default=2)
-    parser.add_argument("--learning_rate", type=float, default=2e-6)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--max_seq_length", type=int, default=2048)
-    parser.add_argument("--lora_r", type=int, default=256)
-    parser.add_argument("--lora_alpha", type=int, default=512)
-    parser.add_argument("--logging_steps", type=int, default=50)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--warmup_steps", type=int, default=100)
-    args = parser.parse_args()
-    apply_yaml_defaults(args, parser, args.config)
-    main(args)
+    runner = StageRunner(
+        "stage2_visual_pretrain",
+        "configs/stage2_visual_pretrain.yaml",
+        description="Stage 2: Visual Pretrain",
+    )
+    runner.add_arg("--model_path", type=str, default=None)
+    runner.add_arg("--pretrain_embedding_path", type=str, default=None)
+    runner.add_arg("--output_dir", type=str, default=None)
+    runner.add_arg("--coco_image_dir", type=str, default=None)
+    runner.add_arg("--coco_ann_file", type=str,
+                   default=None)
+    runner.add_arg("--num_box", type=int, default=None)
+    runner.add_arg("--num_point", type=int, default=None)
+    runner.add_arg("--curriculum", action="store_true",
+                   help="Sort visual pretrain data from simple to complex")
+    runner.add_arg("--num_epochs", type=int, default=None)
+    runner.add_arg("--learning_rate", type=float, default=None)
+    runner.add_arg("--batch_size", type=int, default=None)
+    runner.add_arg("--gradient_accumulation_steps", type=int, default=None)
+    runner.add_arg("--max_seq_length", type=int, default=None)
+    runner.add_arg("--lora_r", type=int, default=None)
+    runner.add_arg("--lora_alpha", type=int, default=None)
+    runner.add_arg("--logging_steps", type=int, default=None)
+    runner.add_arg("--save_steps", type=int, default=None)
+    runner.add_arg("--warmup_steps", type=int, default=None)
+    runner.add_arg("--resume_from_checkpoint", type=str, default=None,
+                   help="Path to a Stage 2 checkpoint directory to resume from.")
+    runner.add_arg("--unfreeze_vit_layers", type=int, default=None,
+                   help="Unfreeze last N ViT blocks + merger (0 = all frozen)")
+    runner.add_arg("--vit_lr", type=float, default=None,
+                   help="LR for unfrozen ViT layers (very low)")
+    runner.run(train)

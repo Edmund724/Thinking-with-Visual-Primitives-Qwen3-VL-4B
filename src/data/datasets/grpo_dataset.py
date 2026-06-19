@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 import torch
 from torch.utils.data import Dataset
 
+from ...utils.conversation_builder import ConversationBuilder
 from .image_loader import load_image
 
 
@@ -28,7 +29,7 @@ def _build_gt_text(sample_or_reasoning, answer: str = "") -> str:
         answer = sample_or_reasoning.get("answer", "")
     else:
         reasoning = sample_or_reasoning
-    return reasoning + "\n" + "\x3c/think\x3e" + "\n\nThe answer is " + answer + "."
+    return ConversationBuilder.build_gt_text(reasoning, answer)
 
 
 class GRPODataset(Dataset):
@@ -41,6 +42,7 @@ class GRPODataset(Dataset):
 
     def __init__(self, data: List[Dict[str, Any]]):
         self.data = data
+        self._conv_builder = ConversationBuilder("grpo")
 
     def __len__(self):
         return len(self.data)
@@ -49,29 +51,8 @@ class GRPODataset(Dataset):
         sample = self.data[idx]
         image = load_image(sample.get("image"))
 
-        system_content = (
-            "You are a helpful visual reasoning assistant. "
-            "Think step by step inside " + "\x3cthink\x3e" + "..." + "\x3c/think\x3e" + " tags, then provide your final answer. "
-            "Use visual primitives (<|box|>, <|point|>) when needed to mark locations. "
-            "Always close your reasoning with " + "\x3c/think\x3e" + " before giving the answer. "
-            "Respond in English only; do not use characters from other languages."
-        )
-
-        if image is not None:
-            # Embed image in message content as multimodal blocks (TRL 1.5+ format)
-            user_content = [
-                {"type": "image", "image": image},
-                {"type": "text", "text": sample["prompt"]},
-            ]
-        else:
-            # Text-only (e.g., some maze samples without images)
-            user_content = sample["prompt"]
-
         return {
-            "prompt": [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ],
+            "prompt": self._conv_builder.build_prompt(sample["prompt"], image),
             "gt_text": _build_gt_text(
                 sample["reasoning"],
                 sample.get("answer", ""),

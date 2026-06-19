@@ -9,18 +9,10 @@ Key design (corrected per paper):
   - Unified model (re-init from merged Stage 2 base) SFTs on filtered data
 """
 
-import os
-
-# Mitigate CUDA memory fragmentation from variable-length expert rollouts.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-import argparse
 import gc
-import pickle
+import os
 import random
 import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
@@ -35,30 +27,19 @@ from src.data.datasets.image_loader import load_image
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status, clear_memory
-from src.utils.config_utils import apply_yaml_defaults
-from src.utils.logging_utils import setup_logging
-from src.utils.metrics import compute_total_reward, extract_answer
-
-logger = setup_logging(log_file="logs/stage5_rft_unified.log")
+from src.training.stage_runner import StageRunner
+from src.utils.reward.accuracy_rm import compute_total_reward
+from src.models.visual_primitive_parser import PrimitiveParser
+from src.utils.conversation_builder import ConversationBuilder
 
 
 def generate_with_expert(expert_model, processor, sample, num_rollouts, max_new_tokens):
     """Expert generates N rollouts for a given sample."""
     image = load_image(sample["image"])
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful visual reasoning assistant. Think step by step.",
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": sample["prompt"]},
-            ],
-        },
-    ]
-    gt_text = sample["reasoning"] + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
+    messages = ConversationBuilder("opd").build_prompt(sample["prompt"], image)
+    gt_text = ConversationBuilder.build_gt_text(
+        sample["reasoning"], sample.get("answer", "")
+    )
 
     prompt_text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
@@ -97,7 +78,7 @@ def difficulty_grading(rollouts, gt_text, task_type, maze_grid, iou_threshold, d
     correct AND its output satisfies basic syntax constraints. We then classify
     the prompt by the count of correct rollouts among the N generated samples.
     """
-    from src.utils.metrics import is_rollout_correct
+    from src.utils.difficulty import is_rollout_correct
 
     correct_flags = []
     for rollout in rollouts:
@@ -152,12 +133,8 @@ def difficulty_grading(rollouts, gt_text, task_type, maze_grid, iou_threshold, d
     return difficulty, rollouts[best_idx], avg_score
 
 
-def main(args):
-    logger.info("=" * 60)
-    logger.info("Stage 5: Unified RFT (Experts as Generators)")
-    logger.info("=" * 60)
-
-    torch.cuda.empty_cache()
+def train(runner: StageRunner) -> None:
+    args, logger = runner.args, runner.logger
 
     # 1. Load Unified model from merged Stage 2 base (fresh LoRA)
     logger.info(f"Loading Unified model from merged base: {args.model_path}")
@@ -169,15 +146,9 @@ def main(args):
     log_memory_status("Unified model loaded:")
 
     # 2. Generate or load cached prompts for rejection sampling
-    cache_path = os.path.join(args.output_dir, "prompts_cache.pkl")
-    if os.path.exists(cache_path):
-        logger.info(f"Loading cached prompts from {cache_path}")
-        with open(cache_path, "rb") as f:
-            all_prompts = pickle.load(f)
-        logger.info(f"  Loaded {len(all_prompts)} prompts from cache")
-    else:
+    def _generate_prompts():
         logger.info("Generating prompts for rejection sampling...")
-        all_prompts = []
+        prompts = []
 
         box_prompts = generate_coco_box_samples(
             image_dir=args.coco_image_dir,
@@ -186,7 +157,7 @@ def main(args):
         )
         for d in box_prompts:
             d["task_type"] = "box"
-        all_prompts.extend(box_prompts)
+        prompts.extend(box_prompts)
         logger.info(f"  Box prompts: {len(box_prompts)}")
 
         counting_prompts = generate_coco_counting_samples(
@@ -196,7 +167,7 @@ def main(args):
         )
         for d in counting_prompts:
             d["task_type"] = "box"
-        all_prompts.extend(counting_prompts)
+        prompts.extend(counting_prompts)
         logger.info(f"  Counting prompts: {len(counting_prompts)}")
 
         clevr_prompts = generate_clevr_spatial_dataset(
@@ -206,7 +177,7 @@ def main(args):
         )
         for d in clevr_prompts:
             d["task_type"] = "box"
-        all_prompts.extend(clevr_prompts)
+        prompts.extend(clevr_prompts)
         logger.info(f"  CLEVR prompts: {len(clevr_prompts)}")
 
         point_prompts = generate_coco_point_samples(
@@ -216,7 +187,7 @@ def main(args):
         )
         for d in point_prompts:
             d["task_type"] = "point"
-        all_prompts.extend(point_prompts)
+        prompts.extend(point_prompts)
         logger.info(f"  Point prompts: {len(point_prompts)}")
 
         maze_prompts = generate_maze_dataset(
@@ -225,17 +196,17 @@ def main(args):
         )
         for d in maze_prompts:
             d["task_type"] = "maze"
-        all_prompts.extend(maze_prompts)
+        prompts.extend(maze_prompts)
         logger.info(f"  Maze prompts: {len(maze_prompts)}")
 
-        random.shuffle(all_prompts)
-        logger.info(f"Total prompts: {len(all_prompts)}")
+        random.shuffle(prompts)
+        logger.info(f"Total prompts: {len(prompts)}")
+        return prompts
 
-        # Save cache for future runs
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(all_prompts, f)
-        logger.info(f"Cached prompts to {cache_path}")
+    all_prompts = runner.cached_data(
+        os.path.join(args.output_dir, "prompts_cache.pkl"),
+        _generate_prompts,
+    )
 
     # 3. Load Box Expert (teacher)
     logger.info(f"Loading Box Expert from {args.box_expert_path}...")
@@ -283,7 +254,7 @@ def main(args):
             "image": sample["image"],
             "prompt": sample["prompt"],
             "reasoning": best_rollout or sample["reasoning"],
-            "answer": extract_answer(best_rollout) or sample["answer"],
+            "answer": PrimitiveParser.extract_answer(best_rollout) or sample["answer"],
             "task_type": sample.get("task_type", "box"),
         }
 
@@ -359,39 +330,39 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 5: Unified RFT")
-    parser.add_argument("--config", type=str, default="configs/stage5_rft_unified.yaml",
-                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
-    parser.add_argument("--model_path", type=str, default="outputs/stage2_merged_base")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage5_rft_unified")
-    parser.add_argument("--box_expert_path", type=str, default="outputs/stage4a_grpo_box")
-    parser.add_argument("--point_expert_path", type=str, default="outputs/stage4b_grpo_point")
-    parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
-    parser.add_argument("--coco_ann_file", type=str,
-                        default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_box_prompts", type=int, default=4000)
-    parser.add_argument("--num_counting_prompts", type=int, default=3000,
-                        help="Number of counting prompts for rejection sampling")
-    parser.add_argument("--num_clevr_prompts", type=int, default=2000,
-                        help="Number of CLEVR spatial/VQA prompts for rejection sampling")
-    parser.add_argument("--num_point_prompts", type=int, default=3000)
-    parser.add_argument("--num_maze_prompts", type=int, default=3000)
-    parser.add_argument("--num_rollouts", type=int, default=5)
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--iou_threshold", type=float, default=0.5)
-    parser.add_argument("--point_dist_threshold", type=float, default=10.0)
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    parser.add_argument("--max_seq_length", type=int, default=2048)
-    parser.add_argument("--lora_r", type=int, default=256)
-    parser.add_argument("--lora_alpha", type=int, default=512)
-    parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--warmup_steps", type=int, default=100)
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to checkpoint dir to resume SFT training, e.g. outputs/stage5_rft_unified/checkpoint-500")
-    args = parser.parse_args()
-    apply_yaml_defaults(args, parser, args.config)
-    main(args)
+    runner = StageRunner(
+        "stage5_rft_unified",
+        "configs/stage5_rft_unified.yaml",
+        description="Stage 5: Unified RFT",
+    )
+    runner.add_arg("--model_path", type=str, default=None)
+    runner.add_arg("--output_dir", type=str, default=None)
+    runner.add_arg("--box_expert_path", type=str, default=None)
+    runner.add_arg("--point_expert_path", type=str, default=None)
+    runner.add_arg("--coco_image_dir", type=str, default=None)
+    runner.add_arg("--coco_ann_file", type=str,
+                   default=None)
+    runner.add_arg("--num_box_prompts", type=int, default=None)
+    runner.add_arg("--num_counting_prompts", type=int, default=None,
+                   help="Number of counting prompts for rejection sampling")
+    runner.add_arg("--num_clevr_prompts", type=int, default=None,
+                   help="Number of CLEVR spatial/VQA prompts for rejection sampling")
+    runner.add_arg("--num_point_prompts", type=int, default=None)
+    runner.add_arg("--num_maze_prompts", type=int, default=None)
+    runner.add_arg("--num_rollouts", type=int, default=None)
+    runner.add_arg("--max_new_tokens", type=int, default=None)
+    runner.add_arg("--iou_threshold", type=float, default=None)
+    runner.add_arg("--point_dist_threshold", type=float, default=None)
+    runner.add_arg("--num_epochs", type=int, default=None)
+    runner.add_arg("--learning_rate", type=float, default=None)
+    runner.add_arg("--batch_size", type=int, default=None)
+    runner.add_arg("--gradient_accumulation_steps", type=int, default=None)
+    runner.add_arg("--max_seq_length", type=int, default=None)
+    runner.add_arg("--lora_r", type=int, default=None)
+    runner.add_arg("--lora_alpha", type=int, default=None)
+    runner.add_arg("--logging_steps", type=int, default=None)
+    runner.add_arg("--save_steps", type=int, default=None)
+    runner.add_arg("--warmup_steps", type=int, default=None)
+    runner.add_arg("--resume_from_checkpoint", type=str, default=None,
+                   help="Path to checkpoint dir to resume SFT training, e.g. outputs/stage5_rft_unified/checkpoint-500")
+    runner.run(train)

@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 
-from ..formatters.primitive_formatter import format_box, format_point, normalize_coordinate
+from ...models.visual_primitive_parser import PrimitiveParser
 from ...utils.thinking_verifier import filter_verified_samples
 
 logger = logging.getLogger(__name__)
@@ -39,10 +39,10 @@ def build_image_annotations(coco_data: Dict) -> Dict[int, List[Dict]]:
 
 def bbox_to_normalized(bbox: List[float], img_w: int, img_h: int) -> Tuple[int, int, int, int]:
     """Convert COCO bbox [x, y, w, h] to normalized [x1, y1, x2, y2] in 0-999."""
-    x1 = normalize_coordinate(bbox[0], img_w)
-    y1 = normalize_coordinate(bbox[1], img_h)
-    x2 = normalize_coordinate(bbox[0] + bbox[2], img_w)
-    y2 = normalize_coordinate(bbox[1] + bbox[3], img_h)
+    x1 = PrimitiveParser.normalize_coordinate(bbox[0], img_w)
+    y1 = PrimitiveParser.normalize_coordinate(bbox[1], img_h)
+    x2 = PrimitiveParser.normalize_coordinate(bbox[0] + bbox[2], img_w)
+    y2 = PrimitiveParser.normalize_coordinate(bbox[1] + bbox[3], img_h)
     return (x1, y1, x2, y2)
 
 
@@ -212,7 +212,7 @@ def generate_coco_box_samples(
 
             if boxes:
                 grounding_parts.append(
-                    f"the {cat_name} is at {format_box(boxes)}"
+                    f"the {cat_name} is at {PrimitiveParser.format_box(boxes)}"
                 )
 
         if total_count == 0:
@@ -243,7 +243,20 @@ def generate_coco_box_samples(
         if use_thinking:
             reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
         else:
-            reasoning = f"<|ref|>{cat_name}<|/ref|>{format_box(all_boxes)}"
+            # Stage 2 visual pretrain: use a short natural-language thinking
+            # sentence that naturally introduces the primitive tags, matching
+            # the unified format from the paper.
+            if task_roll < 0.5:
+                nl_prefix = f"I need to locate all {cat_name}s. "
+            elif task_roll < 0.8:
+                nl_prefix = "I need to count all visible objects. "
+            else:
+                nl_prefix = "I need to find all visible objects. "
+            grounding_sentence = " ".join(grounding_parts) if grounding_parts else ""
+            reasoning = (
+                f"{nl_prefix}"
+                f"{grounding_sentence}"
+            ).strip()
 
         data.append({
             "image": img_path,
@@ -315,19 +328,21 @@ def generate_coco_point_samples(
 
         # Compute center point from bbox
         x, y, w, h = ann["bbox"]
-        cx = normalize_coordinate(x + w / 2, img_w)
-        cy = normalize_coordinate(y + h / 2, img_h)
+        cx = PrimitiveParser.normalize_coordinate(x + w / 2, img_w)
+        cy = PrimitiveParser.normalize_coordinate(y + h / 2, img_h)
 
         prompt = f"Point to the {cat_name} in this image."
         intent = f"I need to locate the {cat_name} in the image."
-        grounding = f"the {cat_name} is centered at {format_point([(cx, cy)])}"
+        grounding = f"the {cat_name} is centered at {PrimitiveParser.format_point([(cx, cy)])}"
         summarization = f"The {cat_name} is located at coordinates ({cx}, {cy})."
         answer = f"({cx}, {cy})"
 
         if use_thinking:
             reasoning = _build_thinking_3step(intent, [grounding], summarization)
         else:
-            reasoning = f"<|point|>{format_point([(cx, cy)])}<|/point|>"
+            # Stage 2 visual pretrain: use a short natural-language thinking
+            # sentence that naturally introduces the primitive tags.
+            reasoning = f"I need to locate the {cat_name}. {grounding}"
 
         data.append({
             "image": img_path,
@@ -366,15 +381,15 @@ def generate_synthetic_dense_counting(
             color = random.choice(["#FF6B6B", "#4ECDC4", "#FFE66D", "#95E1D3"])
             draw.ellipse([x, y, x + size, y + size], fill=color)
             boxes.append((
-                normalize_coordinate(x, img_size[0]),
-                normalize_coordinate(y, img_size[1]),
-                normalize_coordinate(x + size, img_size[0]),
-                normalize_coordinate(y + size, img_size[1]),
+                PrimitiveParser.normalize_coordinate(x, img_size[0]),
+                PrimitiveParser.normalize_coordinate(y, img_size[1]),
+                PrimitiveParser.normalize_coordinate(x + size, img_size[0]),
+                PrimitiveParser.normalize_coordinate(y + size, img_size[1]),
             ))
 
         intent = "I need to count all small objects in the image."
         # Batch grounding: all objects in one tag to match coarse-grained counting.
-        grounding_parts = [f"objects are at {format_box(boxes)}"]
+        grounding_parts = [f"objects are at {PrimitiveParser.format_box(boxes)}"]
         summarization = f"There are {num_objects} small objects in total."
         reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 
@@ -586,7 +601,7 @@ def generate_coco_counting_samples(
         count = len(boxes)
 
         # Batch grounding: all target boxes in a single visual primitive tag.
-        grounding_parts = [f"the {cat_name}s are at {format_box(boxes)}"]
+        grounding_parts = [f"the {cat_name}s are at {PrimitiveParser.format_box(boxes)}"]
 
         if attr_type == "color":
             prompt = (

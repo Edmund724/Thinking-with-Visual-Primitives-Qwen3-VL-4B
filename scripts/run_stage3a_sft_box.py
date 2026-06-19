@@ -8,15 +8,7 @@ Data ratio: 70% general + 30% box-only visual primitives.
 """
 
 import os
-
-# Mitigate CUDA memory fragmentation from variable-length SFT completions.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-import argparse
 import random
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
@@ -30,18 +22,11 @@ from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
-from src.utils.config_utils import apply_yaml_defaults
-from src.utils.logging_utils import setup_logging
-
-logger = setup_logging(log_file="logs/stage3a_sft_box.log")
+from src.training.stage_runner import StageRunner
 
 
-def main(args):
-    logger.info("=" * 60)
-    logger.info("Stage 3a: Specialized SFT — Box Expert")
-    logger.info("=" * 60)
-
-    torch.cuda.empty_cache()
+def train(runner: StageRunner) -> None:
+    args, logger = runner.args, runner.logger
 
     # 1. Load from merged Stage 2 base
     logger.info(f"Loading from merged base: {args.model_path}")
@@ -163,7 +148,7 @@ def main(args):
     logger.info("Starting Box Expert SFT training...")
     if args.resume_from_checkpoint and not os.path.isdir(args.resume_from_checkpoint):
         logger.error(f"Checkpoint not found: {args.resume_from_checkpoint}")
-        sys.exit(1)
+        return
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
@@ -173,40 +158,40 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 3a: Box Expert SFT")
-    parser.add_argument("--config", type=str, default="configs/stage3a_sft_box.yaml",
-                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
-    parser.add_argument("--model_path", type=str, default="outputs/stage2_merged_base")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage3a_sft_box")
-    parser.add_argument("--general_data_path", type=str, default="data/pretrain/pretrain_data.json")
-    parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
-    parser.add_argument("--coco_ann_file", type=str,
-                        default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_box", type=int, default=15000)
-    parser.add_argument("--num_counting", type=int, default=10000,
-                        help="Number of coarse-grained counting samples")
-    parser.add_argument("--counting_attribute_ratio", type=float, default=0.3,
-                        help="Fraction of counting samples with color/size attribute constraints")
-    parser.add_argument("--num_clevr", type=int, default=5000,
-                        help="Number of CLEVR-style spatial/VQA samples")
-    parser.add_argument("--clevr_negative_ratio", type=float, default=0.25,
-                        help="Fraction of CLEVR samples that are faithful-refusal negatives")
-    parser.add_argument("--num_negative_box", type=int, default=2000,
-                        help="Number of COCO negative box samples (category not present)")
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    parser.add_argument("--max_seq_length", type=int, default=2048)
-    parser.add_argument("--lora_r", type=int, default=256)
-    parser.add_argument("--lora_alpha", type=int, default=512)
-    parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--warmup_steps", type=int, default=100)
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to checkpoint dir to resume from, e.g. outputs/stage3a_sft_box/checkpoint-500")
-    parser.add_argument("--format_token_weight", type=float, default=5.0,
-                        help="Loss weight multiplier for visual-primitive / think format tokens.")
-    args = parser.parse_args()
-    apply_yaml_defaults(args, parser, args.config)
-    main(args)
+    runner = StageRunner(
+        "stage3a_sft_box",
+        "configs/stage3a_sft_box.yaml",
+        description="Stage 3a: Specialized SFT — Box Expert",
+    )
+    runner.add_arg("--model_path", type=str, default=None)
+    runner.add_arg("--output_dir", type=str, default=None)
+    runner.add_arg("--general_data_path", type=str, default=None)
+    runner.add_arg("--coco_image_dir", type=str, default=None)
+    runner.add_arg("--coco_ann_file", type=str,
+                   default=None)
+    runner.add_arg("--num_box", type=int, default=None)
+    runner.add_arg("--num_counting", type=int, default=None,
+                   help="Number of coarse-grained counting samples")
+    runner.add_arg("--counting_attribute_ratio", type=float, default=None,
+                   help="Fraction of counting samples with color/size attribute constraints")
+    runner.add_arg("--num_clevr", type=int, default=None,
+                   help="Number of CLEVR-style spatial/VQA samples")
+    runner.add_arg("--clevr_negative_ratio", type=float, default=None,
+                   help="Fraction of CLEVR samples that are faithful-refusal negatives")
+    runner.add_arg("--num_negative_box", type=int, default=None,
+                   help="Number of COCO negative box samples (category not present)")
+    runner.add_arg("--num_epochs", type=int, default=None)
+    runner.add_arg("--learning_rate", type=float, default=None)
+    runner.add_arg("--batch_size", type=int, default=None)
+    runner.add_arg("--gradient_accumulation_steps", type=int, default=None)
+    runner.add_arg("--max_seq_length", type=int, default=None)
+    runner.add_arg("--lora_r", type=int, default=None)
+    runner.add_arg("--lora_alpha", type=int, default=None)
+    runner.add_arg("--logging_steps", type=int, default=None)
+    runner.add_arg("--save_steps", type=int, default=None)
+    runner.add_arg("--warmup_steps", type=int, default=None)
+    runner.add_arg("--resume_from_checkpoint", type=str, default=None,
+                   help="Path to checkpoint dir to resume from, e.g. outputs/stage3a_sft_box/checkpoint-500")
+    runner.add_arg("--format_token_weight", type=float, default=None,
+                   help="Loss weight multiplier for visual-primitive / think format tokens.")
+    runner.run(train)

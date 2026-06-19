@@ -100,7 +100,7 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + On-Policy Distillation）
 
 ```
-Stage 1:  Text Pretrain          文本-only embedding 初始化               ~?    ✅
+Stage 1:  Lightweight Format Pretrain  文本格式预训练（embed + 顶层 2 层）      ~?    ✅
 Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~?    ✅
 Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~27s   ✅
 Stage 3a: Box Expert SFT         格式 token 加权的 Box 专项 SFT           ~?    ✅
@@ -471,6 +471,31 @@ reward = process_reward(
 #       wall_collision_count, backtracking_missing, ...
 ```
 
+### 配置管理（YAML + argparse）
+
+所有 stage 脚本遵循三层默认值级联：
+
+```
+argparse default (None) → YAML config value → CLI override
+```
+
+- **YAML 配置**（`configs/*.yaml`）是超参数的**唯一真实来源**。
+- **argparse 默认值**统一为 `None`——YAML 是必须的。如果 YAML 中缺少某个键，脚本会尽早报错。
+- **CLI 参数**覆盖 YAML 和 argparse 默认值，例如 `--num_epochs 5`。
+- `StageRunner`（在 `src/training/stage_runner.py` 中）提供共享 boilerplate：argparse 设置、YAML 加载（`apply_yaml_defaults`）、日志和 pickle 数据缓存辅助。
+
+### 视觉原语 Domain Seam
+
+`PrimitiveParser`（在 `src/models/visual_primitive_parser.py` 中）是**所有视觉原语操作的唯一公共 API**——解析、验证、格式化和几何计算。生产代码只从这里（或向后兼容的 `src/utils/metrics` shim）导入。底层模块（`text_parsing.py`、`geometry.py`、`primitive_formatter.py`）是内部实现细节。
+
+```python
+from src.models.visual_primitive_parser import PrimitiveParser
+
+boxes = PrimitiveParser.extract_boxes(text)            # 解析
+tags  = PrimitiveParser.format_box([(10,20,100,200)])  # 格式化
+iou   = PrimitiveParser.box_iou(pred, gt)              # 几何计算
+```
+
 ### 数据生成与质量控制
 
 除原始 COCO box/point 和合成迷宫外，训练流水线现己新增多种数据生成器，以扩展模型的推理能力：
@@ -498,6 +523,7 @@ reward = process_reward(
 ```
 tvp-4b-5090d/
 ├── configs/                          # YAML 训练配置
+│   ├── stage1_pretrain.yaml
 │   ├── stage2_visual_pretrain.yaml
 │   ├── stage3a_sft_box.yaml
 │   ├── stage3b_sft_point.yaml
@@ -509,54 +535,77 @@ tvp-4b-5090d/
 │   ├── models/
 │   │   ├── qwen_vl_loader.py         # Qwen3VL + QLoRA 加载器
 │   │   ├── pretrain_loader.py        # Pretrain 模型加载 + embedding 注入
-│   │   └── visual_primitive_parser.py # 视觉原语解析器
+│   │   └── visual_primitive_parser.py # **Domain seam**：视觉原语统一接口（解析、格式化、几何计算）
 │   ├── data/
 │   │   ├── datasets/
 │   │   │   ├── sft_dataset.py        # SFT 数据集（assistant-only loss mask）
 │   │   │   ├── grpo_dataset.py       # GRPO 数据集
 │   │   │   └── image_loader.py       # Lazy image loading（防 OOM）
 │   │   ├── generators/
+│   │   │   ├── __init__.py            # 生成器注册表
 │   │   │   ├── coco_box_generator.py # COCO → box/point/counting 训练样本（3-step thinking + 几何过滤）
 │   │   │   ├── synthetic_maze.py     # 合成迷宫生成器（3-step thinking）
 │   │   │   ├── clevr_spatial.py      # CLEVR 风格 2D 空间 / VQA 生成器
 │   │   │   ├── path_tracing.py       # Bézier 曲线路径追踪生成器
-│   │   │   └── synthetic_path.py     # 合成路径生成器（暂未使用）
+│   │   │   └── synthetic_path.py     # 合成路径生成器
 │   │   └── formatters/
-│   │       └── primitive_formatter.py # 坐标标签格式化
+│   │       └── primitive_formatter.py # 坐标标签格式化（内部模块）
 │   ├── training/
+│   │   ├── stage_runner.py           # **StageRunner**：共享 argparse+YAML+日志 boilerplate
 │   │   ├── trainers/
-│   │   │   └── sft_trainer.py        # SFT Trainer 封装
-│   │   ├── pretrain_trainer.py       # Pretrain Trainer（仅训练 embedding）
+│   │   │   └── sft_trainer.py        # SFT Trainer 封装（WeightedSFTTrainer）
+│   │   ├── pretrain_trainer.py       # Pretrain Trainer（文本 + 视觉两阶段）
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation 训练器
 │   │   ├── grpo_fixes.py             # GRPOTrainer 多模态猴补丁
 │   │   ├── grpo_utils.py             # GRPO 辅助工具（completion 文本提取）
 │   │   ├── callbacks.py              # 训练回调（内存监控）
-│   │   ├── memory_utils.py           # GPU 显存工具
+│   │   ├── memory_utils.py           # GPU 显存工具（build_param_groups）
 │   │   └── config_utils.py           # 阶段脚本的 YAML 配置加载工具
 │   └── utils/
 │       ├── constants.py              # 特殊 token / 超参常量
-│       ├── metrics.py                # Format RM + Accuracy RM + 难度分级 + 长度惩罚
-│       ├── thinking_verifier.py       # Thinking-chain 校验（tag 配对、坐标范围、引用检查）
-│       └── logging_utils.py          # 日志初始化
+│       ├── conversation_builder.py   # **ConversationBuilder**：统一消息构建（SFT/GRPO/OPD/pretrain）
+│       ├── text_parsing.py           # 答案 / 推理 / box / point 解析（内部模块）
+│       ├── geometry.py               # IoU、点距离、迷宫几何（内部模块）
+│       ├── metrics.py                # 向后兼容 shim → text_parsing + geometry + reward/*
+│       ├── thinking_verifier.py      # Thinking-chain 校验（tag 配对、坐标范围、引用检查）
+│       ├── quality_rm_api.py         # LLM-as-Judge Quality RM（OpenAI 兼容 API）
+│       ├── logging_utils.py          # 日志初始化
+│       ├── difficulty.py             # Easy/Normal/Hard 难度分级
+│       ├── batch_inference.py        # 批量生成辅助工具
+│       └── reward/
+│           ├── format_rm.py          # Format Reward Model
+│           ├── quality_rm.py         # Quality Reward Model（规则版）
+│           └── accuracy_rm.py        # Accuracy Reward Model（process_reward, compute_total_reward）
 ├── scripts/                          # 阶段入口脚本
 │   ├── generate_pretrain_data.py     # 预训练数据生成器
-│   ├── run_stage1_pretrain.py        # Stage 1: Text Pretrain
+│   ├── run_stage1_pretrain.py        # Stage 1: Text + Visual Pretrain
 │   ├── run_stage2_visual_pretrain.py # Stage 2: Visual Pretrain
-│   ├── merge_stage2.py               # Stage 2 LoRA Merge
+│   ├── merge_stage2.py               # Stage 2 LoRA Merge + embedding 注入
 │   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
 │   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
 │   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
 │   ├── run_stage4b_grpo_point.py     # Stage 4b: Point Expert GRPO
 │   ├── run_stage5_rft_unified.py     # Stage 5: Unified RFT
 │   ├── run_stage6_opd.py             # Stage 6: OPD
+│   ├── eval_stage2_structure.py      # Stage 2 结构评估
+│   ├── eval_stage3a_paradigm.py      # Stage 3a 范式检查
+│   ├── smoke_test_stage2.py          # Stage 2 冒烟测试
+│   ├── diagnose_stage2_resume_loss.py # Stage 2 loss 诊断
 │   └── run_pipeline.sh               # Master Pipeline 一键运行
 ├── tests/
-│   ├── test_primitive_parser.py      # 坐标解析单元测试
+│   ├── test_primitive_parser.py      # PrimitiveParser 单元测试（32 个方法）
+│   ├── test_primitive_formatter.py   # Box/point 格式化测试
 │   ├── test_metrics.py               # 奖励函数与几何工具测试
+│   ├── test_conversation_builder.py  # ConversationBuilder 单元测试（21 测试）
+│   ├── test_quality_rm_api.py        # Quality RM API 集成测试（23 测试）
 │   ├── test_pretrain_format.py       # 预训练格式测试
+│   ├── test_weighted_sft_trainer.py  # WeightedSFTTrainer loss 测试
 │   ├── test_grpo_fixes.py            # GRPO 猴补丁单元测试
 │   ├── test_grpo_reward_integration.py # GRPO 奖励集成测试
-│   └── test_logging_utils.py         # 日志工具测试
+│   ├── test_stage_integration.py     # **Stage 集成测试**（14 测试，覆盖全部 8 个 stage）
+│   ├── test_stage3a_data_composition.py # Stage 3a 数据组成测试
+│   ├── test_logging_utils.py         # 日志工具测试
+│   └── test_filter_normal_level_data.py # 难度过滤器测试
 ├── outputs/                          # 训练产物（按 stage 组织）
 │   ├── stage1_pretrain/              # embedding state_dict
 │   ├── stage2_visual_pretrain/       # LoRA adapter + checkpoints
@@ -583,6 +632,13 @@ tvp-4b-5090d/
 ## 🧪 运行测试
 
 ```bash
+# 单元测试（快速，大部分不需要 GPU）
+pytest tests/ -v --ignore=tests/test_grpo_reward_integration.py --ignore=tests/test_stage_integration.py
+
+# 集成测试（需要模型 + COCO 数据；缺失时自动跳过）
+pytest tests/test_stage_integration.py -v
+
+# 全部测试
 pytest tests/ -v
 ```
 

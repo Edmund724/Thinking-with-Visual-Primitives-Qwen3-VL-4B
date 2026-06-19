@@ -1,0 +1,156 @@
+"""Stage orchestration — shared boilerplate for all training stage scripts.
+
+Replaces per-script copies of:
+
+* ``os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", ...)``
+* ``sys.path.insert(0, ...)``
+* ``setup_logging(...)``
+* ``argparse.ArgumentParser(...)`` + ``apply_yaml_defaults(...)``
+* ``torch.cuda.empty_cache()`` banners
+* ``pickle`` data-cache pattern
+
+Usage (in a stage script)::
+
+    from src.training.stage_runner import StageRunner
+
+    runner = StageRunner("stage_name", "configs/stage_name.yaml")
+
+    # Add stage-specific CLI args (replaces ``parser.add_argument(...)``).
+    runner.add_arg("--model_path", default="models/Qwen3-VL-4B-Thinking")
+
+    def train(runner: StageRunner) -> None:
+        '''Training logic — runner owns self.args and self.logger.'''
+        args, logger = runner.args, runner.logger
+        model, processor = load_qlora_model(args.model_path, ...)
+        data = runner.cached_data("data/cache.pkl", generate_fn)
+        ...
+
+    if __name__ == "__main__":
+        runner.run(train)
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import pickle
+import sys
+from pathlib import Path
+from typing import Any, Callable
+
+import torch
+
+from ..utils.config_utils import apply_yaml_defaults
+from ..utils.logging_utils import setup_logging
+
+# Ensure ``src/`` is importable regardless of where the script is launched.
+_project_root = Path(__file__).resolve().parents[2]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+
+class StageRunner:
+    """Shared orchestration for a training stage.
+
+    Parameters
+    ----------
+    stage_name:
+        Short identifier used for the log file: ``logs/{stage_name}.log``.
+    config_path:
+        YAML config file path (relative to project root).  Serves as the
+        default argument source; CLI flags override YAML values.
+    description:
+        Help text for the argparse parser.
+    """
+
+    __slots__ = ("stage_name", "config_path", "parser", "args", "logger")
+
+    def __init__(
+        self,
+        stage_name: str,
+        config_path: str,
+        description: str = "",
+    ) -> None:
+        # Mitigate CUDA memory fragmentation from variable-length sequences.
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+        self.stage_name = stage_name
+        self.config_path = config_path
+
+        self.parser = argparse.ArgumentParser(description=description)
+        self.parser.add_argument(
+            "--config", type=str, default=None,
+            help="Override the YAML config path (defaults to stage's built-in config).",
+        )
+
+        # Populated by parse_args().
+        self.args: argparse.Namespace | None = None
+        self.logger: logging.Logger | None = None
+
+    # ── argument registration ─────────────────────────────────────────
+
+    def add_arg(self, *args: Any, **kwargs: Any) -> None:
+        """Register a CLI argument on the internal parser.
+
+        A thin wrapper over ``argparse.ArgumentParser.add_argument``.
+        Call this after construction but before ``parse_args()`` / ``run()``.
+        """
+        self.parser.add_argument(*args, **kwargs)
+
+    def parse_args(self, cli_args: list[str] | None = None) -> argparse.Namespace:
+        """Parse CLI args, overlay YAML defaults, and create the logger.
+
+        Called automatically by ``run()``, so you only need to call this
+        directly when you want to inspect ``self.args`` before training.
+        """
+        self.args = self.parser.parse_args(cli_args)
+        if self.args.config is not None:
+            self.config_path = self.args.config
+        apply_yaml_defaults(self.args, self.parser, self.config_path)
+        self.logger = setup_logging(log_file=f"logs/{self.stage_name}.log")
+        return self.args
+
+    # ── data cache helper ─────────────────────────────────────────────
+
+    def cached_data(
+        self,
+        cache_path: str,
+        generate_fn: Callable[[], list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Load data from *cache_path* if it exists, otherwise generate & cache.
+
+        This replaces the repetitive ``os.path.exists + pickle.load/dump``
+        pattern used in stages 3b, 4a, 4b, 5, and 6.
+        """
+        if os.path.exists(cache_path):
+            self.logger.info(f"Loading cached data from {cache_path}")
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+
+        self.logger.info("Generating data (no cache found)...")
+        data = generate_fn()
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(data, f)
+        self.logger.info(f"Cached {len(data)} samples to {cache_path}")
+        return data
+
+    # ── execution ─────────────────────────────────────────────────────
+
+    def run(self, train_fn: Callable[["StageRunner"], None]) -> None:
+        """Parse args, print banner, call *train_fn*, then clean up.
+
+        *train_fn* receives ``self`` and can access ``self.args`` and
+        ``self.logger`` directly.
+        """
+        if self.args is None:
+            self.parse_args()
+
+        self.logger.info("=" * 60)
+        self.logger.info(f"Stage: {self.stage_name}")
+        self.logger.info("=" * 60)
+
+        torch.cuda.empty_cache()
+        train_fn(self)
+        torch.cuda.empty_cache()

@@ -100,7 +100,7 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 Training Pipeline (Separated Experts + On-Policy Distillation)
 
 ```
-Stage 1:  Text Pretrain          Text-only embedding initialization           ~?    ✅
+Stage 1:  Lightweight Format Pretrain  Text-only format SFT (embed + top-2 layers)  ~?    ✅
 Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~?    ✅
 Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~27s   ✅
 Stage 3a: Box Expert SFT         Box-specific SFT with format-token weighting ~?    ✅
@@ -473,6 +473,31 @@ reward = process_reward(
 #          wall_collision_count, backtracking_missing, ...
 ```
 
+### Configuration Management (YAML + argparse)
+
+All stage scripts follow a three-layer default cascade:
+
+```
+argparse default (None) → YAML config value → CLI override
+```
+
+- **YAML configs** (`configs/*.yaml`) are the **single source of truth** for hyperparameters.
+- **argparse defaults** are always `None` — YAML is required. If a key is missing from YAML, the script will error early.
+- **CLI flags** override both YAML and argparse defaults, e.g. `--num_epochs 5`.
+- `StageRunner` (in `src/training/stage_runner.py`) provides shared boilerplate: argparse setup, YAML loading (`apply_yaml_defaults`), logging, and a pickle data-cache helper.
+
+### Visual Primitive Domain Seam
+
+`PrimitiveParser` (in `src/models/visual_primitive_parser.py`) is the **single public API** for all visual primitive operations — parsing, validation, formatting, and geometry. Production code imports only from here (or the backward-compatible `src/utils/metrics` shim). The lower-level modules (`text_parsing.py`, `geometry.py`, `primitive_formatter.py`) are internal implementation details.
+
+```python
+from src.models.visual_primitive_parser import PrimitiveParser
+
+boxes = PrimitiveParser.extract_boxes(text)       # parsing
+tags  = PrimitiveParser.format_box([(10,20,100,200)])  # formatting
+iou   = PrimitiveParser.box_iou(pred, gt)        # geometry
+```
+
 ### Data Generation & Quality Control
 
 Beyond the original COCO box/point and synthetic maze tasks, the pipeline now includes additional data generators to broaden the model's reasoning capabilities:
@@ -500,6 +525,7 @@ Samples failing any check are discarded before training, ensuring high-quality c
 ```
 tvp-4b-5090d/
 ├── configs/                          # YAML training configs
+│   ├── stage1_pretrain.yaml
 │   ├── stage2_visual_pretrain.yaml
 │   ├── stage3a_sft_box.yaml
 │   ├── stage3b_sft_point.yaml
@@ -511,54 +537,77 @@ tvp-4b-5090d/
 │   ├── models/
 │   │   ├── qwen_vl_loader.py         # Qwen3VL + QLoRA loader
 │   │   ├── pretrain_loader.py        # Pretrain model loader + embedding injection
-│   │   └── visual_primitive_parser.py # Visual primitive parser
+│   │   └── visual_primitive_parser.py # **Domain seam** for all visual primitive ops (parsing, formatting, geometry)
 │   ├── data/
 │   │   ├── datasets/
 │   │   │   ├── sft_dataset.py        # SFT dataset (assistant-only loss mask)
 │   │   │   ├── grpo_dataset.py       # GRPO dataset
 │   │   │   └── image_loader.py       # Lazy image loading (OOM prevention)
 │   │   ├── generators/
+│   │   │   ├── __init__.py            # Generator registry
 │   │   │   ├── coco_box_generator.py # COCO → box/point/counting samples (3-step thinking + geometric filtering)
 │   │   │   ├── synthetic_maze.py     # Synthetic maze generator (3-step thinking)
 │   │   │   ├── clevr_spatial.py      # CLEVR-style 2D spatial/VQA generator
 │   │   │   ├── path_tracing.py       # Bézier curve path tracing generator
-│   │   │   └── synthetic_path.py     # Synthetic path generator (unused)
+│   │   │   └── synthetic_path.py     # Synthetic path generator
 │   │   └── formatters/
-│   │       └── primitive_formatter.py # Coordinate label formatting
+│   │       └── primitive_formatter.py # Coordinate label formatting (internal)
 │   ├── training/
+│   │   ├── stage_runner.py           # **StageRunner**: shared argparse+YAML+logging boilerplate
 │   │   ├── trainers/
-│   │   │   └── sft_trainer.py        # SFT Trainer wrapper
-│   │   ├── pretrain_trainer.py       # Pretrain Trainer (embedding only)
+│   │   │   └── sft_trainer.py        # SFT Trainer wrapper (WeightedSFTTrainer)
+│   │   ├── pretrain_trainer.py       # Pretrain Trainer (text + visual phases)
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation trainer
 │   │   ├── grpo_fixes.py             # GRPOTrainer multimodal monkey-patches
 │   │   ├── grpo_utils.py             # GRPO helper utilities (completion text extraction)
 │   │   ├── callbacks.py              # Training callbacks (memory monitoring)
-│   │   ├── memory_utils.py           # GPU memory utilities
+│   │   ├── memory_utils.py           # GPU memory utilities (build_param_groups)
 │   │   └── config_utils.py           # YAML config loading helpers for stage scripts
 │   └── utils/
 │       ├── constants.py              # Special token / hyperparameter constants
-│       ├── metrics.py                # Format RM + Accuracy RM + difficulty grading + length penalty
-│       ├── thinking_verifier.py       # Thinking-chain validation (tag pairing, coord range, ref checks)
-│       └── logging_utils.py          # Logging initialization
+│       ├── conversation_builder.py   # **ConversationBuilder**: unified message construction (SFT/GRPO/OPD/pretrain)
+│       ├── text_parsing.py           # Answer / reasoning / box / point parsing (internal)
+│       ├── geometry.py               # IoU, point distance, maze geometry (internal)
+│       ├── metrics.py                # Backward-compatible shim → text_parsing + geometry + reward/*
+│       ├── thinking_verifier.py      # Thinking-chain validation (tag pairing, coord range, ref checks)
+│       ├── quality_rm_api.py         # LLM-as-Judge Quality RM (OpenAI-compatible API)
+│       ├── logging_utils.py          # Logging initialization
+│       ├── difficulty.py             # Easy/Normal/Hard difficulty grading
+│       ├── batch_inference.py        # Batched generation helper
+│       └── reward/
+│           ├── format_rm.py          # Format Reward Model
+│           ├── quality_rm.py         # Quality Reward Model (rule-based)
+│           └── accuracy_rm.py        # Accuracy Reward Model (process_reward, compute_total_reward)
 ├── scripts/                          # Stage entry scripts
 │   ├── generate_pretrain_data.py     # Pretrain data generator
-│   ├── run_stage1_pretrain.py        # Stage 1: Text Pretrain
+│   ├── run_stage1_pretrain.py        # Stage 1: Text + Visual Pretrain
 │   ├── run_stage2_visual_pretrain.py # Stage 2: Visual Pretrain
-│   ├── merge_stage2.py               # Stage 2 LoRA Merge
+│   ├── merge_stage2.py               # Stage 2 LoRA Merge + embedding injection
 │   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
 │   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
 │   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
 │   ├── run_stage4b_grpo_point.py     # Stage 4b: Point Expert GRPO
 │   ├── run_stage5_rft_unified.py     # Stage 5: Unified RFT
 │   ├── run_stage6_opd.py             # Stage 6: OPD
+│   ├── eval_stage2_structure.py      # Stage 2 structure evaluation
+│   ├── eval_stage3a_paradigm.py      # Stage 3a paradigm check
+│   ├── smoke_test_stage2.py          # Stage 2 smoke test
+│   ├── diagnose_stage2_resume_loss.py # Stage 2 loss diagnosis
 │   └── run_pipeline.sh               # Master Pipeline (one-click run)
 ├── tests/
-│   ├── test_primitive_parser.py      # Coordinate parser unit tests
+│   ├── test_primitive_parser.py      # PrimitiveParser unit tests (32 methods)
+│   ├── test_primitive_formatter.py   # Box/point formatting tests
 │   ├── test_metrics.py               # Reward function & geometry tool tests
+│   ├── test_conversation_builder.py  # ConversationBuilder unit tests (21 tests)
+│   ├── test_quality_rm_api.py        # Quality RM API integration tests (23 tests)
 │   ├── test_pretrain_format.py       # Pretrain format tests
+│   ├── test_weighted_sft_trainer.py  # WeightedSFTTrainer loss tests
 │   ├── test_grpo_fixes.py            # GRPO monkey-patch unit tests
 │   ├── test_grpo_reward_integration.py # GRPO reward integration tests
-│   └── test_logging_utils.py         # Logging utility tests
+│   ├── test_stage_integration.py     # **Stage integration tests** (14 tests, all 8 stages)
+│   ├── test_stage3a_data_composition.py # Stage 3a data composition tests
+│   ├── test_logging_utils.py         # Logging utility tests
+│   └── test_filter_normal_level_data.py # Difficulty filter tests
 ├── outputs/                          # Training artifacts (organized by stage)
 │   ├── stage1_pretrain/              # embedding state_dict
 │   ├── stage2_visual_pretrain/       # LoRA adapter + checkpoints
@@ -585,6 +634,13 @@ tvp-4b-5090d/
 ## 🧪 Running Tests
 
 ```bash
+# Unit tests (fast, no GPU required for most)
+pytest tests/ -v --ignore=tests/test_grpo_reward_integration.py --ignore=tests/test_stage_integration.py
+
+# Integration tests (require models + COCO data; auto-skip if unavailable)
+pytest tests/test_stage_integration.py -v
+
+# All tests
 pytest tests/ -v
 ```
 

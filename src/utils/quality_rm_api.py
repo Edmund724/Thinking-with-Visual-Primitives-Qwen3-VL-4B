@@ -2,14 +2,19 @@
 
 Falls back to the rule-based quality_reward_text if the API is unavailable,
 times out, or returns an unparseable response.
+
+Subset sampling (QUALITY_RM_SAMPLE_RATIO) reduces API cost by routing a
+random fraction of completions through the LLM judge; the rest use the fast
+rule-based fallback.
 """
 
 import os
+import random
 import re
 import time
-from typing import Any, List
+from typing import Any
 
-from .metrics import quality_reward_text
+from .reward.quality_rm import quality_reward_text
 
 
 def _load_api_config() -> dict:
@@ -36,32 +41,53 @@ def _load_api_config() -> dict:
         "model": model,
         "timeout": int(os.getenv("QUALITY_RM_TIMEOUT", "30")),
         "max_retries": int(os.getenv("QUALITY_RM_MAX_RETRIES", "2")),
+        "sample_ratio": float(os.getenv("QUALITY_RM_SAMPLE_RATIO", "1.0")),
     }
 
 
 def _build_judge_prompt(pred_text: str, gt_text: str, task_type: str = "box") -> str:
-    """Build a strict, parseable prompt for the LLM judge."""
+    """Build a chain-of-thought judge prompt (paper-style GRM evaluation).
+
+    The judge is asked to reason about specific quality dimensions before
+    outputting a structured score, which produces more reliable ratings than
+    a bare score request.
+    """
     return (
-        "You are a quality judge for visual reasoning outputs. "
-        "Score the model's response based on the ground truth.\n\n"
-        "Evaluation criteria (paper-style Quality RM):\n"
-        "- 1.0: No quality issues (correct, consistent, no redundancy, no contradictions).\n"
-        "- 0.5: Minor issues (small redundancy, weak consistency, minor contradictions).\n"
-        "- 0.0: Serious issues (reward hacking, self-contradiction, copied ground truth, "
-        "wrong answer despite claiming correctness).\n\n"
+        "You are a quality judge for visual reasoning model outputs. "
+        "Evaluate the model's response against the ground truth.\n\n"
+        "Check these dimensions:\n"
+        "1. Redundancy — duplicate or near-duplicate coordinates in the thinking trace?\n"
+        "2. Consistency — does the answer count match the number of primitives (<|box|>, <|point|>)?\n"
+        "3. Contradiction — wrong answer while claiming correctness?\n"
+        "4. Reward hacking — copied ground truth text, boilerplate like \"the answer is\"?\n"
+        "5. Self-contradiction — \"no objects\" or \"nothing found\" but outputs primitives?\n"
+        "6. Meaningful references — are <|ref|> tags non-empty and refer to actual objects?\n\n"
         f"Task type: {task_type}\n\n"
-        "--- Ground Truth ---\n"
+        "=== Ground Truth ===\n"
         f"{gt_text}\n\n"
-        "--- Model Prediction ---\n"
+        "=== Model Prediction ===\n"
         f"{pred_text}\n\n"
-        "Respond with ONLY one of: 1.0, 0.5, or 0.0. No explanation."
+        "Briefly identify any issues found (one line per issue, or \"none\" if clean). "
+        "Then on the LAST line output exactly: Score: X.X\n"
+        "Where X.X is 1.0 (no issues), 0.5 (minor issues), or 0.0 (serious issues)."
     )
 
 
 def _parse_score(response: str) -> float:
-    """Parse a discrete score from the judge response."""
+    """Parse a discrete score from the judge response.
+
+    Tries these strategies in order:
+    1. ``Score: X.X`` pattern (from the chain-of-thought prompt)
+    2. Bare number match (``1.0``, ``0.5``, ``0.0`` — legacy prompt format)
+    """
     response = response.strip()
-    # Direct match
+
+    # Strategy 1: "Score: X.X" pattern
+    score_match = re.search(r"Score:\s*(1\.0|0\.5|0\.0)\b", response, re.IGNORECASE)
+    if score_match:
+        return float(score_match.group(1))
+
+    # Strategy 2: Direct match (legacy format)
     if response in ("1.0", "1", "1.00"):
         return 1.0
     if response in ("0.5", ".5", "0.50"):
@@ -69,7 +95,7 @@ def _parse_score(response: str) -> float:
     if response in ("0.0", "0", "0.00"):
         return 0.0
 
-    # Extract first occurrence of 1.0 / 0.5 / 0.0 in the text
+    # Strategy 3: First float-like occurrence
     match = re.search(r"\b(1\.0|0\.5|0\.0)\b", response)
     if match:
         return float(match.group(1))
@@ -112,7 +138,7 @@ def quality_reward_api(
                     model=cfg["model"],
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
-                    max_tokens=10,
+                    max_tokens=150,  # enough for brief reasoning + score
                     timeout=cfg["timeout"],
                 )
                 content = resp.choices[0].message.content
@@ -142,6 +168,10 @@ def quality_reward_api(
 def make_quality_reward_api_fn(tokenizer=None, task_type_default: str = "box"):
     """Factory for a TRL-compatible Quality RM using API judging.
 
+    Subset sampling: controlled by ``QUALITY_RM_SAMPLE_RATIO`` env var
+    (default 1.0).  Completions not sampled for API judging use the
+    rule-based fallback directly, saving cost with minimal quality impact.
+
     Signature matches make_quality_reward_fn so it can be swapped in directly.
     """
 
@@ -153,6 +183,7 @@ def make_quality_reward_api_fn(tokenizer=None, task_type_default: str = "box"):
 
         # Pre-build client once per reward call to avoid repeated instantiation.
         cfg = _load_api_config()
+        sample_ratio = cfg.get("sample_ratio", 1.0)
         client = None
         if cfg:
             try:
@@ -161,9 +192,12 @@ def make_quality_reward_api_fn(tokenizer=None, task_type_default: str = "box"):
             except Exception:
                 client = None
 
-        from .metrics import extract_completion_text
+        from ..training.grpo_utils import extract_completion_text
 
         rewards = []
+        # Use a seeded random state per batch for reproducibility.
+        rng = random.Random(42 + len(completions))
+
         for i, completion in enumerate(completions):
             if i < len(inputs):
                 gt_text = inputs[i].get("gt_text", "")
@@ -179,6 +213,14 @@ def make_quality_reward_api_fn(tokenizer=None, task_type_default: str = "box"):
             pred_text = extract_completion_text(
                 completion, tokenizer=tokenizer, completion_id=comp_id
             )
+
+            # Subset sampling: only a fraction of completions go to the API.
+            if rng.random() > sample_ratio:
+                try:
+                    rewards.append(quality_reward_text(pred_text, gt_text, task_type))
+                except Exception:
+                    rewards.append(0.0)
+                continue
 
             try:
                 rewards.append(quality_reward_api(pred_text, gt_text, task_type, client=client))

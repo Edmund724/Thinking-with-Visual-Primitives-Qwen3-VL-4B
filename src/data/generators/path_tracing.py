@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from ...utils.thinking_verifier import filter_verified_samples
-from ..formatters.primitive_formatter import format_point, normalize_coordinate
+from ...models.visual_primitive_parser import PrimitiveParser
 
 
 LABELS = [
@@ -217,7 +217,7 @@ def _build_path_tracing_thinking(
     else:
         sampled = waypoints
 
-    path_str = format_point(sampled)
+    path_str = PrimitiveParser.format_point(sampled)
     grounding = f"Following the line from {start_label}: {path_str}"
     summarization = f"The line from {start_label} connects to {end_label}."
 
@@ -327,7 +327,7 @@ def generate_path_tracing_dataset(
 
         # Normalize waypoints
         normalized_waypoints = [
-            (normalize_coordinate(x, img_size[0]), normalize_coordinate(y, img_size[1]))
+            (PrimitiveParser.normalize_coordinate(x, img_size[0]), PrimitiveParser.normalize_coordinate(y, img_size[1]))
             for x, y in target_curve
         ]
 

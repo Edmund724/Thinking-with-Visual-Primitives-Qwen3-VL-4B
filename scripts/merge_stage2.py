@@ -112,10 +112,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge Stage 2 LoRA into base")
-    parser.add_argument("--base_model", type=str, default="models/Qwen3-VL-4B-Thinking")
-    parser.add_argument("--adapter_path", type=str, default="outputs/stage2_visual_pretrain")
+    parser.add_argument("--base_model", type=str, default=None)
+    parser.add_argument("--adapter_path", type=str, default=None)
     parser.add_argument("--pretrain_embedding_path", type=str,
-                        default="outputs/stage1_pretrain/pretrain_state_dict.pt")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage2_merged_base")
+                        default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
     main(args)

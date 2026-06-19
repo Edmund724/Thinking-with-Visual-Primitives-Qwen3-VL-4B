@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
 
+from ...utils.conversation_builder import ConversationBuilder
 from .image_loader import load_image
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class SFTDataset(Dataset):
         self.max_length = max_length
         self.format_token_weight = format_token_weight
         self._format_token_ids = self._build_format_token_ids()
+        self._conv_builder = ConversationBuilder("sft")
 
     def _build_format_token_ids(self) -> set:
         """Token IDs that should receive higher loss weight."""
@@ -70,49 +72,11 @@ class SFTDataset(Dataset):
     def _build_messages(self, sample: Dict[str, Any]) -> tuple:
         """Build prompt-only and full conversation messages.
 
-        Handles both image-based and text-only samples.
+        Delegates to ConversationBuilder for unified message construction.
         Returns:
             (prompt_messages, full_messages)
         """
-        has_image = "image" in sample and sample["image"] is not None
-
-        if has_image:
-            user_content = [
-                {"type": "image", "image": sample["image"]},
-                {"type": "text", "text": sample["prompt"]},
-            ]
-        else:
-            user_content = sample["prompt"]
-
-        prompt_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful visual reasoning assistant. "
-                    "Think step by step and use visual primitives when needed. "
-                    "Respond in English only; do not use characters from other languages."
-                ),
-            },
-            {"role": "user", "content": user_content},
-        ]
-
-        # Clean reasoning: remove existing <think> tags to avoid nesting with the
-        # chat template, but keep visual primitive tags intact.
-        reasoning = sample.get("reasoning", "")
-        if reasoning.startswith("<think>"):
-            reasoning = reasoning[len("<think>"):].lstrip("\n")
-        if reasoning.endswith("</think>"):
-            reasoning = reasoning[: -len("</think>")].rstrip()
-
-        full_messages = prompt_messages + [
-            {
-                "role": "assistant",
-                "content": str(sample["answer"]),
-                "reasoning_content": reasoning,
-            },
-        ]
-
-        return prompt_messages, full_messages
+        return self._conv_builder.build_sft(sample)
 
     def _compute_labels(
         self,

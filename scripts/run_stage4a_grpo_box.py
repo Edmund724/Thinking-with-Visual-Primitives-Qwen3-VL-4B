@@ -6,18 +6,8 @@ Uses Format RM + Accuracy RM with difficulty grading (Normal only).
 """
 
 import os
-
-# Mitigate CUDA memory fragmentation from variable-length GRPO completions.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-import argparse
 import gc
-import logging
-import pickle
-import sys
 from pathlib import Path
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from trl import GRPOConfig, GRPOTrainer
@@ -36,18 +26,14 @@ from src.training.callbacks import (
     ValidationSubsetEarlyStoppingCallback,
     maybe_compile_model,
 )
+from src.training.stage_runner import StageRunner
 from src.utils.constants import GPU_MEMORY_WARNING_GB
-from src.utils.config_utils import apply_yaml_defaults
-from src.utils.logging_utils import setup_logging
-from src.utils.metrics import (
-    compute_total_reward,
-    filter_normal_level_data,
-    length_reward,
-    make_quality_reward_fn,
-)
+from src.utils.difficulty import filter_normal_level_data
+from src.utils.reward.accuracy_rm import compute_total_reward, length_reward
+from src.utils.reward.quality_rm import make_quality_reward_fn
 from src.utils.quality_rm_api import make_quality_reward_api_fn
 
-logger = logging.getLogger("stage4a_grpo_box")
+logger = None  # Set by train() from runner.logger
 
 
 def _latest_checkpoint(round_dir: Path) -> Path | None:
@@ -116,16 +102,9 @@ def make_box_reward_fn(iou_threshold: float, tokenizer=None):
     return grpo_reward
 
 
-def main(args):
-    setup_logging(
-        log_file="logs/stage4a_grpo_box.log", console=not args.no_console_log
-    )
-
-    logger.info("=" * 60)
-    logger.info("Stage 4a: Specialized GRPO — Box Expert")
-    logger.info("=" * 60)
-
-    torch.cuda.empty_cache()
+def train(runner: StageRunner) -> None:
+    global logger
+    args, logger = runner.args, runner.logger
 
     # 1. Load Box Expert from Stage 3a
     policy_path = args.model_path
@@ -141,15 +120,9 @@ def main(args):
     policy_model = maybe_compile_model(policy_model, enable=args.compile_model)
 
     # 2. Generate or load cached GRPO data
-    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
-    if os.path.exists(cache_path):
-        logger.info(f"Loading cached training data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            all_data = pickle.load(f)
-        logger.info(f"  Loaded {len(all_data)} samples from cache")
-    else:
+    def _generate_data():
         logger.info("Generating GRPO training data (box + counting + spatial/VQA)...")
-        all_data = []
+        data = []
 
         box_data = generate_coco_box_samples(
             image_dir=args.coco_image_dir,
@@ -158,7 +131,7 @@ def main(args):
         )
         for d in box_data:
             d["task_type"] = "box"
-        all_data.extend(box_data)
+        data.extend(box_data)
         logger.info(f"  Box localization samples: {len(box_data)}")
 
         counting_data = generate_coco_counting_samples(
@@ -168,7 +141,7 @@ def main(args):
         )
         for d in counting_data:
             d["task_type"] = "box"
-        all_data.extend(counting_data)
+        data.extend(counting_data)
         logger.info(f"  Coarse-grained counting samples: {len(counting_data)}")
 
         clevr_data = generate_clevr_spatial_dataset(
@@ -178,16 +151,14 @@ def main(args):
         )
         for d in clevr_data:
             d["task_type"] = "box"
-        all_data.extend(clevr_data)
+        data.extend(clevr_data)
         logger.info(f"  CLEVR spatial/VQA samples: {len(clevr_data)}")
 
-        logger.info(f"Total GRPO samples: {len(all_data)}")
+        logger.info(f"Total GRPO samples: {len(data)}")
+        return data
 
-        # Save cache for future runs
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(all_data, f)
-        logger.info(f"Cached training data to {cache_path}")
+    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
+    all_data = runner.cached_data(cache_path, _generate_data)
 
     num_rounds = args.num_rounds
     iou_thresholds = [0.3, 0.5, 0.7]
@@ -196,14 +167,8 @@ def main(args):
     filtered_cache_path = os.path.join(args.output_dir, "filtered_train_data_cache.pkl")
     if args.skip_difficulty_filter:
         logger.info("--skip_difficulty_filter is set; using all samples without filtering")
-    elif os.path.exists(filtered_cache_path):
-        logger.info(f"Loading filtered training data from {filtered_cache_path}")
-        with open(filtered_cache_path, "rb") as f:
-            all_data = pickle.load(f)
-        logger.info(f"  Loaded {len(all_data)} Normal-difficulty samples")
     else:
-        logger.info("Difficulty filtering: retaining only Normal-level samples...")
-        all_data = filter_normal_level_data(
+        all_data = runner.cached_data(filtered_cache_path, lambda: filter_normal_level_data(
             model=policy_model,
             processor=processor,
             data=all_data,
@@ -214,10 +179,7 @@ def main(args):
             batch_size=args.filter_batch_size,
             empty_cache_every=args.filter_empty_cache_every,
             logger=logger,
-        )
-        with open(filtered_cache_path, "wb") as f:
-            pickle.dump(all_data, f)
-        logger.info(f"Cached filtered training data to {filtered_cache_path}")
+        ))
 
     # Apply monkey-patches once, before training. Applying inside the round loop
     # would nest wrappers on each iteration.
@@ -370,78 +332,78 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 4a: Box Expert GRPO")
-    parser.add_argument("--config", type=str, default="configs/stage4a_grpo_box.yaml",
-                        help="YAML config path; values are used as defaults unless overridden by CLI flags.")
-    parser.add_argument("--model_path", type=str, default="outputs/stage3a_sft_box")
-    parser.add_argument("--output_dir", type=str, default="outputs/stage4a_grpo_box")
-    parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
-    parser.add_argument("--coco_ann_file", type=str,
-                        default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_samples", type=int, default=5000)
-    parser.add_argument("--num_counting", type=int, default=3000,
-                        help="Number of coarse-grained counting samples")
-    parser.add_argument("--num_clevr", type=int, default=2000,
-                        help="Number of CLEVR-style spatial/VQA samples")
-    parser.add_argument("--num_rounds", type=int, default=3)
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-6)
-    parser.add_argument("--batch_size", type=int, default=6)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--lora_r", type=int, default=256)
-    parser.add_argument("--lora_alpha", type=int, default=512)
-    parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=200)
-    parser.add_argument("--warmup_steps", type=int, default=50)
-    parser.add_argument("--num_generations", type=int, default=6)
-    parser.add_argument("--filter_batch_size", type=int, default=4,
-                        help="Batch size for difficulty-filter generation (prompts per batch)")
-    parser.add_argument("--filter_max_completion_length", type=int, default=384,
-                        help="Max completion length used only during difficulty filtering")
-    parser.add_argument("--filter_empty_cache_every", type=int, default=50)
-    parser.add_argument("--skip_difficulty_filter", action="store_true",
-                        help="Skip difficulty filtering and use all generated samples")
-    parser.add_argument("--max_completion_length", type=int, default=384)
-    parser.add_argument("--beta", type=float, default=0.04)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument(
+    runner = StageRunner(
+        "stage4a_grpo_box",
+        "configs/stage4a_grpo_box.yaml",
+        description="Stage 4a: Box Expert GRPO",
+    )
+    runner.add_arg("--model_path", type=str, default=None)
+    runner.add_arg("--output_dir", type=str, default=None)
+    runner.add_arg("--coco_image_dir", type=str, default=None)
+    runner.add_arg("--coco_ann_file", type=str,
+                   default=None)
+    runner.add_arg("--num_samples", type=int, default=None)
+    runner.add_arg("--num_counting", type=int, default=None,
+                   help="Number of coarse-grained counting samples")
+    runner.add_arg("--num_clevr", type=int, default=None,
+                   help="Number of CLEVR-style spatial/VQA samples")
+    runner.add_arg("--num_rounds", type=int, default=None)
+    runner.add_arg("--num_epochs", type=int, default=None)
+    runner.add_arg("--learning_rate", type=float, default=None)
+    runner.add_arg("--batch_size", type=int, default=None)
+    runner.add_arg("--gradient_accumulation_steps", type=int, default=None)
+    runner.add_arg("--lora_r", type=int, default=None)
+    runner.add_arg("--lora_alpha", type=int, default=None)
+    runner.add_arg("--logging_steps", type=int, default=None)
+    runner.add_arg("--save_steps", type=int, default=None)
+    runner.add_arg("--warmup_steps", type=int, default=None)
+    runner.add_arg("--num_generations", type=int, default=None)
+    runner.add_arg("--filter_batch_size", type=int, default=None,
+                   help="Batch size for difficulty-filter generation (prompts per batch)")
+    runner.add_arg("--filter_max_completion_length", type=int, default=None,
+                   help="Max completion length used only during difficulty filtering")
+    runner.add_arg("--filter_empty_cache_every", type=int, default=None)
+    runner.add_arg("--skip_difficulty_filter", action="store_true",
+                   help="Skip difficulty filtering and use all generated samples")
+    runner.add_arg("--max_completion_length", type=int, default=None)
+    runner.add_arg("--beta", type=float, default=None)
+    runner.add_arg("--temperature", type=float, default=None)
+    runner.add_arg(
         "--use_quality_rm_api",
         action="store_true",
         help="Use OpenAI-compatible API for Quality RM (requires .env key).",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--compile_model",
         action="store_true",
         help="Try torch.compile on the policy model (best-effort).",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--early_stopping_subset_size",
         type=int,
-        default=32,
+        default=None,
         help="Validation subset size for early stopping (0 to disable).",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--early_stopping_eval_steps",
         type=int,
-        default=50,
+        default=None,
         help="Evaluate validation subset every N steps.",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--early_stopping_patience",
         type=int,
-        default=2,
+        default=None,
         help="Stop after this many evals without improvement.",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--no_console_log",
         action="store_true",
         help="Only log to file; suppress console output to avoid Terminal crashes.",
     )
-    parser.add_argument(
+    runner.add_arg(
         "--disable_tqdm",
         action="store_true",
         help="Disable progress bars to reduce console output.",
     )
-    args = parser.parse_args()
-    apply_yaml_defaults(args, parser, args.config)
-    main(args)
+    runner.run(train)

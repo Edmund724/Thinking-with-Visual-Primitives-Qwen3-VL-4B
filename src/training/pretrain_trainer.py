@@ -56,8 +56,10 @@ class PretrainDataset(Dataset):
             input_ids = enc["input_ids"][0]
             labels = input_ids.clone()
 
-            # Mask user tokens: find where assistant content starts
-            assistant_content = messages[1]["content"]
+            # Mask user/system tokens: compute prompt length from all messages
+            # before the last assistant message.
+            assistant_message = messages[-1]
+            assistant_content = assistant_message["content"]
             try:
                 idx = full_text.index(assistant_content)
                 prefix = full_text[:idx]
@@ -99,6 +101,7 @@ def train_pretrain(
     output_dir: str,
     num_epochs: int = 3,
     learning_rate: float = 2e-4,
+    vit_lr: float = 1e-6,
     per_device_batch_size: int = 4,
     gradient_accumulation_steps: int = 1,
     max_length: int = 256,
@@ -116,6 +119,8 @@ def train_pretrain(
     """
     if logger is None:
         logger = logging.getLogger(__name__)
+
+    from .memory_utils import build_param_groups
 
     t0 = time.time()
     logger.info("Tokenizing pretrain data...")
@@ -137,11 +142,11 @@ def train_pretrain(
         f"(batch_size={per_device_batch_size}, accum={gradient_accumulation_steps})"
     )
 
-    # Optimizer: only trainable parameters (embed_tokens ± lm_head)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    n_params = sum(p.numel() for p in trainable_params)
+    # Optimizer: per-group LRs for ViT (low), merger (medium), LLM (normal)
+    param_groups = build_param_groups(model, base_lr=learning_rate, vit_lr=vit_lr)
+    n_params = sum(sum(p.numel() for p in g["params"]) for g in param_groups)
     logger.info(f"Trainable params: {n_params:,} ({n_params/1e6:.1f}M)")
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
     total_optimizer_steps = (len(dataloader) // gradient_accumulation_steps) * num_epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_optimizer_steps, 1)
@@ -175,13 +180,17 @@ def train_pretrain(
             if global_step % gradient_accumulation_steps == 0:
                 optimizer_step += 1
 
-                # Warmup (at optimizer-step granularity)
+                # Warmup: scale each group's LR proportionally
                 if optimizer_step <= warmup_steps:
-                    lr = learning_rate * optimizer_step / warmup_steps
+                    warmup_scale = optimizer_step / warmup_steps
                     for g in optimizer.param_groups:
-                        g["lr"] = lr
+                        base_lr = g.get("initial_lr", g["lr"] / warmup_scale if warmup_scale > 0 else g["lr"])
+                        if "initial_lr" not in g:
+                            g["initial_lr"] = g["lr"]
+                        g["lr"] = g["initial_lr"] * warmup_scale
 
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.3)
+                all_trainable = [p for g in param_groups for p in g["params"]]
+                torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=0.3)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -211,3 +220,137 @@ def train_pretrain(
         )
 
     logger.info("Pretrain training complete.")
+
+
+def train_pretrain_visual(
+    model,
+    processor: AutoProcessor,
+    train_data: list,
+    output_dir: str,
+    num_epochs: int = 1,
+    learning_rate: float = 5e-5,
+    vit_lr: float = 1e-6,
+    per_device_batch_size: int = 1,
+    gradient_accumulation_steps: int = 4,
+    max_seq_length: int = 2048,
+    warmup_steps: int = 50,
+    logging_steps: int = 20,
+    format_token_weight: float = 5.0,
+    logger: logging.Logger | None = None,
+):
+    """Run visual grounding pretrain with image+text data.
+
+    Uses ``SFTDataset`` (which handles images, loss masking, format tokens)
+    but with a custom PyTorch training loop — HuggingFace Trainer rejects
+    fully quantized 4-bit models.  Only ``embed_tokens``, ``lm_head``,
+    last decoder layers, and optionally ViT blocks are trainable.
+
+    This is the visual counterpart to ``train_pretrain()`` and is intended
+    for Stage 1's ``--visual_data_ratio > 0`` path.
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    from ...data.datasets.sft_dataset import SFTDataset
+    from ..trainers.sft_trainer import _collate_sft
+    from .memory_utils import build_param_groups
+
+    logger.info("Building visual pretrain dataset...")
+    dataset = SFTDataset(
+        data=train_data,
+        processor=processor,
+        max_length=max_seq_length,
+        format_token_weight=format_token_weight,
+    )
+    logger.info(f"Visual pretrain dataset: {len(dataset)} samples")
+
+    # Use SFT collate for dynamic padding + visual feature concatenation.
+    pad_id = processor.tokenizer.pad_token_id or 0
+    dataloader = DataLoader(
+        dataset,
+        batch_size=per_device_batch_size,
+        shuffle=True,
+        drop_last=False,
+        collate_fn=lambda features: _collate_sft(features, pad_token_id=pad_id),
+    )
+    logger.info(
+        f"Batches/epoch: {len(dataloader)} "
+        f"(batch_size={per_device_batch_size}, accum={gradient_accumulation_steps})"
+    )
+
+    param_groups = build_param_groups(model, base_lr=learning_rate, vit_lr=vit_lr)
+    n_params = sum(sum(p.numel() for p in g["params"]) for g in param_groups)
+    logger.info(f"Trainable params: {n_params:,} ({n_params/1e6:.1f}M)")
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
+    total_optimizer_steps = (len(dataloader) // gradient_accumulation_steps) * num_epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_optimizer_steps, 1)
+    )
+
+    model.train()
+    global_step = 0
+    optimizer_step = 0
+    logger.info(f"Starting visual pretrain ({num_epochs} epochs)...")
+
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        epoch_t0 = time.time()
+
+        pbar = tqdm(dataloader, desc=f"Visual Epoch {epoch+1}/{num_epochs}", unit="batch")
+        for step, batch in enumerate(pbar):
+            global_step += 1
+
+            batch = {k: v.to(model.device, non_blocking=True)
+                     if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs = model(**batch)
+                loss = outputs.loss / gradient_accumulation_steps
+
+            loss.backward()
+            epoch_loss += loss.item() * gradient_accumulation_steps
+
+            if global_step % gradient_accumulation_steps == 0:
+                optimizer_step += 1
+
+                if optimizer_step <= warmup_steps:
+                    warmup_scale = optimizer_step / warmup_steps
+                    for g in optimizer.param_groups:
+                        if "initial_lr" not in g:
+                            g["initial_lr"] = g["lr"]
+                        g["lr"] = g["initial_lr"] * warmup_scale
+
+                all_trainable = [p for g in param_groups for p in g["params"]]
+                torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=0.3)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                if optimizer_step > warmup_steps:
+                    scheduler.step()
+
+                loss_val = loss.item() * gradient_accumulation_steps
+                pbar.set_postfix({
+                    "loss": f"{loss_val:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                })
+
+                if optimizer_step % logging_steps == 0:
+                    logger.info(
+                        f"  Epoch {epoch+1}/{num_epochs} | "
+                        f"Step {optimizer_step} | "
+                        f"Loss: {loss_val:.4f} | "
+                        f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+                    )
+
+        avg_loss = epoch_loss / max(len(dataloader), 1)
+        logger.info(
+            f"Visual Epoch {epoch+1}/{num_epochs} complete. "
+            f"Avg loss: {avg_loss:.4f} | "
+            f"Time: {time.time() - epoch_t0:.1f}s"
+        )
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    logger.info("Visual pretrain complete.")

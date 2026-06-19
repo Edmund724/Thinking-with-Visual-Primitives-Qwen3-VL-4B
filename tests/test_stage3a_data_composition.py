@@ -58,6 +58,10 @@ def test_stage3a_includes_negative_boxes_without_crash():
     clevr_samples = [{"id": f"clevr_{i}"} for i in range(2)]
     negative_samples = [{"id": f"neg_{i}"} for i in range(2)]
 
+    runner = MagicMock()
+    runner.args = _make_args()
+    runner.logger = MagicMock()
+
     with (
         patch.object(stage3a, "generate_coco_box_samples", return_value=box_samples),
         patch.object(stage3a, "generate_coco_counting_samples", return_value=counting_samples),
@@ -70,7 +74,7 @@ def test_stage3a_includes_negative_boxes_without_crash():
         patch.object(stage3a.torch.cuda, "empty_cache"),
         patch("src.utils.logging_utils.setup_logging", return_value=MagicMock()),
     ):
-        stage3a.main(_make_args())
+        stage3a.train(runner)
 
     trainer_mock.assert_called_once()
     train_data = trainer_mock.call_args.kwargs["train_data"]

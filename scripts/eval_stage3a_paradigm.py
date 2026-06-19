@@ -30,6 +30,7 @@ from src.data.generators.coco_box_generator import (
 from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.utils.constants import BOX_OPEN, BOX_CLOSE
+from src.utils.conversation_builder import ConversationBuilder
 
 
 def build_eval_set(args):
@@ -130,19 +131,7 @@ def evaluate_sample(model, processor, sample, device):
     if isinstance(image, str):
         image = Image.open(image).convert("RGB")
 
-    system_msg = (
-        "You are a helpful visual reasoning assistant. "
-        "Think step by step and use visual primitives when needed. "
-        "Respond in English only; do not use characters from other languages."
-    )
-    user_content = [
-        {"type": "image", "image": image},
-        {"type": "text", "text": sample["prompt"]},
-    ]
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_content},
-    ]
+    messages = ConversationBuilder("sft").build_prompt(sample["prompt"], image)
 
     prompt_text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -309,17 +298,17 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="outputs/stage3a_sft_box")
-    parser.add_argument("--output_dir", type=str, default="outputs/eval_stage3a")
-    parser.add_argument("--output_json", type=str, default="outputs/eval_stage3a/results.json")
-    parser.add_argument("--coco_image_dir", type=str, default="data/coco/train2017")
+    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--output_json", type=str, default=None)
+    parser.add_argument("--coco_image_dir", type=str, default=None)
     parser.add_argument("--coco_ann_file", type=str,
-                        default="data/coco/annotations/instances_train2017.json")
-    parser.add_argument("--num_samples", type=int, default=20,
+                        default=None)
+    parser.add_argument("--num_samples", type=int, default=None,
                         help="Number of samples per subtype")
-    parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--show_examples", type=int, default=5)
-    parser.add_argument("--lora_r", type=int, default=256)
-    parser.add_argument("--lora_alpha", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--show_examples", type=int, default=None)
+    parser.add_argument("--lora_r", type=int, default=None)
+    parser.add_argument("--lora_alpha", type=int, default=None)
     args = parser.parse_args()
     main(args)

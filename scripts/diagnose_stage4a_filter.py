@@ -11,12 +11,9 @@ import torch
 
 from src.models.qwen_vl_loader import load_qlora_model
 from src.utils.batch_inference import generate_single_completion
-from src.utils.metrics import (
-    compute_total_reward,
-    format_reward,
-    is_rollout_correct,
-    process_reward,
-)
+from src.utils.difficulty import is_rollout_correct
+from src.utils.reward.accuracy_rm import compute_total_reward, process_reward
+from src.utils.reward.format_rm import format_reward
 
 
 def main():

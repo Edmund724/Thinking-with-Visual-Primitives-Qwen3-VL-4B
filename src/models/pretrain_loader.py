@@ -1,7 +1,9 @@
-"""Pretrain model loader for visual primitive token embedding initialization.
+"""Pretrain model loader for visual primitive token initialization.
 
 Uses 4-bit QLoRA for base model to fit 15GB system RAM.
-Only embed_tokens is trainable (fp16, bnb never quantizes embedding layer).
+Trains embed_tokens, the LM head, and the last two decoder layers so that
+Stage 1 learns not only the embeddings but also the conditional pattern of
+emitting visual primitives inside the thinking chain.
 """
 
 import logging
@@ -30,24 +32,27 @@ SPECIAL_TOKENS = [
 def load_pretrain_model(
     model_name: str,
     attn_impl: str = "eager",
+    num_trainable_layers: int = 2,
+    unfreeze_vit_layers: int = 0,
 ) -> Tuple[Qwen3VLForConditionalGeneration, AutoProcessor, int]:
-    """Load Qwen3-VL in 4-bit for embedding-only pretrain.
+    """Load Qwen3-VL in 4-bit for lightweight format pretrain.
 
     Steps:
     1. Load base model with 4-bit quantization (~2GB RAM)
     2. Add special tokens to tokenizer
     3. resize_token_embeddings (embedding stays fp16, bnb skips it)
-    4. prepare_model_for_kbit_training
-    5. Freeze all parameters except embed_tokens
+    4. Freeze all parameters except embed_tokens, LM head, and the last
+       ``num_trainable_layers`` decoder layers.
+    5. Optionally unfreeze last ``unfreeze_vit_layers`` ViT blocks + merger.
 
     Memory: ~4-5GB total (safe for 15GB system RAM + 24GB VRAM)
 
     Returns:
-        model: 4-bit Qwen3VL with only embed_tokens trainable (fp16)
+        model: 4-bit Qwen3VL with embedding/LM head + top decoder layers trainable
         processor: Tokenizer with special tokens added
         old_vocab_size: Base vocab size before resize (151936)
     """
-    logger.info(f"Loading model: {model_name} (4-bit, embedding-only trainable)")
+    logger.info(f"Loading model: {model_name} (4-bit, embedding + top-{num_trainable_layers} layers trainable)")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -95,11 +100,7 @@ def load_pretrain_model(
             f"tokenizer ({new_tokenizer_len})"
         )
 
-    # 5. Skip prepare_model_for_kbit_training — backbone is frozen,
-    #    embedding layer stays fp16. Only embed_tokens receives gradients.
-    #    (prepare_model_for_kbit_training is for QLoRA training, not needed here)
-
-    # 6. Confirm weight tying
+    # 5. Confirm weight tying
     embed = model.get_input_embeddings()
     lm_head = model.get_output_embeddings()
     tied = embed.weight.data_ptr() == lm_head.weight.data_ptr()
@@ -107,7 +108,12 @@ def load_pretrain_model(
         f"embed_tokens & lm_head {'TIED' if tied else 'NOT tied'}"
     )
 
-    # 7. Freeze ALL parameters, then unfreeze only embed_tokens
+    # 6. Freeze ALL parameters, then unfreeze embed_tokens + LM head + the
+    #    last two decoder layers. Training a few top layers lets the model
+    #    learn the conditional pattern of emitting visual primitives inside
+    #    the thinking chain, not just the token embeddings in isolation.
+    #    This aligns Stage 1 with the paper's pretraining objective
+    #    (foundational visual primitive generation) under single-GPU constraints.
     for param in model.parameters():
         param.requires_grad = False
 
@@ -122,6 +128,48 @@ def load_pretrain_model(
     if not tied:
         lm_head.weight.requires_grad = True
         logger.info(f"  + lm_head.weight (NOT tied, {lm_head.weight.numel():,} params)")
+
+    # Unfreeze the last N language model decoder layers.
+    # Qwen3-VL model structure: model.model.layers[i]
+    decoder_layers = getattr(model.model, "layers", None)
+    if decoder_layers is not None and len(decoder_layers) >= num_trainable_layers:
+        for layer in decoder_layers[-num_trainable_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+        logger.info(
+            f"  + last {num_trainable_layers} decoder layers "
+            f"(layers {len(decoder_layers)-num_trainable_layers}-{len(decoder_layers)-1})"
+        )
+    else:
+        logger.warning("Could not locate decoder layers; only embedding/LM head will be trained.")
+
+    # 7. Optionally unfreeze the last N ViT blocks + merger (projection).
+    #    ViT layers learn with very low LR (e.g. 1e-6) while LLM layers use normal LR.
+    #    This experimentally tests whether fine-grained visual features improve
+    #    coordinate precision (paper-style approach).
+    if unfreeze_vit_layers > 0:
+        visual = getattr(model, "visual", None)
+        if visual is not None:
+            blocks = getattr(visual, "blocks", None)
+            if blocks is not None and len(blocks) >= unfreeze_vit_layers:
+                for block in blocks[-unfreeze_vit_layers:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+                n_params = sum(
+                    p.numel() for b in blocks[-unfreeze_vit_layers:]
+                    for p in b.parameters()
+                )
+                logger.info(
+                    f"  + last {unfreeze_vit_layers} ViT blocks "
+                    f"(blocks {len(blocks)-unfreeze_vit_layers}-{len(blocks)-1}, "
+                    f"{n_params:,} params)"
+                )
+            merger = getattr(visual, "merger", None)
+            if merger is not None:
+                for param in merger.parameters():
+                    param.requires_grad = True
+                n_params = sum(p.numel() for p in merger.parameters())
+                logger.info(f"  + ViT merger (vision→language projection, {n_params:,} params)")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())

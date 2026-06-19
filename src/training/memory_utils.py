@@ -44,6 +44,86 @@ def log_memory_status(prefix: str = ""):
         logger.info(msg)
 
 
+def build_param_groups(
+    model: torch.nn.Module,
+    base_lr: float,
+    vit_lr: float = 1e-6,
+) -> list[dict]:
+    """Build per-layer parameter groups for mixed-precision training.
+
+    Separates ViT blocks and merger from LLM parameters so they can use
+    different learning rates.  ViT layers should be trained with very low
+    LR (e.g. 1e-6) to avoid disrupting pretrained visual features.
+
+    Returns a list of dicts suitable for ``torch.optim.AdamW(params=...)``.
+    """
+    vit_params: list[torch.nn.Parameter] = []
+    merger_params: list[torch.nn.Parameter] = []
+    llm_params: list[torch.nn.Parameter] = []
+
+    def _is_vit_block(param: torch.nn.Parameter) -> bool:
+        """Heuristic: a param belongs to a ViT block if its name contains
+        'visual.blocks'."""
+        return False  # determined during iteration
+
+    # Access base model through PeftModel wrapper if present.
+    base = model.base_model.model if hasattr(model, "base_model") else model
+    visual = getattr(base, "visual", None)
+
+    vit_block_params: set[int] = set()
+    merger_param_ids: set[int] = set()
+    if visual is not None:
+        blocks = getattr(visual, "blocks", None)
+        if blocks is not None:
+            for block in blocks:
+                for p in block.parameters():
+                    if p.requires_grad:
+                        vit_block_params.add(id(p))
+        merger = getattr(visual, "merger", None)
+        if merger is not None:
+            for p in merger.parameters():
+                if p.requires_grad:
+                    merger_param_ids.add(id(p))
+
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in vit_block_params:
+            vit_params.append(p)
+        elif pid in merger_param_ids:
+            merger_params.append(p)
+        else:
+            llm_params.append(p)
+
+    groups: list[dict] = []
+    if llm_params:
+        groups.append({"params": llm_params, "lr": base_lr})
+        logger.info(
+            "Param groups: LLM %s params @ lr=%.1e",
+            f"{sum(p.numel() for p in llm_params):,}", base_lr,
+        )
+    if merger_params:
+        merger_lr = vit_lr * 10.0
+        groups.append({"params": merger_params, "lr": merger_lr})
+        logger.info(
+            "Param groups: ViT merger %s params @ lr=%.1e",
+            f"{sum(p.numel() for p in merger_params):,}", merger_lr,
+        )
+    if vit_params:
+        groups.append({"params": vit_params, "lr": vit_lr})
+        logger.info(
+            "Param groups: ViT blocks %s params @ lr=%.1e",
+            f"{sum(p.numel() for p in vit_params):,}", vit_lr,
+        )
+    if not groups:
+        # Fallback: all trainable params at base_lr
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        groups.append({"params": all_params, "lr": base_lr})
+
+    return groups
+
+
 class GPUMemoryMonitor(TrainerCallback):
     """Hugging Face Trainer callback to monitor GPU memory."""
 

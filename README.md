@@ -31,7 +31,7 @@ Unlike conventional approaches that treat grounding as a post-hoc verification s
 
 Since 24GB VRAM cannot accommodate online multi-rollout training for a 284B MoE model, this project adopts a **lightweight Separated Experts (Specialist) architecture + On-Policy Distillation (OPD)**, preserving the core idea while achieving single-GPU feasibility through **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit**.
 
-> **⚠️ Pretrain Limitation**: The original paper's pretrain involves **trillion-scale multimodal pretraining**, where the model builds the foundational ability of "visual primitives as thinking units" on massive web data. Due to compute constraints, Stage 1 of this project only performs **Format Pretraining** — teaching the model the syntax of outputting `<|box|>`, `<|point|>` and other special tokens. Stage 2 Visual Pretrain on COCO images compensates for the visual→coordinate grounding ability.
+> **⚠️ Pretrain Limitation**: The original paper's pretrain involves **trillion-scale multimodal pretraining** on 40M+ curated web grounding samples. Due to compute constraints, this project uses a **unified visual grounding pretrain** as the direct entry point — the model learns special token embeddings and visual→coordinate mapping simultaneously on COCO + CLEVR data via QLoRA, eliminating the split between text-only format learning and visual grounding. This is a closer approximation to the paper's approach than the previous two-stage text-then-visual split.
 
 ---
 
@@ -100,17 +100,16 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 Training Pipeline (Separated Experts + On-Policy Distillation)
 
 ```
-Stage 1:  Lightweight Format Pretrain  Text-only format SFT (embed + top-2 layers)  ~?    ✅
-Stage 2:  Visual Pretrain        COCO images + box/point visual pretrain      ~?    ✅
-Stage 2M: Merge LoRA             Merge visual pretrain LoRA into base model   ~27s   ✅
-Stage 3a: Box Expert SFT         Box-specific SFT with format-token weighting ~?    ✅
-Stage 3b: Point Expert SFT       Point+Maze SFT                               ~?    ✅ (including resume)
-Stage 4a: Box Expert GRPO        Box expert GRPO (3 rounds, default)          ~6h    (est.)
-Stage 4b: Point Expert GRPO      Point expert GRPO (3 rounds, default)        ~6h    (est.)
-Stage 5:  Unified RFT            Expert-generated rollouts → Unified learning ~5h    (est.)
-Stage 6:  OPD                    On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
-                              ──────────────────────────────────────────────
-                              Total (measured):                           ~52h
+Stage 1:  Unified Visual Pretrain  COCO + CLEVR images, box/point grounding  ~?    ✅
+Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~27s   ✅
+Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~?  ✅
+Stage 3b: Point Expert SFT         Point+Maze SFT                             ~?    ✅ (including resume)
+Stage 4a: Box Expert GRPO          Box expert GRPO (3 rounds, default)        ~6h    (est.)
+Stage 4b: Point Expert GRPO        Point expert GRPO (3 rounds, default)      ~6h    (est.)
+Stage 5:  Unified RFT              Expert-generated rollouts → Unified learning ~5h  (est.)
+Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
+                                ──────────────────────────────────────────────
+                                Total (measured):                           ~52h
 ```
 
 **Core Design**:
@@ -121,43 +120,18 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student||expert)) 
 - **On-Policy Distillation (OPD)**: Uses D_KL(student || expert) to consolidate both specialists into a single Unified model
 - **Three-Step Thinking (CoT)**: Intent Analysis → Grounding → Summarization
 
-### Stage 1: Text Pretrain (Format Pretraining) ✅
+### Stage 1: Unified Visual Grounding Pretrain ✅
 
-**Text-only training, no images**. Only trains `embed_tokens` layers. Programmatically generated samples.
+**Training on COCO + CLEVR images** to establish "visual feature → coordinate" mapping from the start. Special tokens (`<|box|>`, `<|point|>`) are randomly initialized and learned alongside the LoRA adapter — no separate text-only format pretrain needed.
 
-> **Current config**: `num_samples=30000`, `num_epochs=3`, `batch_size=4`, `gradient_accumulation_steps=1` (effective batch=4), `max_length=256`, `learning_rate=2e-4`, curriculum enabled.
-> - Trainable params: ~389M
-> - Output: `outputs/stage1_pretrain/pretrain_state_dict.pt`
-> - *Timings above reflect the previous 10K/2-epoch fast-run config and will be updated after the next full run.*
+> **Current config**: `num_box=30000`, `num_point=10000`, `num_clevr=5000` (total 45K samples), `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4` (effective batch=4), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum enabled.
+> - Output: `outputs/stage1_visual_pretrain/`
 
 ```bash
-python scripts/run_stage1_pretrain.py --config configs/stage1_pretrain.yaml
+python scripts/run_stage1_visual_pretrain.py --config configs/stage1_visual_pretrain.yaml
 ```
 
-> **Optional COCO grounding mix**: To move closer to the paper's real grounding pretraining while keeping Stage 1 lightweight, you can mix in real COCO categories + coordinates (still text-only, no images processed):
-> ```bash
-> python scripts/run_stage1_pretrain.py \
->     --coco_grounding_ratio 0.3 \
->     --coco_ann_file data/coco/annotations/instances_train2017.json
-> ```
-
-**Output**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
-
----
-
-### Stage 2: Visual Pretrain ✅
-
-**Training on COCO images** to establish real "visual features → coordinates" mapping. No random coordinate guessing.
-
-> **Current config**: `num_box=30000`, `num_point=10000` (total 40K samples), `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4` (effective batch=4), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum enabled.
-> - Output: `outputs/stage2_visual_pretrain/`
-> - *Timings above reflect the previous 20K/1-epoch fast-run config and will be updated after the next full run.*
-
-```bash
-python scripts/run_stage2_visual_pretrain.py --config configs/stage2_visual_pretrain.yaml
-```
-
-**Output**: `outputs/stage2_visual_pretrain/`
+**Output**: `outputs/stage1_visual_pretrain/`
 
 ---
 
@@ -165,15 +139,12 @@ python scripts/run_stage2_visual_pretrain.py --config configs/stage2_visual_pret
 
 **Must merge!** Avoid stacking double LoRA layers.
 
-`merge_stage2.py` now also injects the Stage 1 pretrained special-token embeddings before merging, so the merged base keeps the `<|box|>` / `<|point|>` representations learned in Stage 1.
-
-> **Actual run**: merge duration **~27s**.
+Special token embeddings are learned during Stage 1 visual pretrain together with the LoRA adapter — no separate pretrain embedding injection needed.
 
 ```bash
 python scripts/merge_stage2.py \
     --base_model models/Qwen3-VL-4B-Thinking \
-    --adapter_path outputs/stage2_visual_pretrain \
-    --pretrain_embedding_path outputs/stage1_pretrain/pretrain_state_dict.pt \
+    --adapter_path outputs/stage1_visual_pretrain \
     --output_dir outputs/stage2_merged_base
 ```
 
@@ -525,8 +496,7 @@ Samples failing any check are discarded before training, ensuring high-quality c
 ```
 tvp-4b-5090d/
 ├── configs/                          # YAML training configs
-│   ├── stage1_pretrain.yaml
-│   ├── stage2_visual_pretrain.yaml
+│   ├── stage1_visual_pretrain.yaml
 │   ├── stage3a_sft_box.yaml
 │   ├── stage3b_sft_point.yaml
 │   ├── stage4a_grpo_box.yaml
@@ -579,10 +549,8 @@ tvp-4b-5090d/
 │           ├── quality_rm.py         # Quality Reward Model (rule-based)
 │           └── accuracy_rm.py        # Accuracy Reward Model (process_reward, compute_total_reward)
 ├── scripts/                          # Stage entry scripts
-│   ├── generate_pretrain_data.py     # Pretrain data generator
-│   ├── run_stage1_pretrain.py        # Stage 1: Text + Visual Pretrain
-│   ├── run_stage2_visual_pretrain.py # Stage 2: Visual Pretrain
-│   ├── merge_stage2.py               # Stage 2 LoRA Merge + embedding injection
+│   ├── run_stage1_visual_pretrain.py  # Stage 1: Unified Visual Grounding Pretrain
+│   ├── merge_stage2.py               # Stage 2: Merge LoRA
 │   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
 │   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
 │   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
@@ -609,8 +577,7 @@ tvp-4b-5090d/
 │   ├── test_logging_utils.py         # Logging utility tests
 │   └── test_filter_normal_level_data.py # Difficulty filter tests
 ├── outputs/                          # Training artifacts (organized by stage)
-│   ├── stage1_pretrain/              # embedding state_dict
-│   ├── stage2_visual_pretrain/       # LoRA adapter + checkpoints
+│   ├── stage1_visual_pretrain/       # LoRA adapter + checkpoints
 │   ├── stage2_merged_base/           # Merged full model
 │   ├── stage3a_sft_box/              # Box Expert SFT adapter
 │   ├── stage3b_sft_point/            # Point Expert SFT adapter
@@ -620,7 +587,6 @@ tvp-4b-5090d/
 │   └── stage6_opd/                   # On-Policy Distillation output
 ├── logs/                             # Training logs per stage
 ├── data/
-│   ├── pretrain/pretrain_data.json   # Format pretrain data
 │   ├── coco/                         # COCO dataset (manual download)
 │   └── cache/maze/                   # Maze image cache
 ├── models/Qwen3-VL-4B-Thinking/     # Base model (manual download)
@@ -711,19 +677,19 @@ And this project:
 This reproduction prioritizes the **core idea** (visual primitives as reasoning units) within single-GPU constraints. Below are the main remaining gaps and concrete ways to move closer to the paper without re-implementing trillion-scale pretraining:
 
 ### Stage 1 — Pretraining
-- **Current**: Text-only format pretraining (synthetic dialogues teaching special-token syntax).
+- **Current**: Unified visual grounding pretrain on COCO + CLEVR images via QLoRA. Special tokens are randomly initialized and learned alongside visual features. No separate text-only format pretrain.
 - **Paper**: Large-scale multimodal pretraining on 40M+ curated web grounding samples.
 - **Practical next steps**:
-  1. Replace or augment the synthetic text data with real image-text grounding pairs (COCO grounding, Flickr30k Entities, RefCOCO, etc.). Even 100K–1M real samples would move the model from "format-aware" toward "visually grounded".
+  1. Increase data diversity beyond COCO + CLEVR — add Flickr30k Entities, RefCOCO, SA-1B samples, or domain-specific grounding datasets. Even 100K–1M real samples from diverse domains would improve generalization.
   2. If web scraping is infeasible, use publicly available detection/grounding datasets and apply the same two-step filtering logic (semantic + geometric) described in Sec 2.3.3.
-  3. Keep the special-token embedding warm-up, but train on real images as soon as possible so the visual projection learns coordinate semantics.
+  3. Unfreeze the last few ViT layers (`--unfreeze_vit_layers 2-4`) to allow visual features to better adapt to the coordinate prediction task.
 
-### Stage 2 — Visual Pretraining
-- **Current**: Qwen3-VL ViT is frozen; only projection + LLM LoRA are trained on COCO.
+### Stage 1 Visual Pretrain — Further Data Diversity
+- **Current**: COCO + CLEVR synthetic data trained via QLoRA with ViT frozen.
 - **Paper**: DeepSeek-ViT + 3×3 token compression + CSA 4× KV-cache compression, trained end-to-end on massive data.
 - **Practical next steps**:
-  1. Document that ViT freezing is a hardware concession: Qwen3-VL's ViT is already pretrained and we cannot reproduce CSA. Unfreezing the ViT (or parts of it) with an even lower LR is the closest approximation, but watch VRAM closely.
-  2. Increase the diversity of visual pretraining data beyond COCO (e.g., add SA-1B samples, synthetic shapes, or domain-specific grounding datasets).
+  1. Increase the diversity of visual pretraining data beyond COCO + CLEVR (e.g., add SA-1B samples, synthetic shapes, or domain-specific grounding datasets).
+  2. Unfreeze the last few ViT layers (`--unfreeze_vit_layers 2-4`) with a very low LR for better coordinate precision.
 
 ### Stage 3 — Cold-Start SFT
 - **Current**: COCO box/point/counting + synthetic CLEVR + recursive-backtracking mazes + path tracing.

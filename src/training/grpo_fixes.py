@@ -4,9 +4,14 @@ Monkey-patch fixes for TRL GRPOTrainer multimodal alignment with Qwen3-VL.
 Fix 1: Rebuild mm_token_type_ids from input_ids to fix padding direction mismatch.
 Fix 2: Strip generated image/video pad tokens from completion_ids to prevent
        orphan image tokens without matching pixel_values features.
+
+.. warning::
+   These patches target private GRPOTrainer methods and are verified for
+   TRL 1.6.x only.  A ``UserWarning`` is emitted for untested versions.
 """
 
 import re as _re
+import warnings
 
 import torch
 
@@ -16,10 +21,35 @@ def apply_grpo_fixes(trainer_class):
 
     Idempotent: patches are applied at most once per class to avoid nested
     wrappers and accidental in-place modifications stacking across rounds.
+
+    Emits a ``UserWarning`` when the installed TRL version is outside the
+    tested range (1.6.0 – 1.6.x).
     """
     attr = "_grpo_fixes_applied"
     if getattr(trainer_class, attr, False):
         return
+
+    # ── Version guard ──────────────────────────────────────────────
+    try:
+        from packaging.version import Version
+
+        import trl
+    except ImportError:
+        warnings.warn(
+            "Cannot determine TRL version; GRPO monkey-patches may not work correctly."
+        )
+    else:
+        current = Version(trl.__version__)
+        required = Version("1.6.0")
+        max_known = Version("1.7.0")
+        if current < required or current >= max_known:
+            warnings.warn(
+                f"GRPO monkey-patches were verified for TRL {required} – "
+                f"{max_known}.  Current TRL version is {trl.__version__}. "
+                f"The patches may not behave correctly — verify training results carefully.",
+                stacklevel=2,
+            )
+
     _patch_prepare_inputs(trainer_class)
     _patch_get_per_token_logps_and_entropies(trainer_class)
     _patch_log_completions(trainer_class)

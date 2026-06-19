@@ -7,6 +7,7 @@ underlying annotations before it is used for SFT / GRPO / RFT training.
 import re
 from typing import Dict, List, Tuple
 
+from ..models.visual_primitive_parser import PrimitiveParser
 from .constants import BOX_OPEN, BOX_CLOSE, POINT_OPEN, POINT_CLOSE
 
 
@@ -23,46 +24,17 @@ def _parse_int(text: str) -> int | None:
 
 def _parse_boxes(text: str) -> List[Tuple[int, int, int, int]]:
     """Parse all boxes from text as (x1, y1, x2, y2)."""
-    boxes = []
-    pattern = re.compile(re.escape(BOX_OPEN) + r"(.*?)" + re.escape(BOX_CLOSE))
-    for match in pattern.finditer(text):
-        coords_str = match.group(1)
-        try:
-            nums = [int(float(x.strip())) for x in coords_str.strip("[]").split(",")]
-            if len(nums) == 4:
-                boxes.append((nums[0], nums[1], nums[2], nums[3]))
-            elif len(nums) > 4 and len(nums) % 4 == 0:
-                for i in range(0, len(nums), 4):
-                    boxes.append((nums[i], nums[i + 1], nums[i + 2], nums[i + 3]))
-        except (ValueError, IndexError):
-            continue
-    return boxes
+    return PrimitiveParser.extract_boxes(text)
 
 
 def _parse_points(text: str) -> List[Tuple[int, int]]:
     """Parse all points from text as (x, y)."""
-    points = []
-    pattern = re.compile(re.escape(POINT_OPEN) + r"(.*?)" + re.escape(POINT_CLOSE))
-    for match in pattern.finditer(text):
-        coords_str = match.group(1)
-        try:
-            nums = [int(float(x.strip())) for x in coords_str.strip("[]").split(",")]
-            if len(nums) == 2:
-                points.append((nums[0], nums[1]))
-            elif len(nums) > 2 and len(nums) % 2 == 0:
-                for i in range(0, len(nums), 2):
-                    points.append((nums[i], nums[i + 1]))
-        except (ValueError, IndexError):
-            continue
-    return points
+    return PrimitiveParser.extract_points(text)
 
 
 def _tags_paired(text: str) -> bool:
     """Check that primitive tags are properly paired."""
-    return (
-        text.count(BOX_OPEN) == text.count(BOX_CLOSE)
-        and text.count(POINT_OPEN) == text.count(POINT_CLOSE)
-    )
+    return PrimitiveParser.validate_syntax(text)
 
 
 def _coords_in_range(coords: List[int]) -> bool:

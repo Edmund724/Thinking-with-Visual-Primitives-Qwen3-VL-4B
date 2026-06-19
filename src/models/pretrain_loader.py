@@ -17,16 +17,9 @@ from transformers import (
     Qwen3VLForConditionalGeneration,
 )
 
-from ..utils.constants import BASE_VOCAB_SIZE
+from ..utils.constants import BASE_VOCAB_SIZE, SPECIAL_TOKENS
 
 logger = logging.getLogger(__name__)
-
-# 6 special tokens for visual primitives
-SPECIAL_TOKENS = [
-    "<|box|>", "<|/box|>",
-    "<|point|>", "<|/point|>",
-    "<|ref|>", "<|/ref|>",
-]
 
 
 def load_pretrain_model(

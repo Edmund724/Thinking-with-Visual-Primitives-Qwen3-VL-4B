@@ -1,11 +1,13 @@
 # Stage 3b: Specialized SFT — Point Expert
 model_path: outputs/stage2_merged_base
 output_dir: outputs/stage3b_sft_point
+coco_image_dir: data/coco/train2017
+coco_ann_file: data/coco/annotations/instances_train2017.json
 max_seq_length: 2048
-per_device_batch_size: 1
+batch_size: 1
 gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
-num_train_epochs: 1
+num_epochs: 1
 lora_r: 256
 lora_alpha: 512
 lora_dropout: 0.05

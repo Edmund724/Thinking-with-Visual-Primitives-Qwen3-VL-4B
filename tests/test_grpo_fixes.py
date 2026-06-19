@@ -81,7 +81,38 @@ def test_strip_image_pad_tokens_clones_input_ids():
     print("test_strip_image_pad_tokens_clones_input_ids PASSED")
 
 
+def test_version_guard_warns():
+    """Version guard should warn for TRL outside tested range."""
+    import warnings
+
+    # Fresh class to avoid side effects from idempotency test.
+    FreshGRPOTrainer = _restore_grpo_trainer()
+
+    # Mock the TRL version to something untested.
+    with _mock_trl_version("2.0.0"):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            apply_grpo_fixes(FreshGRPOTrainer)
+            version_warnings = [
+                x for x in w
+                if "GRPO monkey-patches were verified" in str(x.message)
+            ]
+            assert len(version_warnings) > 0, (
+                "Should emit a UserWarning for untested TRL version"
+            )
+    print("test_version_guard_warns PASSED")
+
+
+def _mock_trl_version(version_str: str):
+    """Context manager that temporarily patches trl.__version__."""
+    from unittest.mock import patch
+
+    import trl
+    return patch.object(trl, "__version__", version_str)
+
+
 if __name__ == "__main__":
     test_apply_grpo_fixes_is_idempotent()
     test_strip_image_pad_tokens_clones_input_ids()
+    test_version_guard_warns()
     print("\n=== GRPO fixes tests PASSED ===")

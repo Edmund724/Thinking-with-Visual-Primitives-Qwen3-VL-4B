@@ -31,7 +31,7 @@
 
 由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级 Separated Experts（Specialist）架构 + On-Policy Distillation (OPD)**，在保持核心思想不变的前提下，通过 **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
 
-> **⚠️ Pretrain Limitation**: 原论文的 Pretrain 是 **trillion-scale 多模态预训练**，模型在海量 web 数据上建立"Visual Primitives 作为思维单元"的基础能力。由于算力限制，本项目的 Stage 1 仅做 **Format Pretraining（格式预训练）**——让模型学会输出 `<|box|>`、`<|point|>` 等特殊 token 的语法格式。后续 Stage 2 Visual Pretrain 在 COCO 图像上补偿视觉→坐标的 Grounding 能力。
+> **⚠️ Pretrain Limitation**: 原论文的 Pretrain 是 **trillion-scale 多模态预训练**，模型在 4000 万+ 筛选后的网页 grounding 数据上建立"Visual Primitives 作为思维单元"的基础能力。由于算力限制，本项目采用**统一视觉 Grounding 预训练**作为直接入口——模型在 COCO + CLEVR 数据上通过 QLoRA 同时学习 special token embedding 和视觉→坐标映射，避免了先文本后视觉的分裂路径，更贴近论文的单阶段多模态预训练范式。
 
 ---
 
@@ -100,17 +100,16 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + On-Policy Distillation）
 
 ```
-Stage 1:  Lightweight Format Pretrain  文本格式预训练（embed + 顶层 2 层）      ~?    ✅
-Stage 2:  Visual Pretrain        COCO 图像 + box/point 视觉预训练        ~?    ✅
-Stage 2M: Merge LoRA             将视觉预训练 LoRA 合并入基座模型          ~27s   ✅
-Stage 3a: Box Expert SFT         格式 token 加权的 Box 专项 SFT           ~?    ✅
-Stage 3b: Point Expert SFT       Point+Maze 专项 SFT                      ~?    ✅ (含 resume)
-Stage 4a: Box Expert GRPO        Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
-Stage 4b: Point Expert GRPO      Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
-Stage 5:  Unified RFT            专家生成 rollout → Unified 学习         ~5h    (预计)
-Stage 6:  OPD                    On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
-                              ──────────────────────────────────────────────
-                              Total（已实测部分）:                         ~52h
+Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~?    ✅
+Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型          ~27s   ✅
+Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~?    ✅
+Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~?    ✅ (含 resume)
+Stage 4a: Box Expert GRPO         Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
+Stage 4b: Point Expert GRPO       Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
+Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~5h    (预计)
+Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
+                                ──────────────────────────────────────────────
+                                Total（已实测部分）:                         ~52h
 ```
 
 **核心设计**：
@@ -121,43 +120,18 @@ Stage 6:  OPD                    On-Policy Distillation (D_KL(student || expert)
 - **On-Policy Distillation (OPD)**：用 D_KL(student || expert) 将两个 Specialist 的能力蒸馏到单个 Unified 模型
 - **三步 Chain-of-Thought**：Intent Analysis（意图分析）→ Grounding → Summarization（总结）
 
-### Stage 1: Text Pretrain（格式预训练）✅
+### Stage 1: Unified Visual Grounding Pretrain（统一视觉 Grounding 预训练）✅
 
-**纯文本训练，无图像**。只训练 `embed_tokens` 层。程序化生成样本。
+**在 COCO + CLEVR 图像上训练**，从零开始建立"视觉特征 → 坐标"的真实映射。Special token（`<|box|>`、`<|point|>`）从随机初始化开始，与 LoRA adapter 同时学习——不需要独立的文本格式预训练。
 
-> **当前默认配置**：`num_samples=30000`, `num_epochs=3`, `batch_size=4`, `gradient_accumulation_steps=1`（有效 batch=4）, `max_length=256`, `learning_rate=2e-4`，启用 curriculum。
-> - 可训练参数量：~389M
-> - 输出：`outputs/stage1_pretrain/pretrain_state_dict.pt`
-> - *上方旧耗时为 10K/2 epoch 快速跑通配置，新配置耗时将在下次完整跑完后更新。*
+> **当前默认配置**：`num_box=30000`, `num_point=10000`, `num_clevr=5000`（共 45K 样本）, `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4`（有效 batch=4）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`，启用 curriculum。
+> - 输出：`outputs/stage1_visual_pretrain/`
 
 ```bash
-python scripts/run_stage1_pretrain.py --config configs/stage1_pretrain.yaml
+python scripts/run_stage1_visual_pretrain.py --config configs/stage1_visual_pretrain.yaml
 ```
 
-> **可选 COCO grounding 混合**：在保持 Stage 1 轻量的前提下，可混入真实 COCO 类别与坐标（仍为文本，不处理图像），让格式预训练更接近论文的真实 grounding 预训练：
-> ```bash
-> python scripts/run_stage1_pretrain.py \
->     --coco_grounding_ratio 0.3 \
->     --coco_ann_file data/coco/annotations/instances_train2017.json
-> ```
-
-**输出**: `outputs/stage1_pretrain/pretrain_state_dict.pt`
-
----
-
-### Stage 2: Visual Pretrain（视觉预训练）✅
-
-**在 COCO 图像上训练**，建立"视觉特征 → 坐标"的真实映射。不是随机猜坐标。
-
-> **当前默认配置**：`num_box=30000`, `num_point=10000`（共 40K 样本）, `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4`（有效 batch=4）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`，启用 curriculum。
-> - 输出：`outputs/stage2_visual_pretrain/`
-> - *上方旧耗时为 20K/1 epoch 快速跑通配置，新配置耗时将在下次完整跑完后更新。*
-
-```bash
-python scripts/run_stage2_visual_pretrain.py --config configs/stage2_visual_pretrain.yaml
-```
-
-**输出**: `outputs/stage2_visual_pretrain/`
+**输出**: `outputs/stage1_visual_pretrain/`
 
 ---
 
@@ -165,19 +139,27 @@ python scripts/run_stage2_visual_pretrain.py --config configs/stage2_visual_pret
 
 **必须合并**！避免双层 LoRA 叠加。
 
-`merge_stage2.py` 现在会在合并前注入 Stage 1 预训练好的特殊 token embedding，保证合并后的基座模型保留 `<|box|>` / `<|point|>` 的表示能力。
-
-> **本次真实耗时**：**~27 s**。
+Special token embedding 在 Stage 1 中与 LoRA adapter 一同学习，无需额外的 pretrain embedding 注入。
 
 ```bash
 python scripts/merge_stage2.py \
     --base_model models/Qwen3-VL-4B-Thinking \
-    --adapter_path outputs/stage2_visual_pretrain \
-    --pretrain_embedding_path outputs/stage1_pretrain/pretrain_state_dict.pt \
+    --adapter_path outputs/stage1_visual_pretrain \
     --output_dir outputs/stage2_merged_base
 ```
 
 **输出**: `outputs/stage2_merged_base/`（完整 bf16 模型，~8.8GB `model.safetensors`）
+
+> **合并后是否需要验证再进入 Stage 3？**  
+> 严格来说不需要——`merge_stage2.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
+>
+> ```bash
+> python scripts/smoke_test_stage2.py
+> # 或指定图片 / 问题
+> python scripts/smoke_test_stage2.py \
+>     --image_path data/coco/train2017/000000000009.jpg \
+>     --question "Locate the main object in the image. Mark it with a box."
+> ```
 
 > **合并后是否需要验证再进入 Stage 3？**  
 > 严格来说不需要——`merge_stage2.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但因为刚刚修复了数据格式和 reward，建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
@@ -523,8 +505,7 @@ iou   = PrimitiveParser.box_iou(pred, gt)              # 几何计算
 ```
 tvp-4b-5090d/
 ├── configs/                          # YAML 训练配置
-│   ├── stage1_pretrain.yaml
-│   ├── stage2_visual_pretrain.yaml
+│   ├── stage1_visual_pretrain.yaml
 │   ├── stage3a_sft_box.yaml
 │   ├── stage3b_sft_point.yaml
 │   ├── stage4a_grpo_box.yaml
@@ -577,10 +558,8 @@ tvp-4b-5090d/
 │           ├── quality_rm.py         # Quality Reward Model（规则版）
 │           └── accuracy_rm.py        # Accuracy Reward Model（process_reward, compute_total_reward）
 ├── scripts/                          # 阶段入口脚本
-│   ├── generate_pretrain_data.py     # 预训练数据生成器
-│   ├── run_stage1_pretrain.py        # Stage 1: Text + Visual Pretrain
-│   ├── run_stage2_visual_pretrain.py # Stage 2: Visual Pretrain
-│   ├── merge_stage2.py               # Stage 2 LoRA Merge + embedding 注入
+│   ├── run_stage1_visual_pretrain.py  # Stage 1: 统一视觉 Grounding 预训练
+│   ├── merge_stage2.py               # Stage 2: Merge LoRA
 │   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
 │   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
 │   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
@@ -607,8 +586,7 @@ tvp-4b-5090d/
 │   ├── test_logging_utils.py         # 日志工具测试
 │   └── test_filter_normal_level_data.py # 难度过滤器测试
 ├── outputs/                          # 训练产物（按 stage 组织）
-│   ├── stage1_pretrain/              # embedding state_dict
-│   ├── stage2_visual_pretrain/       # LoRA adapter + checkpoints
+│   ├── stage1_visual_pretrain/       # LoRA adapter + checkpoints
 │   ├── stage2_merged_base/           # merge 后的完整模型
 │   ├── stage3a_sft_box/              # Box Expert SFT adapter
 │   ├── stage3b_sft_point/            # Point Expert SFT adapter
@@ -618,7 +596,6 @@ tvp-4b-5090d/
 │   └── stage6_opd/                   # On-Policy Distillation 蒸馏产物
 ├── logs/                             # 各 stage 训练日志
 ├── data/
-│   ├── pretrain/pretrain_data.json   # 格式预训练数据
 │   ├── coco/                         # COCO 数据集（需手动下载）
 │   └── cache/maze/                   # 迷宫图片缓存
 ├── models/Qwen3-VL-4B-Thinking/     # 基座模型（需手动下载）
@@ -709,19 +686,19 @@ pytest tests/ -v
 本复现优先保证**核心思想**（视觉原语作为推理单元）在单卡约束下可跑。以下是在不重建万亿级预训练的前提下，仍可逐步缩小与原文差距的具体方向：
 
 ### Stage 1 — 预训练
-- **当前**: 纯文本格式预训练（合成对话教会特殊 token 语法）。
+- **当前**: 统一视觉 Grounding 预训练，COCO + CLEVR 图像通过 QLoRA 训练。Special token 随机初始化，与视觉特征同时学习，不再有独立的文本格式预训练。
 - **论文**: 在 4000 万+ 筛选后的网页 grounding 数据上进行万亿级多模态预训练。
 - **可行优化**:
-  1. 用真实图像-文本 grounding 数据（COCO grounding、Flickr30k Entities、RefCOCO 等）替换或增补合成文本数据；10 万~100 万真实样本即可让模型从“懂格式”迈向“有视觉 ground”。
+  1. 扩充视觉预训练数据来源（Flickr30k Entities、RefCOCO、SA-1B 样本等），10 万~100 万来自不同域的真实样本即可提升泛化能力。
   2. 若无法做网页抓取，可在公开检测/grounding 数据集上复现论文的两步过滤（语义审查 + 几何质量审查）。
-  3. 保留特殊 token embedding 预热，但尽早加入真实图像训练，让视觉投影学到坐标语义。
+  3. 解冻 ViT 最后几层（`--unfreeze_vit_layers 2-4`），让视觉特征更好地适配坐标预测任务。
 
-### Stage 2 — 视觉预训练
-- **当前**: 冻结 Qwen3-VL ViT，只训练 projection + LLM LoRA，数据为 COCO。
+### Stage 1 视觉预训练 — 进一步提升数据多样性
+- **当前**: COCO + CLEVR 合成数据，通过 QLoRA 训练，ViT 冻结。
 - **论文**: DeepSeek-ViT + 3×3 token 压缩 + CSA 4× KV-cache 压缩，端到端海量数据训练。
 - **可行优化**:
-  1. 明确记录“冻结 ViT”是算力妥协；若显存允许，可尝试以极低学习率解冻部分 ViT 层。
-  2. 扩充视觉预训练数据来源（SA-1B、合成几何图形、领域 grounding 数据集等）。
+  1. 扩充视觉预训练数据来源（SA-1B、合成几何图形、领域 grounding 数据集等）。
+  2. 若显存允许，以极低学习率解冻部分 ViT 层（`--unfreeze_vit_layers 2-4`）。
 
 ### Stage 3 — Cold-Start SFT
 - **当前**: COCO box/point/counting + 简化 CLEVR + 单算法矩形迷宫 + path tracing。

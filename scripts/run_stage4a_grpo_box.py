@@ -6,49 +6,29 @@ Uses Format RM + Accuracy RM with difficulty grading (Normal only).
 """
 
 import os
-import gc
+
+import sys
 from pathlib import Path
-
-import torch
-from trl import GRPOConfig, GRPOTrainer
-
-from src.data.datasets.grpo_dataset import GRPODataset
-from src.training.grpo_fixes import apply_grpo_fixes
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+from src.training.grpo_runner import run_grpo_rounds
 from src.training.grpo_utils import extract_completion_text
 from src.data.generators.coco_box_generator import (
     generate_coco_box_samples,
     generate_coco_counting_samples,
 )
 from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
-from src.models.qwen_vl_loader import load_qlora_model, _set_use_cache_deep
-from src.training.memory_utils import log_memory_status, clear_memory, GPUMemoryMonitor
-from src.training.callbacks import (
-    ValidationSubsetEarlyStoppingCallback,
-    maybe_compile_model,
-)
+from src.models.qwen_vl_loader import load_qlora_model
+from src.training.memory_utils import log_memory_status
+from src.training.callbacks import maybe_compile_model
 from src.training.stage_runner import StageRunner
-from src.utils.constants import GPU_MEMORY_WARNING_GB
 from src.utils.difficulty import filter_normal_level_data
 from src.utils.reward.accuracy_rm import compute_total_reward, length_reward
 from src.utils.reward.quality_rm import make_quality_reward_fn
 from src.utils.quality_rm_api import make_quality_reward_api_fn
 
 logger = None  # Set by train() from runner.logger
-
-
-def _latest_checkpoint(round_dir: Path) -> Path | None:
-    """Return the latest checkpoint-* directory inside a round dir, or None."""
-    checkpoints = [p for p in round_dir.glob("checkpoint-*") if p.is_dir()]
-    if not checkpoints:
-        return None
-
-    def _step(p: Path) -> int:
-        try:
-            return int(p.name.split("-")[-1])
-        except ValueError:
-            return -1
-
-    return max(checkpoints, key=_step)
 
 
 def make_box_reward_fn(iou_threshold: float, tokenizer=None):
@@ -161,7 +141,6 @@ def train(runner: StageRunner) -> None:
     all_data = runner.cached_data(cache_path, _generate_data)
 
     num_rounds = args.num_rounds
-    iou_thresholds = [0.3, 0.5, 0.7]
 
     # Difficulty filtering: keep only Normal-level samples (paper Sec 2.5.2).
     filtered_cache_path = os.path.join(args.output_dir, "filtered_train_data_cache.pkl")
@@ -175,158 +154,35 @@ def train(runner: StageRunner) -> None:
             num_generations=args.num_generations,
             max_completion_length=args.filter_max_completion_length,
             task_type="box",
-            iou_threshold=iou_thresholds[0] if num_rounds > 0 else 0.5,
+            iou_threshold=0.3 if num_rounds > 0 else 0.5,
             batch_size=args.filter_batch_size,
             empty_cache_every=args.filter_empty_cache_every,
             logger=logger,
         ))
 
-    # Apply monkey-patches once, before training. Applying inside the round loop
-    # would nest wrappers on each iteration.
-    apply_grpo_fixes(GRPOTrainer)
+    # Build quality RM factory (captures use_quality_rm_api flag in closure).
+    quality_fn_factory = (
+        make_quality_reward_api_fn if args.use_quality_rm_api
+        else make_quality_reward_fn
+    )
 
-    for round_idx in range(num_rounds):
-        iou_th = iou_thresholds[round_idx] if round_idx < len(iou_thresholds) else 0.7
-        round_dir = Path(args.output_dir) / f"round_{round_idx + 1}"
+    # Reward factory: box-specific reward with accuracy + length penalty.
+    def reward_fn_factory(threshold: float, **kwargs):
+        return make_box_reward_fn(threshold, **kwargs)
 
-        # Skip already-completed rounds
-        round_adapter = round_dir / "adapter_model.safetensors"
-        if round_adapter.exists():
-            logger.info(f"Round {round_idx + 1}/{num_rounds} already done ({round_adapter}), skipping.")
-            # Reload for next round
-            try:
-                policy_model, processor = load_qlora_model(
-                    model_name=str(round_dir),
-                    lora_r=args.lora_r,
-                    lora_alpha=args.lora_alpha,
-                )
-            except Exception as e:
-                logger.warning(f"Could not reload round {round_idx + 1}: {e}")
-            continue
-
-        round_dir.mkdir(parents=True, exist_ok=True)
-
-        logger.info(f"{'='*60}")
-        logger.info(f"GRPO Round {round_idx + 1}/{num_rounds} (IoU threshold: {iou_th})")
-        logger.info(f"{'='*60}")
-
-        # If this round was interrupted, resume from the latest checkpoint-*
-        # instead of restarting the whole round.
-        resume_from = _latest_checkpoint(round_dir)
-        if resume_from is not None:
-            logger.info(
-                f"Found checkpoint {resume_from.name} for round {round_idx + 1}, resuming."
-            )
-            try:
-                policy_model, processor = load_qlora_model(
-                    model_name=str(resume_from),
-                    lora_r=args.lora_r,
-                    lora_alpha=args.lora_alpha,
-                )
-                log_memory_status(f"Loaded checkpoint {resume_from.name}:")
-            except Exception as e:
-                logger.warning(f"Could not load checkpoint {resume_from}: {e}, starting from scratch.")
-                resume_from = None
-
-        reward_fn = make_box_reward_fn(iou_th, tokenizer=processor.tokenizer)
-
-        grpo_config = GRPOConfig(
-            output_dir=str(round_dir),
-            num_train_epochs=args.num_epochs,
-            per_device_train_batch_size=args.batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.learning_rate,
-            warmup_steps=args.warmup_steps,
-            logging_steps=args.logging_steps,
-            save_steps=args.save_steps,
-            save_total_limit=2,
-            bf16=True,
-            optim="paged_adamw_8bit",
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            dataloader_num_workers=0,
-            remove_unused_columns=False,
-            report_to="none",
-            max_grad_norm=0.3,
-            lr_scheduler_type="cosine",
-            num_generations=args.num_generations,
-            generation_batch_size=args.batch_size,
-            max_completion_length=args.max_completion_length,
-            beta=args.beta,
-            temperature=args.temperature,
-            scale_rewards="group",
-            disable_tqdm=args.disable_tqdm,
-        )
-
-        dataset = GRPODataset(all_data)
-
-        # use_cache is incompatible with gradient checkpointing; disable on all nested configs
-        _set_use_cache_deep(policy_model)
-
-        # Memory monitor threshold: 85% of total VRAM (5090D = ~27 GB) so we
-        # clear cache before fragmentation pushes us into OOM territory.
-        total_vram_gb = (
-            torch.cuda.get_device_properties(0).total_memory / 1e9
-            if torch.cuda.is_available()
-            else 0.0
-        )
-        mem_threshold_gb = max(GPU_MEMORY_WARNING_GB, total_vram_gb * 0.85)
-
-        if args.use_quality_rm_api:
-            quality_fn = make_quality_reward_api_fn(
-                tokenizer=processor.tokenizer, task_type_default="box"
-            )
-        else:
-            quality_fn = make_quality_reward_fn(
-                tokenizer=processor.tokenizer, task_type_default="box"
-            )
-
-        callbacks = [GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb)]
-        if args.early_stopping_subset_size > 0:
-            callbacks.append(
-                ValidationSubsetEarlyStoppingCallback(
-                    model=policy_model,
-                    processor=processor,
-                    eval_data=all_data,
-                    reward_fn=reward_fn,
-                    eval_steps=args.early_stopping_eval_steps,
-                    patience=args.early_stopping_patience,
-                    subset_size=args.early_stopping_subset_size,
-                )
-            )
-
-        trainer = GRPOTrainer(
-            model=policy_model,
-            reward_funcs=[reward_fn, quality_fn],
-            args=grpo_config,
-            train_dataset=dataset,
-            processing_class=processor,
-            callbacks=callbacks,
-        )
-
-        logger.info("Training GRPO...")
-        trainer.train(resume_from_checkpoint=str(resume_from) if resume_from is not None else None)
-        trainer.save_model(str(round_dir))
-        processor.save_pretrained(str(round_dir))
-
-        log_memory_status(f"Round {round_idx + 1} complete:")
-
-        # Explicitly free the trainer + old model before reloading to avoid
-        # carrying fragmented/accumulated memory into the next round.
-        del trainer
-        del policy_model
-        gc.collect()
-        clear_memory()
-
-        # Reload for next round
-        try:
-            policy_model, processor = load_qlora_model(
-                model_name=str(round_dir),
-                lora_r=args.lora_r,
-                lora_alpha=args.lora_alpha,
-            )
-        except Exception as e:
-            logger.warning(f"Could not reload: {e}, continuing")
+    run_grpo_rounds(
+        policy_model=policy_model,
+        processor=processor,
+        train_data=all_data,
+        output_dir=args.output_dir,
+        num_rounds=num_rounds,
+        reward_fn_factory=reward_fn_factory,
+        thresholds=[0.3, 0.5, 0.7],
+        quality_fn_factory=quality_fn_factory,
+        quality_task_type="box",
+        args=args,
+        logger=logger,
+    )
 
     logger.info(f"Stage 4a complete. Checkpoints in {args.output_dir}/")
 

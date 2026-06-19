@@ -6,6 +6,16 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Changed
 
+- **Merged Stage 1+2 into Unified Visual Grounding Pretrain**
+  - Removed text-only format pretrain — special token embeddings now start from random init and are learned alongside visual features during visual pretrain (closer to the paper's single-stage multimodal pretraining paradigm).
+  - New `scripts/run_stage1_visual_pretrain.py` replaces `run_stage1_pretrain.py` + `run_stage2_visual_pretrain.py`. Trains on COCO box/point + CLEVR spatial data with QLoRA (r=256). No separate pretrain embedding injection needed.
+  - New `scripts/merge_stage2.py` replaces `merge_stage2.py`. Simplified: drops `--pretrain_embedding_path` and `inject_pretrained_embeddings()` call.
+  - Deleted `configs/stage1_pretrain.yaml` and `configs/stage2_visual_pretrain.yaml`; added `configs/stage1_visual_pretrain.yaml` with CLEVR data generation (`num_clevr: 5000`).
+  - Updated `configs/stage3a_sft_box.yaml` and `configs/stage3b_sft_point.yaml`: `model_path` now points to `outputs/stage2_merged_base`.
+  - Updated `scripts/run_pipeline.sh`: stages renumbered from 8 → 6 (removed old Stage 1, merged Stage 2 into new Stage 1).
+  - Updated `README.md` and `README_zh.md`: renumbered all stage documentation, updated pipeline diagram, project structure tree, and "Closing the Gap" optimization guidance.
+  - Old `scripts/run_stage1_pretrain.py` and `scripts/run_stage2_visual_pretrain.py` kept as reference but removed from main pipeline documentation.
+
 - **YAML duplicate keys cleaned + argparse defaults unified to `None`**
   - Fixed duplicate `num_epochs` in `configs/stage2_visual_pretrain.yaml` (was `1` then `2`; removed the dead `1`).
   - Fixed duplicate `early_stopping_*` block in `configs/stage4a_grpo_box.yaml` (was `0/50/2` then `16/50/2`; removed the dead first set).

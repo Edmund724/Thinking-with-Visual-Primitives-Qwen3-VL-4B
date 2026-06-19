@@ -18,6 +18,12 @@ import sys
 
 import torch
 
+import sys
+from pathlib import Path
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+from src.training.stage_runner import StageRunner
 from src.data.generators.coco_box_generator import (
     generate_coco_box_samples,
     generate_coco_point_samples,
@@ -26,7 +32,6 @@ from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.opd_trainer import train_opd
 from src.training.memory_utils import log_memory_status, clear_memory
-from src.training.stage_runner import StageRunner
 from src.utils.constants import DEFAULT_DISTILL_TEMPERATURE
 
 

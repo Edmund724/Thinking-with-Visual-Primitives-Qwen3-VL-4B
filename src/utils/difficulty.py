@@ -9,6 +9,7 @@ from typing import List
 import numpy as np
 
 from .batch_inference import batch_generate_completions, generate_single_completion
+from .conversation_builder import ConversationBuilder
 from ..models.visual_primitive_parser import PrimitiveParser
 from .reward.format_rm import format_reward, _NON_LATIN_SCRIPT_RE
 from .reward.accuracy_rm import process_reward, compute_total_reward
@@ -165,9 +166,9 @@ def filter_normal_level_data(
         nonlocal last_input_len
         last_input_len = input_len
         for j, sample in enumerate(chunk):
-            gt_text = (
-                sample.get("reasoning", "")
-                + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
+            gt_text = ConversationBuilder.build_gt_text(
+                sample.get("reasoning", ""),
+                sample.get("answer", ""),
             )
             rollouts = []
             start = j * num_generations
@@ -209,9 +210,9 @@ def filter_normal_level_data(
 
     def _process_single(sample):
         nonlocal easy_count, hard_count, normal_data
-        gt_text = (
-            sample.get("reasoning", "")
-            + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
+        gt_text = ConversationBuilder.build_gt_text(
+            sample.get("reasoning", ""),
+            sample.get("answer", ""),
         )
         rollouts = []
         for _ in range(num_generations):

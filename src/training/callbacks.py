@@ -5,6 +5,7 @@ import logging
 import torch
 from transformers import TrainerCallback
 
+from ..utils.conversation_builder import ConversationBuilder
 from .memory_utils import clear_memory, get_gpu_memory_gb, log_memory_status
 
 logger = logging.getLogger(__name__)
@@ -105,9 +106,9 @@ class ValidationSubsetEarlyStoppingCallback(TrainerCallback):
 
             rewards = []
             for j, sample in enumerate(self.eval_data):
-                gt_text = (
-                    sample.get("reasoning", "")
-                    + f"\n</think>\n\nThe answer is {sample.get('answer', '')}."
+                gt_text = ConversationBuilder.build_gt_text(
+                    sample.get("reasoning", ""),
+                    sample.get("answer", ""),
                 )
                 pred = self.processor.tokenizer.decode(
                     outputs[j][input_len:], skip_special_tokens=False

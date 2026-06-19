@@ -14,6 +14,12 @@ import sys
 
 import torch
 
+import sys
+from pathlib import Path
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+from src.training.stage_runner import StageRunner
 from src.data.generators.coco_box_generator import (
     generate_coco_negative_point_samples,
     generate_coco_point_samples,
@@ -23,7 +29,6 @@ from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
 from src.training.memory_utils import log_memory_status
-from src.training.stage_runner import StageRunner
 
 
 def train(runner: StageRunner) -> None:

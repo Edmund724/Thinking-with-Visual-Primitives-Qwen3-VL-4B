@@ -10,8 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-_THINK_OPEN = "<think>"
-_THINK_CLOSE = "</think>"
+from .constants import THINK_CLOSE as _THINK_CLOSE, THINK_OPEN as _THINK_OPEN
 
 
 # ── system messages ──────────────────────────────────────────────────────

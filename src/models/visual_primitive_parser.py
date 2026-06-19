@@ -1,13 +1,18 @@
-"""Visual Primitive Parser — domain seam for all visual primitive operations.
+"""Visual Primitive Parser — convenience facade for visual primitive operations.
 
-This module is the **single public API** for working with visual primitive tokens
-(box / point) in text.  All parsing, validation, formatting, and geometry
-operations are accessed through ``PrimitiveParser`` static methods.
+This module provides static methods for parsing, formatting, validating, and
+scoring visual primitive tokens (box / point) in generated text.  It delegates
+to the underlying specialised modules:
 
-The lower-level modules (``src.utils.text_parsing``, ``src.utils.geometry``,
-``src.data.formatters.primitive_formatter``) are **internal implementation
-details** — production code should import only from here or from
-``src.utils.metrics`` (the backward-compatible shim).
+* ``src.utils.text_parsing`` — parsing and syntax validation
+* ``src.utils.geometry`` — geometric operations (IoU, distance, maze scoring)
+* ``src.data.formatters.primitive_formatter`` — coordinate formatting
+
+Production code may also import directly from these modules when it needs only a
+subset of operations.  ``PrimitiveParser`` exists as a discoverability aid
+(one import gives you everything).
+
+For backward compatibility, ``src.utils.metrics`` re-exports the same public API.
 """
 
 import re

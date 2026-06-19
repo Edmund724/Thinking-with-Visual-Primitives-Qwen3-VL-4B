@@ -1,25 +1,22 @@
-"""Tests for process reward and geometry utilities in metrics module."""
-
+"""Tests for process reward and geometry utilities."""
 import numpy as np
 import pytest
 
-from src.utils.metrics import (
+from src.utils.reward.format_rm import format_reward, primitive_format_compliance_reward
+from src.utils.reward.accuracy_rm import (
     box_count_answer_consistency_reward,
-    box_iou,
     compute_total_reward,
+    process_reward,
+)
+from src.utils.text_parsing import (
     extract_answer,
     extract_reasoning,
-    format_reward,
-    is_rollout_correct,
     lenient_parse_boxes,
-    match_boxes,
-    match_points,
-    point_distance,
-    primitive_format_compliance_reward,
-    process_reward,
     split_generated_text,
     syntax_valid,
 )
+from src.utils.geometry import box_iou, match_boxes, match_points, point_distance
+from src.utils.difficulty import is_rollout_correct
 
 
 class TestExtractAnswer:
@@ -273,7 +270,7 @@ class TestQualityRewardNonLatin:
     def test_non_latin_major_issue(self):
         pred = "<think><|box|>[[1,2,3,4]]<|/box|> จีน</think>\n\nThe answer is 1."
         gt = "<think><|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is 1."
-        from src.utils.metrics import quality_reward_text
+        from src.utils.reward.quality_rm import quality_reward_text
         assert quality_reward_text(pred, gt, "box") == 0.0
 
 

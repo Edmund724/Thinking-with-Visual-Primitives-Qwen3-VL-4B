@@ -138,10 +138,15 @@ def quality_reward_api(
                     model=cfg["model"],
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
-                    max_tokens=150,  # enough for brief reasoning + score
+                    max_tokens=1024,  # reasoning models need headroom for CoT
                     timeout=cfg["timeout"],
                 )
                 content = resp.choices[0].message.content
+                # Fallback: reasoning models may put everything in reasoning_content
+                if not content:
+                    reasoning = getattr(resp.choices[0].message, "reasoning_content", None)
+                    if reasoning:
+                        content = reasoning
                 return _parse_score(content)
             except Exception as e:
                 last_error = e
@@ -310,10 +315,14 @@ def spatial_accuracy_rm_api(
                     model=cfg["model"],
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
-                    max_tokens=150,
+                    max_tokens=1024,
                     timeout=cfg["timeout"],
                 )
                 content = resp.choices[0].message.content
+                if not content:
+                    reasoning = getattr(resp.choices[0].message, "reasoning_content", None)
+                    if reasoning:
+                        content = reasoning
                 return _parse_score(content)
             except Exception as e:
                 last_error = e

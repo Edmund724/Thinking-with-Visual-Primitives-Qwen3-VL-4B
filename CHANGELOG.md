@@ -18,6 +18,7 @@ All notable changes to the GRPO training pipeline are documented in this file.
 ### Fixed
 
 - **Stage 1 point samples all filtered out** — `verify_thinking_chain` in `thinking_verifier.py` had a count-consistency check that applied to `"point"` task type, but point answers are coordinate strings (e.g. `"(500, 300)"`), not counts. `_parse_int` would extract the last integer (300) and compare it against the number of primitives (1), rejecting every point sample. Changed `task_type in ("box", "point")` to `task_type == "box"` on line 105.
+- **LLM Judge API returned empty content for reasoning models** — `quality_rm_api.py` used `max_tokens=150` which was insufficient for reasoning models (e.g. `step-3.7-flash`) that produce verbose chain-of-thought in `reasoning_content` before the final answer. Increased `max_tokens` to 1024 and added a fallback: when `content` is empty, try to parse the score from `reasoning_content`. Applied to both `quality_reward_api` and `spatial_accuracy_rm_api`.
 
 ### Added
 

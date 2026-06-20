@@ -111,8 +111,6 @@ def load_qlora_model(
     lora_dropout: float = DEFAULT_LORA_DROPOUT,
     target_modules: list | None = None,
     use_gradient_checkpointing: bool = True,
-    pretrain_embedding_path: str | None = None,
-    old_vocab_size: int | None = None,
     unfreeze_vit_layers: int = 0,
 ) -> Tuple[Qwen3VLForConditionalGeneration, AutoProcessor]:
     """Load Qwen3-VL with QLoRA (4-bit NF4, double quantization).
@@ -125,16 +123,8 @@ def load_qlora_model(
         1. Load base model
         2. Add special tokens to tokenizer
         3. resize_token_embeddings (before prepare_model_for_kbit_training!)
-        4. (NEW) Inject pretrained special-token embeddings if provided
-        5. prepare_model_for_kbit_training
-        6. add LoRA or load existing adapter
-
-    Args:
-        pretrain_embedding_path: Path to pretrain_state_dict.pt from Stage 0.
-            If provided, new special-token embedding rows will be overwritten
-            with pretrained weights instead of remaining random.
-        old_vocab_size: Base model vocab size before add_special_tokens.
-            Required when pretrain_embedding_path is set.
+        4. prepare_model_for_kbit_training
+        5. add LoRA or load existing adapter
     """
     logger.info(f"Loading model: {model_name}")
 
@@ -217,20 +207,7 @@ def load_qlora_model(
             f"No resize needed: embedding ({current_embed_size}) covers tokenizer ({new_tokenizer_len})"
         )
 
-    # (NEW) Inject pretrained special-token embeddings from Stage 0
-    if pretrain_embedding_path is not None:
-        if old_vocab_size is None:
-            raise ValueError(
-                "old_vocab_size must be provided when pretrain_embedding_path is set. "
-                "This is the base model's vocab size before add_special_tokens."
-            )
-        from .pretrain_loader import inject_pretrained_embeddings
-        inject_pretrained_embeddings(
-            model=model,
-            pretrain_path=pretrain_embedding_path,
-            old_vocab_size=old_vocab_size,
-        )
-
+    # (Step 4) prepare_model_for_kbit_training
     if use_gradient_checkpointing:
         # use_cache is incompatible with gradient checkpointing; disable explicitly
         # before enabling checkpointing to suppress the runtime warning.

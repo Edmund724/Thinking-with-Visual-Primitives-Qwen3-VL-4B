@@ -75,8 +75,6 @@ def main(args):
         model_name=args.checkpoint,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        pretrain_embedding_path=None,
-        old_vocab_size=None,
     )
     model.eval()
 

@@ -525,7 +525,6 @@ tvp-4b-5090d/
 │   │   ├── stage_runner.py           # **StageRunner**: shared argparse+YAML+logging boilerplate
 │   │   ├── trainers/
 │   │   │   └── sft_trainer.py        # SFT Trainer wrapper (WeightedSFTTrainer)
-│   │   ├── pretrain_trainer.py       # Pretrain Trainer (text + visual phases)
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation trainer
 │   │   ├── grpo_fixes.py             # GRPOTrainer multimodal monkey-patches
 │   │   ├── grpo_utils.py             # GRPO helper utilities (completion text extraction)

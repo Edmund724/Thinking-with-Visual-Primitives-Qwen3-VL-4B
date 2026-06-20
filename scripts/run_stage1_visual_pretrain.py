@@ -54,8 +54,6 @@ def train(runner: StageRunner) -> None:
             model_name=resume_ckpt,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            pretrain_embedding_path=None,
-            old_vocab_size=None,
             unfreeze_vit_layers=vit_unfreeze,
         )
     else:
@@ -67,8 +65,6 @@ def train(runner: StageRunner) -> None:
             model_name=args.model_path,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            pretrain_embedding_path=None,
-            old_vocab_size=None,
             unfreeze_vit_layers=vit_unfreeze,
         )
     log_memory_status("After model loading:")

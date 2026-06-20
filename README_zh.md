@@ -534,7 +534,6 @@ tvp-4b-5090d/
 │   │   ├── stage_runner.py           # **StageRunner**：共享 argparse+YAML+日志 boilerplate
 │   │   ├── trainers/
 │   │   │   └── sft_trainer.py        # SFT Trainer 封装（WeightedSFTTrainer）
-│   │   ├── pretrain_trainer.py       # Pretrain Trainer（文本 + 视觉两阶段）
 │   │   ├── opd_trainer.py            # OPD On-Policy Distillation 训练器
 │   │   ├── grpo_fixes.py             # GRPOTrainer 多模态猴补丁
 │   │   ├── grpo_utils.py             # GRPO 辅助工具（completion 文本提取）

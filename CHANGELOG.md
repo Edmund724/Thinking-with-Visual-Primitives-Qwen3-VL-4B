@@ -6,6 +6,12 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Removed
 
+- **Dead code cleanup (round 2)** — removed ~470 lines of unused code and stale artifacts:
+  - `src/training/pretrain_trainer.py` (356 lines) — zero references after Stage 1 unified refactor
+  - `inject_pretrained_embeddings()` and `save_pretrain_state()` in `src/models/pretrain_loader.py` (~110 lines) — code paths no longer reachable
+  - `pretrain_embedding_path` and `old_vocab_size` parameters from `load_qlora_model()` in `src/models/qwen_vl_loader.py` — all callers passed `None`
+  - Stale log files: `stage1_pretrain.log`, `stage2_visual_pretrain.log`, `merge_stage2.log`, `verify_grpo_fixes.log`, `stage1_sft_unified.log` (empty), `test_a/b/c.log` (empty)
+  - Stale smoke-test cache directories: `data/cache/clevr_smoke/`, `clevr_smoke2/`, `clevr_spatial/`, `maze_smoke/`, `path_tracing/`, and empty `tmp_trainer/`
 - **Dead code cleanup** — removed ~352 lines of unused code:
   - `src/data/generators/synthetic_path.py` (169 lines) — superseded by `path_tracing.py`
   - `TensorBoardPrimitiveMetricsCallback` in `src/training/callbacks.py` (133 lines) — defined but never wired into any trainer

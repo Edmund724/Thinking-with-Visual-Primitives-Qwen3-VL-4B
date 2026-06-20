@@ -1,13 +1,12 @@
 """Pretrain model loader for visual primitive token initialization.
 
-Uses 4-bit QLoRA for base model to fit 15GB system RAM.
+Loads Qwen3-VL in 4-bit QLoRA mode for Stage 1 visual pretraining.
 Trains embed_tokens, the LM head, and the last two decoder layers so that
 Stage 1 learns not only the embeddings but also the conditional pattern of
 emitting visual primitives inside the thinking chain.
 """
 
 import logging
-import os
 from typing import Tuple
 
 import torch
@@ -171,111 +170,3 @@ def load_pretrain_model(
     )
 
     return model, processor, old_vocab_size
-
-
-def save_pretrain_state(
-    model: Qwen3VLForConditionalGeneration,
-    processor: AutoProcessor,
-    output_dir: str,
-    old_vocab_size: int,
-):
-    """Save only the trained embedding weights.
-
-    Saves:
-        pretrain_state_dict.pt  — embed_tokens.weight (and lm_head if not tied)
-        tokenizer files         — needed because vocab size changed
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    embed_tokens = model.get_input_embeddings()
-    lm_head = model.get_output_embeddings()
-
-    state_dict = {
-        "embed_tokens.weight": embed_tokens.weight.data.clone().cpu(),
-        "old_vocab_size": old_vocab_size,
-    }
-
-    tied = embed_tokens.weight.data_ptr() == lm_head.weight.data_ptr()
-    if not tied:
-        state_dict["lm_head.weight"] = lm_head.weight.data.clone().cpu()
-        logger.info("Saved separate lm_head.weight (not tied)")
-    else:
-        logger.info("Saved embed_tokens.weight only (tied with lm_head)")
-
-    path = os.path.join(output_dir, "pretrain_state_dict.pt")
-    torch.save(state_dict, path)
-    file_size_mb = os.path.getsize(path) / (1024 * 1024)
-    logger.info(f"Pretrain state saved to {path} ({file_size_mb:.1f} MB)")
-
-    # Save tokenizer (vocab size changed!)
-    processor.save_pretrained(output_dir)
-    logger.info(f"Tokenizer saved (vocab={len(processor.tokenizer)})")
-
-
-def inject_pretrained_embeddings(
-    model: Qwen3VLForConditionalGeneration,
-    pretrain_path: str,
-    old_vocab_size: int,
-):
-    """Inject pretrained new-token embeddings into a 4-bit QLoRA model.
-
-    Only overwrites rows >= old_vocab_size. Old vocab untouched.
-    Handles both normal (expanded) and shrunk embedding states.
-    """
-    logger.info(f"Injecting pretrained embeddings from {pretrain_path}...")
-
-    pretrain_state = torch.load(pretrain_path, map_location="cpu", weights_only=True)
-    pretrained_embed = pretrain_state["embed_tokens.weight"]
-    saved_old_vocab = pretrain_state.get("old_vocab_size", old_vocab_size)
-
-    current_embed = model.get_input_embeddings()
-    current_weight = current_embed.weight.data
-
-    embed_shape = pretrained_embed.shape[0]
-
-    # Detect shrunk embedding state (old bug where resize shrank instead of expanded)
-    if saved_old_vocab >= embed_shape:
-        effective_old = embed_shape - len(SPECIAL_TOKENS)
-        logger.warning(
-            f"Shrunk embedding detected (saved_old={saved_old_vocab} > shape={embed_shape}). "
-            f"Assuming {len(SPECIAL_TOKENS)} new tokens at end. effective_old={effective_old}"
-        )
-    else:
-        effective_old = saved_old_vocab
-
-    num_new_tokens = embed_shape - effective_old
-    logger.info(
-        f"  effective_old={effective_old}, embed_shape={embed_shape}, "
-        f"num_new_tokens={num_new_tokens}"
-    )
-
-    # bnb never quantizes embedding — should be fp16/bf16, not uint8
-    if current_weight.dtype in (torch.uint8, torch.int8):
-        logger.warning("Embedding is quantized. Attempting dequantized injection...")
-        pass
-
-    # Direct indexing (embedding is fp16 in bnb 4-bit models)
-    new_part = pretrained_embed[effective_old:].to(
-        dtype=current_weight.dtype,
-        device=current_weight.device,
-    )
-    with torch.no_grad():
-        current_weight[effective_old:effective_old + new_part.shape[0]] = new_part
-    logger.info(
-        f"  Injected {new_part.shape[0]} new token rows. "
-        f"Old tokens preserved ({effective_old} rows untouched)."
-    )
-
-    if "lm_head.weight" in pretrain_state:
-        lm_head = model.get_output_embeddings()
-        lm_weight = lm_head.weight.data
-        if lm_weight.dtype not in (torch.uint8, torch.int8):
-            pretrained_lm = pretrain_state["lm_head.weight"]
-            new_lm = pretrained_lm[effective_old:effective_old + new_part.shape[0]].to(
-                dtype=lm_weight.dtype, device=lm_weight.device
-            )
-            with torch.no_grad():
-                lm_weight[effective_old:effective_old + new_part.shape[0]] = new_lm
-            logger.info("  Injected lm_head new token rows (not tied).")
-
-    logger.info("Pretrained embedding injection complete.")

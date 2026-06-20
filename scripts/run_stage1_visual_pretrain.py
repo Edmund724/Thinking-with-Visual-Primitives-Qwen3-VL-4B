@@ -151,7 +151,7 @@ def train(runner: StageRunner) -> None:
     processor.save_pretrained(args.output_dir)
 
     logger.info(f"Stage 1 complete. Model saved to {args.output_dir}")
-    logger.info(f"Next: merge LoRA into base with scripts/merge_stage2.py")
+    logger.info(f"Next: merge LoRA into base with scripts/run_stage2_merge.py")
     log_memory_status("Stage 1 complete:")
 
 

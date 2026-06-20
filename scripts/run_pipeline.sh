@@ -44,7 +44,7 @@ if [ -f "$MERGED_CONFIG" ]; then
     echo "✅ Stage 2 Merge already done"
 else
     echo "🔄 Running Stage 2: Merge LoRA into base..."
-    python scripts/merge_stage2.py \
+    python scripts/run_stage2_merge.py \
         --base_model models/Qwen3-VL-4B-Thinking \
         --adapter_path outputs/stage1_visual_pretrain \
         --output_dir outputs/stage2_merged_base

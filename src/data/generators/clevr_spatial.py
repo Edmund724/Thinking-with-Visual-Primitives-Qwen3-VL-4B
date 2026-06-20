@@ -271,6 +271,7 @@ def _generate_counting_question(
         filtered = _filter_objects(objects, color=color)
         if not filtered:
             return None
+        label = color
         prompt = f"How many {color} objects are in the image? Use <|box|> to mark each one."
         intent = f"I need to count all {color} objects in the image."
     else:
@@ -278,13 +279,14 @@ def _generate_counting_question(
         filtered = _filter_objects(objects, shape=shape)
         if not filtered:
             return None
+        label = f"{shape}s"
         prompt = f"How many {shape}s are in the image? Use <|box|> to mark each one."
         intent = f"I need to count all {shape}s in the image."
 
     count = len(filtered)
     # Batch grounding for counting-style questions.
     bboxes = [obj.normalized_bbox(img_w, img_h) for obj in filtered]
-    grounding_parts = [f"{PrimitiveParser.format_ref(f'{shape}s')}{PrimitiveParser.format_box(bboxes)}"]
+    grounding_parts = [f"{PrimitiveParser.format_ref(label)}{PrimitiveParser.format_box(bboxes)}"]
     summarization = f"There are {count} matching objects in total."
     reasoning = _build_thinking_3step(intent, grounding_parts, summarization)
 

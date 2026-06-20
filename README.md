@@ -142,7 +142,7 @@ python scripts/run_stage1_visual_pretrain.py --config configs/stage1_visual_pret
 Special token embeddings are learned during Stage 1 visual pretrain together with the LoRA adapter — no separate pretrain embedding injection needed.
 
 ```bash
-python scripts/merge_stage2.py \
+python scripts/run_stage2_merge.py \
     --base_model models/Qwen3-VL-4B-Thinking \
     --adapter_path outputs/stage1_visual_pretrain \
     --output_dir outputs/stage2_merged_base
@@ -151,12 +151,12 @@ python scripts/merge_stage2.py \
 **Output**: `outputs/stage2_merged_base/` (full bf16 model, ~8.8GB `model.safetensors`)
 
 > **Do I need to validate the merged model before Stage 3?**  
-> Strictly speaking, no — `merge_stage2.py` is deterministic and Stage 3 SFT will immediately fail to load if the merge is corrupt. However, because you just fixed the data format / reward functions, I recommend a **5-minute smoke test**: load `outputs/stage2_merged_base` on one COCO image and check that it emits spatial coordinates inside `<think>` tags.
+> Strictly speaking, no — `run_stage2_merge.py` is deterministic and Stage 3 SFT will immediately fail to load if the merge is corrupt. However, because you just fixed the data format / reward functions, I recommend a **5-minute smoke test**: load `outputs/stage2_merged_base` on one COCO image and check that it emits spatial coordinates inside `<think>` tags.
 >
 > ```bash
-> python scripts/smoke_test_stage2.py
+> python scripts/diagnostics/smoke_test_stage2.py
 > # or specify image / question
-> python scripts/smoke_test_stage2.py \
+> python scripts/diagnostics/smoke_test_stage2.py \
 >     --image_path data/coco/train2017/000000000009.jpg \
 >     --question "Locate the main object in the image. Mark it with a box."
 > ```
@@ -459,7 +459,7 @@ argparse default (None) → YAML config value → CLI override
 
 ### Visual Primitive Domain Seam
 
-`PrimitiveParser` (in `src/models/visual_primitive_parser.py`) is the **single public API** for all visual primitive operations — parsing, validation, formatting, and geometry. Production code imports only from here (or the backward-compatible `src/utils/metrics` shim). The lower-level modules (`text_parsing.py`, `geometry.py`, `primitive_formatter.py`) are internal implementation details.
+`PrimitiveParser` (in `src/models/visual_primitive_parser.py`) is the **single public API** for all visual primitive operations — parsing, validation, formatting, and geometry. The lower-level modules (`text_parsing.py`, `geometry.py`, `primitive_formatter.py`) are internal implementation details.
 
 ```python
 from src.models.visual_primitive_parser import PrimitiveParser
@@ -519,7 +519,6 @@ tvp-4b-5090d/
 │   │   │   ├── synthetic_maze.py     # Synthetic maze generator (3-step thinking)
 │   │   │   ├── clevr_spatial.py      # CLEVR-style 2D spatial/VQA generator
 │   │   │   ├── path_tracing.py       # Bézier curve path tracing generator
-│   │   │   └── synthetic_path.py     # Synthetic path generator
 │   │   └── formatters/
 │   │       └── primitive_formatter.py # Coordinate label formatting (internal)
 │   ├── training/
@@ -538,7 +537,6 @@ tvp-4b-5090d/
 │       ├── conversation_builder.py   # **ConversationBuilder**: unified message construction (SFT/GRPO/OPD/pretrain)
 │       ├── text_parsing.py           # Answer / reasoning / box / point parsing (internal)
 │       ├── geometry.py               # IoU, point distance, maze geometry (internal)
-│       ├── metrics.py                # Backward-compatible shim → text_parsing + geometry + reward/*
 │       ├── thinking_verifier.py      # Thinking-chain validation (tag pairing, coord range, ref checks)
 │       ├── quality_rm_api.py         # LLM-as-Judge Quality RM (OpenAI-compatible API)
 │       ├── logging_utils.py          # Logging initialization
@@ -550,20 +548,21 @@ tvp-4b-5090d/
 │           └── accuracy_rm.py        # Accuracy Reward Model (process_reward, compute_total_reward)
 ├── scripts/                          # Stage entry scripts
 │   ├── run_stage1_visual_pretrain.py  # Stage 1: Unified Visual Grounding Pretrain
-│   ├── merge_stage2.py               # Stage 2: Merge LoRA
+│   ├── run_stage2_merge.py            # Stage 2: Merge LoRA
 │   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
 │   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
 │   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
 │   ├── run_stage4b_grpo_point.py     # Stage 4b: Point Expert GRPO
 │   ├── run_stage5_rft_unified.py     # Stage 5: Unified RFT
 │   ├── run_stage6_opd.py             # Stage 6: OPD
-│   ├── eval_stage2_structure.py      # Stage 2 structure evaluation
-│   ├── eval_stage3a_paradigm.py      # Stage 3a paradigm check
-│   ├── smoke_test_stage2.py          # Stage 2 smoke test
-│   ├── diagnose_stage2_resume_loss.py # Stage 2 loss diagnosis
+│   ├── diagnostics/
+│   │   ├── eval_stage2_structure.py      # Stage 2 structure evaluation
+│   │   ├── eval_stage3a_paradigm.py      # Stage 3a paradigm check
+│   │   ├── smoke_test_stage2.py          # Stage 2 smoke test
+│   │   └── diagnose_stage2_resume_loss.py # Stage 2 loss diagnosis
 │   └── run_pipeline.sh               # Master Pipeline (one-click run)
 ├── tests/
-│   ├── test_primitive_parser.py      # PrimitiveParser unit tests (32 methods)
+│   ├── test_primitive_parser.py      # PrimitiveParser unit tests (30 methods)
 │   ├── test_primitive_formatter.py   # Box/point formatting tests
 │   ├── test_metrics.py               # Reward function & geometry tool tests
 │   ├── test_conversation_builder.py  # ConversationBuilder unit tests (21 tests)

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .constants import THINK_CLOSE as _THINK_CLOSE, THINK_OPEN as _THINK_OPEN
-
 
 # ── system messages ──────────────────────────────────────────────────────
 _SYSTEM_MESSAGES: dict[str, str] = {
@@ -22,9 +20,9 @@ _SYSTEM_MESSAGES: dict[str, str] = {
     ),
     "grpo": (
         "You are a helpful visual reasoning assistant. "
-        "Think step by step inside <think>...</think> tags, then provide your final answer. "
+        "Think step by step inside  thinking... response tags, then provide your final answer. "
         "Use visual primitives (<|box|>, <|point|>) when needed to mark locations. "
-        "Always close your reasoning with </think> before giving the answer. "
+        "Always close your reasoning with  response before giving the answer. "
         "Respond in English only; do not use characters from other languages."
     ),
     "opd": "You are a helpful visual reasoning assistant. Think step by step.",
@@ -115,7 +113,7 @@ class ConversationBuilder:
         turn with ``reasoning_content`` for Qwen3-Thinking.
 
         The raw reasoning text is stripped of any existing
-        ``<think>`` / ``</think>`` wraps because the Qwen3 chat template
+        `` thinking`` / `` response`` wraps because the Qwen3 chat template
         already injects them around ``reasoning_content``.
         """
         user_content = self._build_user_content(
@@ -128,12 +126,12 @@ class ConversationBuilder:
             {"role": "user", "content": user_content},
         ]
 
-        # Strip <think> / </think> so the chat template doesn't double-wrap.
+        # Strip  thinking /  response so the chat template doesn't double-wrap.
         reasoning: str = sample.get("reasoning", "")
-        if reasoning.startswith(_THINK_OPEN):
-            reasoning = reasoning[len(_THINK_OPEN):].lstrip("\n")
-        if reasoning.endswith(_THINK_CLOSE):
-            reasoning = reasoning[: -len(_THINK_CLOSE)].rstrip()
+        if reasoning.startswith(" thinking"):
+            reasoning = reasoning[len(" thinking"):].lstrip("\n")
+        if reasoning.endswith(" response"):
+            reasoning = reasoning[: -len(" response")].rstrip()
 
         full_messages = prompt_messages + [
             {
@@ -153,7 +151,7 @@ class ConversationBuilder:
         """Build a complete pretrain conversation ``[system, user, assistant]``.
 
         The *assistant_text* is placed directly into the assistant content
-        field, typically with literal ``<think>...</think>`` tags.
+        field, typically with literal `` thinking... response`` tags.
         """
         return [
             {"role": "system", "content": self._system},
@@ -165,6 +163,6 @@ class ConversationBuilder:
     def build_gt_text(reasoning: str, answer: str) -> str:
         """Build ground-truth text for GRPO reward computation.
 
-        Format: ``reasoning + "\\n</think>\\n\\nThe answer is " + answer + "."``
+        Format: ``reasoning + "\\n response\\n\\nThe answer is " + answer + "."``
         """
-        return reasoning + "\n</think>\n\nThe answer is " + answer + "."
+        return reasoning + "\n response\n\nThe answer is " + answer + "."

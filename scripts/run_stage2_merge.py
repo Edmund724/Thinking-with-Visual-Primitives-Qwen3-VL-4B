@@ -10,7 +10,7 @@ together with the LoRA adapter — no separate pretrain embedding injection
 is needed.
 
 Usage:
-    python scripts/merge_stage2.py \
+    python scripts/run_stage2_merge.py \
         --base_model models/Qwen3-VL-4B-Thinking \
         --adapter_path outputs/stage1_visual_pretrain \
         --output_dir outputs/stage2_merged_base
@@ -20,21 +20,19 @@ import argparse
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import torch
 from peft import PeftModel
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
-import sys
 from pathlib import Path
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
+from src.utils.config_utils import load_yaml_config
 from src.utils.constants import SPECIAL_TOKENS
 from src.utils.logging_utils import setup_logging
 
-logger = setup_logging(log_file="logs/merge_stage2.log")
+logger = setup_logging(log_file="logs/run_stage2_merge.log")
 
 
 def main(args):
@@ -104,4 +102,11 @@ if __name__ == "__main__":
     parser.add_argument("--adapter_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
+
+    # Apply YAML defaults for any argument not explicitly provided
+    yaml_cfg = load_yaml_config("configs/stage2_merge.yaml")
+    for key, value in yaml_cfg.items():
+        if hasattr(args, key) and getattr(args, key) is None:
+            setattr(args, key, value)
+
     main(args)

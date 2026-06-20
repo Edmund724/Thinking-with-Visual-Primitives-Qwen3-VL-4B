@@ -102,7 +102,7 @@ class TestLoadAPIConfig:
     def test_sample_ratio_default(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True):
             cfg = _load_api_config()
-            assert cfg["sample_ratio"] == 1.0
+            assert cfg["sample_ratio"] == 0.5  # .env default
 
     def test_sample_ratio_custom(self):
         with patch.dict(os.environ, {

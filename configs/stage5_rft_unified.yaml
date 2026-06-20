@@ -1,4 +1,5 @@
 # Stage 5: Unified RFT (Experts as Generators)
+model_path: outputs/stage2_merged_base
 stage2_merged_base: outputs/stage2_merged_base
 box_expert_path: outputs/stage4a_grpo_box
 point_expert_path: outputs/stage4b_grpo_point

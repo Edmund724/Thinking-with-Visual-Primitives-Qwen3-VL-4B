@@ -82,22 +82,6 @@ class TestPrimitiveParser:
         collisions = PrimitiveParser.check_wall_collision(text, grid)
         assert len(collisions) > 0
 
-    def test_count_tags(self):
-        text = "<|box|>[[1,2,3,4]]<|/box|> <|point|>[[5,6]]<|/point|> <|box|>[[7,8,9,10]]<|/box|>"
-        counts = PrimitiveParser.count_tags(text)
-        assert counts["box_open"] == 2
-        assert counts["box_close"] == 2
-        assert counts["point_open"] == 1
-        assert counts["point_close"] == 1
-
-    def test_has_backtracking_keywords(self):
-        text = "Dead end at <|point|>[[100,200]]<|/point|>, backtracking..."
-        assert PrimitiveParser.has_backtracking_keywords(text) is True
-
-    def test_no_backtracking_keywords(self):
-        text = "Move to <|point|>[[100,200]]<|/point|>, then to <|point|>[[300,400]]<|/point|>"
-        assert PrimitiveParser.has_backtracking_keywords(text) is False
-
     # ── Answer / reasoning extraction ───────────────────────────────────
 
     def test_extract_answer_boxed(self):

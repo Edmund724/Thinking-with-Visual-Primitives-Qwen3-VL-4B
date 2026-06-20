@@ -142,7 +142,7 @@ python scripts/run_stage1_visual_pretrain.py --config configs/stage1_visual_pret
 Special token embedding 在 Stage 1 中与 LoRA adapter 一同学习，无需额外的 pretrain embedding 注入。
 
 ```bash
-python scripts/merge_stage2.py \
+python scripts/run_stage2_merge.py \
     --base_model models/Qwen3-VL-4B-Thinking \
     --adapter_path outputs/stage1_visual_pretrain \
     --output_dir outputs/stage2_merged_base
@@ -151,23 +151,23 @@ python scripts/merge_stage2.py \
 **输出**: `outputs/stage2_merged_base/`（完整 bf16 模型，~8.8GB `model.safetensors`）
 
 > **合并后是否需要验证再进入 Stage 3？**  
-> 严格来说不需要——`merge_stage2.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
+> 严格来说不需要——`run_stage2_merge.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
 >
 > ```bash
-> python scripts/smoke_test_stage2.py
+> python scripts/diagnostics/smoke_test_stage2.py
 > # 或指定图片 / 问题
-> python scripts/smoke_test_stage2.py \
+> python scripts/diagnostics/smoke_test_stage2.py \
 >     --image_path data/coco/train2017/000000000009.jpg \
 >     --question "Locate the main object in the image. Mark it with a box."
 > ```
 
 > **合并后是否需要验证再进入 Stage 3？**  
-> 严格来说不需要——`merge_stage2.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但因为刚刚修复了数据格式和 reward，建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
+> 严格来说不需要——`run_stage2_merge.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但因为刚刚修复了数据格式和 reward，建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
 >
 > ```bash
-> python scripts/smoke_test_stage2.py
+> python scripts/diagnostics/smoke_test_stage2.py
 > # 或指定图片 / 问题
-> python scripts/smoke_test_stage2.py \
+> python scripts/diagnostics/smoke_test_stage2.py \
 >     --image_path data/coco/train2017/000000000009.jpg \
 >     --question "Locate the main object in the image. Mark it with a box."
 > ```
@@ -468,7 +468,7 @@ argparse default (None) → YAML config value → CLI override
 
 ### 视觉原语 Domain Seam
 
-`PrimitiveParser`（在 `src/models/visual_primitive_parser.py` 中）是**所有视觉原语操作的唯一公共 API**——解析、验证、格式化和几何计算。生产代码只从这里（或向后兼容的 `src/utils/metrics` shim）导入。底层模块（`text_parsing.py`、`geometry.py`、`primitive_formatter.py`）是内部实现细节。
+`PrimitiveParser`（在 `src/models/visual_primitive_parser.py` 中）是**所有视觉原语操作的唯一公共 API**——解析、验证、格式化和几何计算。底层模块（`text_parsing.py`、`geometry.py`、`primitive_formatter.py`）是内部实现细节。
 
 ```python
 from src.models.visual_primitive_parser import PrimitiveParser
@@ -528,7 +528,6 @@ tvp-4b-5090d/
 │   │   │   ├── synthetic_maze.py     # 合成迷宫生成器（3-step thinking）
 │   │   │   ├── clevr_spatial.py      # CLEVR 风格 2D 空间 / VQA 生成器
 │   │   │   ├── path_tracing.py       # Bézier 曲线路径追踪生成器
-│   │   │   └── synthetic_path.py     # 合成路径生成器
 │   │   └── formatters/
 │   │       └── primitive_formatter.py # 坐标标签格式化（内部模块）
 │   ├── training/
@@ -547,7 +546,6 @@ tvp-4b-5090d/
 │       ├── conversation_builder.py   # **ConversationBuilder**：统一消息构建（SFT/GRPO/OPD/pretrain）
 │       ├── text_parsing.py           # 答案 / 推理 / box / point 解析（内部模块）
 │       ├── geometry.py               # IoU、点距离、迷宫几何（内部模块）
-│       ├── metrics.py                # 向后兼容 shim → text_parsing + geometry + reward/*
 │       ├── thinking_verifier.py      # Thinking-chain 校验（tag 配对、坐标范围、引用检查）
 │       ├── quality_rm_api.py         # LLM-as-Judge Quality RM（OpenAI 兼容 API）
 │       ├── logging_utils.py          # 日志初始化
@@ -559,20 +557,21 @@ tvp-4b-5090d/
 │           └── accuracy_rm.py        # Accuracy Reward Model（process_reward, compute_total_reward）
 ├── scripts/                          # 阶段入口脚本
 │   ├── run_stage1_visual_pretrain.py  # Stage 1: 统一视觉 Grounding 预训练
-│   ├── merge_stage2.py               # Stage 2: Merge LoRA
+│   ├── run_stage2_merge.py            # Stage 2: Merge LoRA
 │   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
 │   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
 │   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
 │   ├── run_stage4b_grpo_point.py     # Stage 4b: Point Expert GRPO
 │   ├── run_stage5_rft_unified.py     # Stage 5: Unified RFT
 │   ├── run_stage6_opd.py             # Stage 6: OPD
-│   ├── eval_stage2_structure.py      # Stage 2 结构评估
-│   ├── eval_stage3a_paradigm.py      # Stage 3a 范式检查
-│   ├── smoke_test_stage2.py          # Stage 2 冒烟测试
-│   ├── diagnose_stage2_resume_loss.py # Stage 2 loss 诊断
+│   ├── diagnostics/
+│   │   ├── eval_stage2_structure.py      # Stage 2 结构评估
+│   │   ├── eval_stage3a_paradigm.py      # Stage 3a 范式检查
+│   │   ├── smoke_test_stage2.py          # Stage 2 冒烟测试
+│   │   └── diagnose_stage2_resume_loss.py # Stage 2 loss 诊断
 │   └── run_pipeline.sh               # Master Pipeline 一键运行
 ├── tests/
-│   ├── test_primitive_parser.py      # PrimitiveParser 单元测试（32 个方法）
+│   ├── test_primitive_parser.py      # PrimitiveParser 单元测试（30 个方法）
 │   ├── test_primitive_formatter.py   # Box/point 格式化测试
 │   ├── test_metrics.py               # 奖励函数与几何工具测试
 │   ├── test_conversation_builder.py  # ConversationBuilder 单元测试（21 测试）

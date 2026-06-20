@@ -4,6 +4,21 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **Dead code cleanup** — removed ~352 lines of unused code:
+  - `src/data/generators/synthetic_path.py` (169 lines) — superseded by `path_tracing.py`
+  - `TensorBoardPrimitiveMetricsCallback` in `src/training/callbacks.py` (133 lines) — defined but never wired into any trainer
+  - `GENERATORS` dict and `__all__` in `src/data/generators/__init__.py` (25 lines) — unused registry
+  - 8 unused constants in `src/utils/constants.py` (`DEFAULT_MAX_SEQ_LENGTH`, `DEFAULT_IMAGE_SIZE`, `HN_BOX_IOU_THRESHOLDS`, `HN_POINT_DIST_THRESHOLD_PX`, `DEFAULT_DPO_BETA`, `MAZE_UNSOLVABLE_RATIO`, `ANSWER_TRUE`, `ANSWER_FALSE`)
+  - `PrimitiveParser.count_tags` and `PrimitiveParser.has_backtracking_keywords` (15 lines) — only used in tests, never in production
+  - Duplicate `import sys` in `scripts/run_stage3b_sft_point.py`, `scripts/run_stage5_rft_unified.py`, `scripts/run_stage6_opd.py`
+  - Stale documentation references to nonexistent `src/utils/metrics.py`
+
+### Fixed
+
+- **Stage 1 point samples all filtered out** — `verify_thinking_chain` in `thinking_verifier.py` had a count-consistency check that applied to `"point"` task type, but point answers are coordinate strings (e.g. `"(500, 300)"`), not counts. `_parse_int` would extract the last integer (300) and compare it against the number of primitives (1), rejecting every point sample. Changed `task_type in ("box", "point")` to `task_type == "box"` on line 105.
+
 ### Added
 
 - **Path Tracing 4-component Accuracy RM** — Stage 4b GRPO now uses the full paper reward decomposition:
@@ -50,7 +65,7 @@ All notable changes to the GRPO training pipeline are documented in this file.
 - **Merged Stage 1+2 into Unified Visual Grounding Pretrain**
   - Removed text-only format pretrain — special token embeddings now start from random init and are learned alongside visual features during visual pretrain (closer to the paper's single-stage multimodal pretraining paradigm).
   - New `scripts/run_stage1_visual_pretrain.py` replaces `run_stage1_pretrain.py` + `run_stage2_visual_pretrain.py`. Trains on COCO box/point + CLEVR spatial data with QLoRA (r=256). No separate pretrain embedding injection needed.
-  - New `scripts/merge_stage2.py` replaces `merge_stage2.py`. Simplified: drops `--pretrain_embedding_path` and `inject_pretrained_embeddings()` call.
+  - New `scripts/run_stage2_merge.py` replaces the old merge script. Simplified: drops `--pretrain_embedding_path` and `inject_pretrained_embeddings()` call.
   - Deleted `configs/stage1_pretrain.yaml` and `configs/stage2_visual_pretrain.yaml`; added `configs/stage1_visual_pretrain.yaml` with CLEVR data generation (`num_clevr: 5000`).
   - Updated `configs/stage3a_sft_box.yaml` and `configs/stage3b_sft_point.yaml`: `model_path` now points to `outputs/stage2_merged_base`.
   - Updated `scripts/run_pipeline.sh`: stages renumbered from 8 → 6 (removed old Stage 1, merged Stage 2 into new Stage 1).
@@ -62,7 +77,7 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - Fixed duplicate `early_stopping_*` block in `configs/stage4a_grpo_box.yaml` (was `0/50/2` then `16/50/2`; removed the dead first set).
   - All 8 stage scripts: `add_arg(default=<concrete>)` → `default=None` (~120 arguments). YAML configs are now the sole default source; `action="store_true"` flags unchanged.
   - Fixed latent bug in `run_stage1_pretrain.py`: only 5 args were registered but `train()` accessed ~17 — now all registered; `configs/stage1_pretrain.yaml` expanded with visual-phase, ViT, and `max_seq_length` keys.
-  - 5 standalone scripts (`merge_stage2`, `smoke_test_stage2`, `eval_stage2_structure`, `eval_stage3a_paradigm`, `diagnose_stage2_resume_loss`): all `default=<concrete>` → `default=None`.
+  - 5 standalone scripts (`run_stage2_merge`, `smoke_test_stage2`, `eval_stage2_structure`, `eval_stage3a_paradigm`, `diagnose_stage2_resume_loss`): all `default=<concrete>` → `default=None`.
   - Fixed `--config` CLI override in `StageRunner.parse_args()`: `self.args.config` was never read, so CLI `--config` was effectively dead. Now correctly synced and defaults to `None`.
   - `apply_yaml_defaults` correctly handles `None == None` comparison for the three-layer default cascade (argparse `None` → YAML value → CLI override).
 
@@ -176,7 +191,7 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Fixed
 
-- **`merge_stage2.py` now preserves Stage 1 embeddings**
+- **`run_stage2_merge.py` now preserves Stage 1 embeddings**
   - Adds special tokens, resizes embeddings, and injects `outputs/stage1_pretrain/pretrain_state_dict.pt` before loading/merging the Stage 2 LoRA adapter.
   - Without this, special-token embeddings in the merged base were randomly initialized.
 

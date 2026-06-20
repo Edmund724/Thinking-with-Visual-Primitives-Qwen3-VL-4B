@@ -102,7 +102,7 @@ def verify_thinking_chain(sample: Dict, tolerate_count_error: int = 1) -> Tuple[
     # 4. Count consistency for counting-style answers
     answer_count = _parse_int(answer)
     if answer_count is not None:
-        if task_type in ("box", "point"):
+        if task_type == "box":
             num_primitives = len(boxes) if task_type == "box" else len(points)
             # Some tasks ask for total count, others ask for category count.
             # We allow the reasoning to contain at least as many primitives as

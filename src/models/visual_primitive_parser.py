@@ -12,7 +12,6 @@ Production code may also import directly from these modules when it needs only a
 subset of operations.  ``PrimitiveParser`` exists as a discoverability aid
 (one import gives you everything).
 
-For backward compatibility, ``src.utils.metrics`` re-exports the same public API.
 """
 
 import re
@@ -28,12 +27,6 @@ from ..data.formatters.primitive_formatter import (
     format_point,
     format_ref,
     normalize_coordinate,
-)
-from ..utils.constants import (
-    BOX_CLOSE,
-    BOX_OPEN,
-    POINT_CLOSE,
-    POINT_OPEN,
 )
 from ..utils.geometry import (
     _count_repeated_coordinates,
@@ -201,22 +194,6 @@ class PrimitiveParser:
     ) -> List[int]:
         """Check wall collisions for already-parsed point lists."""
         return check_wall_collision(points, maze_grid)
-
-    @staticmethod
-    def has_backtracking_keywords(text: str) -> bool:
-        """Check if text contains backtracking-related keywords."""
-        text_lower = text.lower()
-        return any(w in text_lower for w in ["backtrack", "dead end", "retreat", "go back"])
-
-    @staticmethod
-    def count_tags(text: str) -> dict:
-        """Count occurrences of each primitive tag."""
-        return {
-            "box_open": text.count(BOX_OPEN),
-            "box_close": text.count(BOX_CLOSE),
-            "point_open": text.count(POINT_OPEN),
-            "point_close": text.count(POINT_CLOSE),
-        }
 
     # ── Formatting ──────────────────────────────────────────────────────
 

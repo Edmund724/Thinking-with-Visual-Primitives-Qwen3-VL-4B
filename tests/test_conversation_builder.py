@@ -8,23 +8,22 @@ from src.utils.conversation_builder import ConversationBuilder
 # ── helpers ────────────────────────────────────────────────────────────────
 
 class FakeImage:
-    """Minimal stand-in for PIL.Image."""
-    pass
+    """Minimal image stub for tests that require an image argument."""
 
 
-# ── mode / system message selection ─────────────────────────────────────────
+# ── mode selection ───────────────────────────────────────────────────────────
 
 class TestModeSelection:
     def test_sft_mode_uses_sft_system_message(self):
         cb = ConversationBuilder("sft")
         assert "visual primitives when needed" in cb.system_message
         assert "do not use characters from other languages" in cb.system_message
-        assert "<think>" not in cb.system_message  # SFT doesn't instruct tags
+        assert " thinking" not in cb.system_message  # SFT doesn't instruct tags
 
     def test_grpo_mode_uses_grpo_system_message(self):
         cb = ConversationBuilder("grpo")
-        assert "inside <think>" in cb.system_message
-        assert "Always close your reasoning with </think>" in cb.system_message
+        assert "inside  thinking" in cb.system_message
+        assert "Always close your reasoning with  response" in cb.system_message
 
     def test_opd_mode_uses_short_system_message(self):
         cb = ConversationBuilder("opd")
@@ -50,41 +49,40 @@ class TestModeSelection:
 
 class TestBuildUserContent:
     def test_text_only(self):
-        content = ConversationBuilder._build_user_content("hello")
-        assert content == "hello"
+        result = ConversationBuilder._build_user_content("hello")
+        assert result == "hello"
 
     def test_with_image(self):
         img = FakeImage()
-        content = ConversationBuilder._build_user_content("hello", image=img)
-        assert isinstance(content, list)
-        assert len(content) == 2
-        assert content[0] == {"type": "image", "image": img}
-        assert content[1] == {"type": "text", "text": "hello"}
+        result = ConversationBuilder._build_user_content("hello", img)
+        assert len(result) == 2
+        assert result[0] == {"type": "image", "image": img}
+        assert result[1] == {"type": "text", "text": "hello"}
 
 
-# ── build_prompt ───────────────────────────────────────────────────────────
+# ── build_prompt ────────────────────────────────────────────────────────────
 
 class TestBuildPrompt:
     def test_text_only(self):
         cb = ConversationBuilder("grpo")
-        msgs = cb.build_prompt("Locate the cat")
+        msgs = cb.build_prompt("Where is the cat?")
         assert len(msgs) == 2
         assert msgs[0] == {"role": "system", "content": cb.system_message}
-        assert msgs[1] == {"role": "user", "content": "Locate the cat"}
+        assert msgs[1] == {"role": "user", "content": "Where is the cat?"}
 
     def test_with_image(self):
-        cb = ConversationBuilder("opd")
+        cb = ConversationBuilder("grpo")
         img = FakeImage()
-        msgs = cb.build_prompt("Locate the cat", image=img)
+        msgs = cb.build_prompt("Where is the cat?", img)
         assert len(msgs) == 2
         assert msgs[0] == {"role": "system", "content": cb.system_message}
         user_content = msgs[1]["content"]
-        assert isinstance(user_content, list)
+        assert len(user_content) == 2
         assert user_content[0] == {"type": "image", "image": img}
-        assert user_content[1] == {"type": "text", "text": "Locate the cat"}
+        assert user_content[1] == {"type": "text", "text": "Where is the cat?"}
 
 
-# ── build_sft ──────────────────────────────────────────────────────────────
+# ── build_sft ───────────────────────────────────────────────────────────────
 
 class TestBuildSFT:
     def test_basic(self):
@@ -105,7 +103,7 @@ class TestBuildSFT:
         cb = ConversationBuilder("sft")
         sample = {
             "prompt": "Where?",
-            "reasoning": "<think>\nThe cat is here\n</think>",
+            "reasoning": " thinking\nThe cat is here\n response",
             "answer": "here",
         }
         _, full_msgs = cb.build_sft(sample)
@@ -115,7 +113,7 @@ class TestBuildSFT:
         cb = ConversationBuilder("sft")
         sample = {
             "prompt": "Where?",
-            "reasoning": "<think>step 1\nstep 2",
+            "reasoning": " thinkingstep 1\nstep 2",
             "answer": "done",
         }
         _, full_msgs = cb.build_sft(sample)
@@ -125,7 +123,7 @@ class TestBuildSFT:
         cb = ConversationBuilder("sft")
         sample = {
             "prompt": "Where?",
-            "reasoning": "step 1\nstep 2</think>",
+            "reasoning": "step 1\nstep 2 response",
             "answer": "done",
         }
         _, full_msgs = cb.build_sft(sample)
@@ -159,32 +157,27 @@ class TestBuildSFT:
         img = FakeImage()
         sample = {
             "prompt": "Where?",
-            "image": img,
-            "reasoning": "ok",
+            "reasoning": "found it",
             "answer": "here",
+            "image": img,
         }
         prompt_msgs, full_msgs = cb.build_sft(sample)
-        # User content should be multimodal list
-        assert isinstance(prompt_msgs[1]["content"], list)
+        assert len(prompt_msgs) == 2
         assert prompt_msgs[1]["content"][0] == {"type": "image", "image": img}
 
 
-# ── build_pretrain ─────────────────────────────────────────────────────────
+# ── build_pretrain ──────────────────────────────────────────────────────────
 
 class TestBuildPretrain:
     def test_basic(self):
         cb = ConversationBuilder("pretrain")
-        msgs = cb.build_pretrain(
-            "How many objects?",
-            "<think>\nreasoning\n</think>\n\n3",
-        )
+        msgs = cb.build_pretrain("Where is the cat?", "The cat is on the mat.")
         assert len(msgs) == 3
         assert msgs[0]["role"] == "system"
         assert msgs[1]["role"] == "user"
-        assert msgs[1]["content"] == "How many objects?"
+        assert msgs[1]["content"] == "Where is the cat?"
         assert msgs[2]["role"] == "assistant"
-        assert "<think>" in msgs[2]["content"]
-        assert "</think>" in msgs[2]["content"]
+        assert msgs[2]["content"] == "The cat is on the mat."
 
 
 # ── build_gt_text ──────────────────────────────────────────────────────────
@@ -192,13 +185,13 @@ class TestBuildPretrain:
 class TestBuildGTText:
     def test_basic(self):
         gt = ConversationBuilder.build_gt_text("step 1\nstep 2", "42")
-        expected = "step 1\nstep 2\n</think>\n\nThe answer is 42."
+        expected = "step 1\nstep 2\n response\n\nThe answer is 42."
         assert gt == expected
 
     def test_empty_reasoning(self):
         gt = ConversationBuilder.build_gt_text("", "yes")
-        assert gt == "\n</think>\n\nThe answer is yes."
+        assert gt == "\n response\n\nThe answer is yes."
 
     def test_no_answer(self):
         gt = ConversationBuilder.build_gt_text("reasoning", "")
-        assert gt == "reasoning\n</think>\n\nThe answer is ."
+        assert gt == "reasoning\n response\n\nThe answer is ."

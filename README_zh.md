@@ -100,16 +100,16 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + On-Policy Distillation）
 
 ```
-Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~?    ✅
-Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型          ~27s   ✅
-Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~?    ✅
+Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~11.5h  ✅
+Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型          ~1m     ✅
+Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~12h   ✅
 Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~?    ✅ (含 resume)
 Stage 4a: Box Expert GRPO         Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
 Stage 4b: Point Expert GRPO       Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
 Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~5h    (预计)
 Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
                                 ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~52h
+                                Total（已实测部分）:                         ~57h
 ```
 
 **核心设计**：
@@ -125,6 +125,8 @@ Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert
 **在 COCO + CLEVR 图像上训练**，从零开始建立"视觉特征 → 坐标"的真实映射。Special token（`<|box|>`、`<|point|>`）从随机初始化开始，与 LoRA adapter 同时学习——不需要独立的文本格式预训练。
 
 > **当前默认配置**：`num_box=30000`, `num_point=10000`, `num_clevr=5000`（共 45K 样本）, `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4`（有效 batch=4）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`，启用 curriculum。
+>
+> **训练结果**：22,500 步（2 epochs），loss 6.88 → 2.34（−66%），grad norm 14.48 → 1.25，收敛稳定。**耗时：~11.5h GPU 时间**（从 checkpoint-10000 resume，最终段 6h21m 完成 12.5K 步 @ ~1.8s/步）。墙钟时间 ~29h（含多次配置调整重启）。
 > - 输出：`outputs/stage1_visual_pretrain/`
 
 ```bash
@@ -182,6 +184,8 @@ python scripts/run_stage2_merge.py \
 > - 支持 `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` 断点续训。
 >
 > **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
+>
+> **训练结果**：14,250 步（2 epochs），loss 2.87 → 1.62（−44%），均值 1.65，grad norm 6.20 → 0.44，收敛稳定。57,000 样本（15K box + 10K 计数 + 5K CLEVR + 2K 负样本 + 25K general）。**耗时：~12.1h GPU 时间** @ ~2.6 samples/sec。输出：`outputs/stage3a_sft_box/`。
 
 ```bash
 # 从头训练
@@ -223,6 +227,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
 > **注**：GRPO 采用多轮循环结构，每轮结束后模型会被 reload，轮间是天然断点。每轮本身应一次性跑完；若中途 OOM，脚本会自动查找最新的 `checkpoint-*` 并从中断处恢复。已完成的轮次在重跑时自动跳过。
 >
 > **显存提示**：所有 stage 脚本现已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，无需手动添加，可有效缓解长时间训练中的 CUDA 显存碎片化问题。
+
+> **难度筛选（论文 Sec 2.5.2）**：论文在 GRPO 训练前会筛选“Normal”难度样本（模型有时对有时错）。对单卡环境，这个步骤需要额外的 on-policy rollout 推理，容易引发 OOM。我们**默认跳过**该步骤（`skip_difficulty_filter: true`），并将数据量加倍来补偿。Hard 样本（全错）在 GRPO 训练中 reward 方差为 0，梯度接近 0，只会浪费算力但不会损害训练效果；Easy 样本（全对）同理。若在多卡环境希望重新启用筛选，将 YAML 中的 `skip_difficulty_filter` 设为 `false` 即可。
 
 ```bash
 python scripts/run_stage4a_grpo_box.py \

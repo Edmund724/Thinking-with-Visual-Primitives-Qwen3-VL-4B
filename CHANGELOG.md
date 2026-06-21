@@ -4,6 +4,62 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stage 4 GRPO `generation_batch_size` 与 `num_generations` 不兼容导致 ValueError**
+  - `src/training/grpo_runner.py`：`generation_batch_size` 从硬绑定 `args.batch_size` 改为独立配置参数 `args.generation_batch_size`，默认回退到 `args.num_generations`。解决 `batch_size=2` 不能被 `num_generations=6` 整除的报错。
+  - `configs/stage4a_grpo_box.yaml` 和 `configs/stage4b_grpo_point.yaml`：新增 `generation_batch_size: 6`。
+  - `scripts/run_stage4a_grpo_box.py` 和 `scripts/run_stage4b_grpo_point.py`：新增 `--generation_batch_size` CLI 参数。
+
+- **Stage 4a `make_box_reward_fn` 缺少 `logger` 参数导致 TypeError**
+  - `scripts/run_stage4a_grpo_box.py`：`make_box_reward_fn` 签名添加 `logger=None`，与 `grpo_runner.py` 的 `reward_fn_factory(threshold, tokenizer=..., logger=...)` 调用保持一致。闭包内改用 `_log` 局部变量，优先使用传入的 logger，回退到全局 logger。
+
+### Changed
+
+- **Stage 4 GRPO 难度筛选默认跳过，数据量加倍补偿**
+  - `configs/stage4a_grpo_box.yaml` 和 `configs/stage4b_grpo_point.yaml`：`skip_difficulty_filter: true`（默认关闭），数据量各参数翻倍（stage4a: 4000/2000/2000；stage4b: 2000/4000/2000）。
+  - 原因：单卡环境下难度筛选步骤需要额外 on-policy rollout 推理，容易引发 OOM。Hard 样本在 GRPO 训练中 reward 方差 ≈ 0、梯度 ≈ 0，不会损害训练，只是浪费算力。用更大数据量补偿“有效信号密度”的下降。
+  - 多卡环境可通过 YAML 中 `skip_difficulty_filter: false` 重新启用论文原始流程。
+  - `README.md` 和 `README_zh.md` 已同步添加说明。
+
+- **Stage 4a GRPO filter 参数优化**
+  - `configs/stage4a_grpo_box.yaml`: `num_generations` 2 → 6，与论文常用的 4~8 次 rollout 对齐，显著放宽 normal 难度判定窗口；`filter_batch_size` 4 → 6，利用显存余量加速 filter；`filter_max_completion_length` 384 → 512，减少截断导致的格式错误判定。
+  - 新增 `filter_iou_threshold` 独立参数（默认 0.3），将难度过滤阶段的 IoU 阈值与训练 round 阈值解耦，可单独调优而不影响奖励函数。
+
+- **Stage 4b GRPO filter 参数同步优化**
+  - `configs/stage4b_grpo_point.yaml`: `num_generations` 2 → 6，`filter_batch_size` 4 → 6，与 stage 4a 保持一致。
+  - 新增 `filter_max_completion_length: 512` 和 `filter_point_dist_threshold: 20.0` 独立参数，将 filter 阶段的距离阈值和生成长度与训练参数解耦，与 stage 4a 的参数化模式对齐。
+
+- **难度筛选新增 `filter_reward_threshold` 备用模式**
+  - `filter_normal_level_data` 新增 `reward_threshold` 参数（默认 `null`，向后兼容）。
+  - 启用后以 `total_reward >= threshold` 作为 rollout 正确性判定，取代二值 `is_rollout_correct` 检查。
+  - **默认不启用**：论文 Sec 2.5.2 的“correct response”应仅基于任务正确性（IoU/distance/count），不含格式质量；当前 `is_rollout_correct` 已严格对齐这一原则，无需 reward 混合判定。
+  - `reward_threshold` 仅保留作为可调旋钮，供探索性实验使用。
+
+### Fixed
+
+- **`is_rollout_correct` 移除格式门控，只判断任务正确性（严格对齐论文 Sec 2.5.2）**
+  - 此前 `is_rollout_correct` 包含 think tag 和非拉丁字符检查，导致即使模型任务答案正确（IoU=0.9），也因格式小疵被判为 hard。这与论文“correct response”的定义（任务答案是否正确）不符。格式质量应由 GRPO 训练时的 Format RM 负责，不应污染难度筛选。
+  - 修复后：`is_rollout_correct` 仅检查 IoU/distance/count 匹配 + 可解析性，不再检查 think tags 和非拉丁字符。预期 normal 比例将显著提升。
+
+- **`is_rollout_correct` 对 box/point 任务改用 IoU/距离匹配（修复 normal 比例过低的根本原因）**
+  - 此前 `is_rollout_correct` 对所有任务类型使用精确字符串比较判定答案正确与否，导致 localization 任务中即使模型输出的 box IoU 很高（如 0.8），也因坐标数值不完全相同而被判为 hard，`iou_threshold` 参数在 box 任务中实际未生效。
+  - 修复后：box 任务使用 `match_boxes(iou_threshold)` 判定，point/path 任务使用 `match_points(point_dist_threshold)` 判定，只有 counting 任务（GT 无 box）才回退到精确答案匹配。预期 normal 样本比例将大幅提升。
+  - 新增 8 个单元测试覆盖 IoU/distance 匹配、counting fallback、格式验证等场景。
+
+- **`process_reward.answer_correct` 对 localization 任务改用空间匹配**
+  - 此前 `process_reward` 的 `answer_correct` 对所有任务均使用字符串精确匹配，导致 box localization 训练中即使模型输出 IoU 极高，只要坐标字符串不完全相同，`answer_r` 就为 0，削弱了 GRPO 的奖励信号。
+  - 修复后：box 任务若 GT 含 boxes，`answer_correct = (IoU match > 0) AND (答案字符串匹配)`，同时保留计数正确性检查；point 任务若 GT 含 points，改用距离匹配。counting 任务（GT 无 boxes）逻辑不变。
+
+- **Path tracing continuity penalty 参数传错 bug**
+  - `src/utils/reward/accuracy_rm.py` 中 `path_continuity_penalty` 的第二个参数错误地传入了 `pred_end`（应为 `gt_end`），导致 continuity penalty 始终为 0，path tracing 的奖励信号不完整。现已修复为传入 `gt_end`。
+
+### Added
+
+- **Stage 1 & 2 timing recorded** — Stage 1: ~11.5h GPU time (resumed from checkpoint-10000; final segment 6h21m for 12.5K steps @ ~1.8s/step, wall clock ~29h with config restarts). Stage 2: ~1m13s. Results: 22,500 steps, loss 6.88→2.34 (−66%), grad norm 14.48→1.25, stable convergence. Updated README.md and README_zh.md pipeline tables and Stage 1 sections.
+
+- **Stage 3a timing recorded** — Stage 3a: ~12.1h GPU time. Results: 14,250 steps (2 epochs), loss 2.87→1.62 (−44%), average 1.65, grad norm 6.20→0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). Updated README.md and README_zh.md pipeline tables, total time (~52h→~57h), and Stage 3a sections.
+
 ### Removed
 
 - **Dead code cleanup (round 2)** — removed ~470 lines of unused code and stale artifacts:

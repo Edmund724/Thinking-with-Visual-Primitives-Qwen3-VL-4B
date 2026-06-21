@@ -254,10 +254,13 @@ class TestNonLatinPenalty:
         details = format_reward(text)
         assert details["non_latin_penalty"] <= -0.1
 
-    def test_is_rollout_correct_rejects_non_latin(self):
+    def test_is_rollout_correct_ignores_non_latin_when_task_solved(self):
+        # Non-Latin script is a FORMAT concern (handled by Format RM during GRPO),
+        # not a task-correctness concern.  If the boxes match, the rollout is
+        # "correct" for difficulty grading purposes (paper Sec 2.5.2).
         pred = "<think>อันตราย<|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is 1."
         gt = "<think><|box|>[[1,2,3,4]]<|/box|></think>\n\nThe answer is 1."
-        assert is_rollout_correct(pred, gt, "box") is False
+        assert is_rollout_correct(pred, gt, "box") is True
 
     def test_lenient_parse_boxes_handles_double_comma(self):
         text = "[[300,581,,334,699]]"

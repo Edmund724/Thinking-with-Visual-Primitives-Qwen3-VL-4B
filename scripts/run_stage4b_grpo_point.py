@@ -156,11 +156,12 @@ def train(runner: StageRunner) -> None:
                 processor=processor,
                 data=all_data,
                 num_generations=args.num_generations,
-                max_completion_length=args.max_completion_length,
+                max_completion_length=args.filter_max_completion_length,
                 task_type="point",
-                point_dist_threshold=20.0 if num_rounds > 0 else 10.0,
+                point_dist_threshold=args.filter_point_dist_threshold,
                 batch_size=args.filter_batch_size,
                 empty_cache_every=args.filter_empty_cache_every,
+                reward_threshold=args.filter_reward_threshold,
                 logger=logger,
             )
 
@@ -222,8 +223,16 @@ if __name__ == "__main__":
     runner.add_arg("--save_steps", type=int, default=None)
     runner.add_arg("--warmup_steps", type=int, default=None)
     runner.add_arg("--num_generations", type=int, default=None)
+    runner.add_arg("--generation_batch_size", type=int, default=None,
+                   help="Prompts per generation batch (must be divisible by num_generations). Defaults to num_generations.")
     runner.add_arg("--filter_batch_size", type=int, default=None,
                    help="Batch size for difficulty-filter generation (prompts per batch)")
+    runner.add_arg("--filter_max_completion_length", type=int, default=None,
+                   help="Max completion length used only during difficulty filtering")
+    runner.add_arg("--filter_point_dist_threshold", type=float, default=None,
+                   help="Point distance threshold used only during difficulty filtering")
+    runner.add_arg("--filter_reward_threshold", type=float, default=None,
+                   help="Reward threshold for correctness in difficulty filtering (overrides binary check)")
     runner.add_arg("--filter_empty_cache_every", type=int, default=None)
     runner.add_arg("--skip_difficulty_filter", action="store_true",
                    help="Skip difficulty filtering and use all generated samples")

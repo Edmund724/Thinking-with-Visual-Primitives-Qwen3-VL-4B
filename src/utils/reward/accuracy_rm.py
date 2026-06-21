@@ -61,6 +61,11 @@ def process_reward(
             "box_num_pred": len(pred_boxes),
             "box_num_gt": num_gt,
         })
+        # For localization tasks with GT boxes, answer_correct combines
+        # IoU matching (spatial correctness) with the original string match
+        # (so counting + localization must both be correct).
+        if gt_boxes and num_gt > 0:
+            result["answer_correct"] = (num_match > 0) and answer_correct
 
     if task_type in ("point", "maze", "path"):
         pred_points = PrimitiveParser.extract_points(pred_reasoning)
@@ -79,6 +84,9 @@ def process_reward(
             "point_num_pred": len(pred_points),
             "point_num_gt": num_gt,
         })
+        # For point grounding tasks with GT points, answer_correct is distance-based.
+        if task_type == "point" and gt_points and num_gt > 0:
+            result["answer_correct"] = num_match > 0
 
         # Maze-specific checks
         if maze_grid is not None:
@@ -347,7 +355,7 @@ def compute_total_reward(
         # 5. Continuity penalty: jump from last trajectory point to endpoint
         continuity = PrimitiveParser.path_continuity_penalty(
             pred_end if pred_points else None,
-            pred_end if pred_points else None,
+            gt_end if curve else None,
         )
 
         accuracy_score = (

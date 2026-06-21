@@ -100,16 +100,16 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 Training Pipeline (Separated Experts + On-Policy Distillation)
 
 ```
-Stage 1:  Unified Visual Pretrain  COCO + CLEVR images, box/point grounding  ~?    ✅
-Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~27s   ✅
-Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~?  ✅
+Stage 1:  Unified Visual Pretrain  COCO + CLEVR images, box/point grounding  ~11.5h  ✅
+Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~1m     ✅
+Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~12h  ✅
 Stage 3b: Point Expert SFT         Point+Maze SFT                             ~?    ✅ (including resume)
 Stage 4a: Box Expert GRPO          Box expert GRPO (3 rounds, default)        ~6h    (est.)
 Stage 4b: Point Expert GRPO        Point expert GRPO (3 rounds, default)      ~6h    (est.)
 Stage 5:  Unified RFT              Expert-generated rollouts → Unified learning ~5h  (est.)
 Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
                                 ──────────────────────────────────────────────
-                                Total (measured):                           ~52h
+                                Total（已实测部分）:                         ~57h
 ```
 
 **Core Design**:
@@ -125,6 +125,8 @@ Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)
 **Training on COCO + CLEVR images** to establish "visual feature → coordinate" mapping from the start. Special tokens (`<|box|>`, `<|point|>`) are randomly initialized and learned alongside the LoRA adapter — no separate text-only format pretrain needed.
 
 > **Current config**: `num_box=30000`, `num_point=10000`, `num_clevr=5000` (total 45K samples), `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4` (effective batch=4), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum enabled.
+>
+> **Results**: 22,500 steps (2 epochs), loss 6.88 → 2.34 (−66%), grad norm 14.48 → 1.25, stable convergence. **Duration: ~11.5h GPU time** (resumed from checkpoint-10000; final segment 6h21m for 12.5K steps @ ~1.8s/step). Wall clock ~29h including config tuning restarts.
 > - Output: `outputs/stage1_visual_pretrain/`
 
 ```bash
@@ -173,6 +175,8 @@ python scripts/run_stage2_merge.py \
 > - Supports `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` to continue training.
 >
 > **Note**: Stage 3a does not enable data caching (pickle cache) to preserve accurate timing data. From Stage 3b onward, all scripts support training data pickle caching — auto-saved on first run, loaded directly on subsequent runs.
+>
+> **Results**: 14,250 steps (2 epochs), loss 2.87 → 1.62 (−44%), average 1.65, grad norm 6.20 → 0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). **Duration: ~12.1h GPU time** @ ~2.6 samples/sec. Output: `outputs/stage3a_sft_box/`.
 
 ```bash
 # From scratch
@@ -214,6 +218,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
 > **Note**: GRPO uses a multi-round loop structure. After each round, the model is reloaded — inter-round gaps are natural checkpoints. Each round should run to completion; if interrupted mid-round, the script auto-detects the latest `checkpoint-*` and resumes from it. Completed rounds are skipped on restart.
 >
 > **VRAM tip**: All stage scripts now set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` internally to mitigate CUDA memory fragmentation during long runs.
+
+> **Difficulty filter (paper Sec 2.5.2)**: The paper pre-filters GRPO data to keep only "Normal" difficulty samples (model sometimes succeeds, sometimes fails). For single-GPU setups this step can cause OOM due to the extra on-policy rollouts required. We **skip it by default** (`skip_difficulty_filter: true`) and compensate by doubling the dataset size. Hard samples (all rollouts wrong) produce zero reward variance and thus near-zero gradients during GRPO — they waste compute but do not harm training. Easy samples (all correct) behave the same way. To re-enable filtering on a multi-GPU setup, set `skip_difficulty_filter: false` in the YAML.
 
 ```bash
 python scripts/run_stage4a_grpo_box.py \

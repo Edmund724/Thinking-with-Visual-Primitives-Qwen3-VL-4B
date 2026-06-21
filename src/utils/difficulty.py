@@ -30,41 +30,87 @@ def is_rollout_correct(
     correct when its final answer is correct AND the output contains at least
     one valid visual primitive.
 
+    This function checks **task correctness only** (IoU for boxes, distance
+    for points, exact answer match for counting).  Format quality (think tags,
+    non-Latin script, tag pairing) is NOT part of this check — it is handled
+    separately by Format RM during GRPO training.  This keeps the difficulty
+    grading signal focused on "can the model solve the task", which is the
+    paper's intent.
+
     This is intentionally more lenient than ``format_reward`` on tag order:
     after SFT the model often emits coordinates with reversed or duplicated
     tags. As long as coordinates are parseable and the answer matches, the
     rollout counts as correct for difficulty selection. GRPO's reward will
     still penalize malformed tags.
     """
-    # Basic sanity gate: must have think tags and not be non-Latin garbage.
-    fmt = format_reward(pred_text)
-    if not fmt.get("has_think_tags"):
-        return False
-    if _NON_LATIN_SCRIPT_RE.search(pred_text):
-        return False
 
-    # Robust answer match (numeric / boolean / exact)
-    pred_answer = PrimitiveParser.normalize_answer_text(PrimitiveParser.extract_answer(pred_text))
-    gt_answer = PrimitiveParser.normalize_answer_text(PrimitiveParser.extract_answer(gt_text))
-    if pred_answer is None or gt_answer is None or pred_answer != gt_answer:
-        return False
+    # For box/point tasks with spatial GT, use IoU / distance matching
+    # instead of exact answer string comparison.  The paper (Sec 2.5.2)
+    # defines correctness by whether the output is *actually correct*,
+    # and for localization tasks that means IoU ≥ threshold, not exact
+    # coordinate string match.
+    if task_type == "box":
+        pred_boxes = PrimitiveParser.extract_boxes(pred_text) or PrimitiveParser.lenient_extract_boxes(pred_text)
+        gt_boxes = PrimitiveParser.extract_boxes(gt_text)
 
-    # For box/point tasks, require at least one parseable primitive with
-    # in-range coordinates. Be forgiving about tag order.
-    if task_type in ("box", "point", "path"):
-        if task_type == "box":
-            boxes = PrimitiveParser.extract_boxes(pred_text) or PrimitiveParser.lenient_extract_boxes(pred_text)
-            if not boxes:
+        if gt_boxes:
+            # Box localization: IoU-based correctness.
+            if not pred_boxes:
                 return False
-            coords = [c for b in boxes for c in b]
+            coords = [c for b in pred_boxes for c in b]
+            if any(c < 0 or c > 999 for c in coords):
+                return False
+            _, num_match, _ = PrimitiveParser.match_boxes(
+                pred_boxes, gt_boxes, iou_threshold
+            )
+            # Require at least one box matched at the given IoU threshold.
+            if num_match == 0:
+                return False
+            return True
         else:
-            points = PrimitiveParser.extract_points(pred_text)
-            if not points:
+            # Counting or refusal (no GT boxes): fall back to answer match.
+            pred_answer = PrimitiveParser.normalize_answer_text(
+                PrimitiveParser.extract_answer(pred_text)
+            )
+            gt_answer = PrimitiveParser.normalize_answer_text(
+                PrimitiveParser.extract_answer(gt_text)
+            )
+            if pred_answer is None or gt_answer is None or pred_answer != gt_answer:
                 return False
-            coords = [c for p in points for c in p]
+            # Require parseable boxes only when the answer implies objects exist.
+            if pred_boxes:
+                coords = [c for b in pred_boxes for c in b]
+                if any(c < 0 or c > 999 for c in coords):
+                    return False
+            return True
 
-        if any(c < 0 or c > 999 for c in coords):
-            return False
+    if task_type in ("point", "path"):
+        pred_points = PrimitiveParser.extract_points(pred_text)
+        gt_points = PrimitiveParser.extract_points(gt_text)
+
+        if gt_points:
+            # Point/path: distance-based correctness.
+            if not pred_points:
+                return False
+            coords = [c for p in pred_points for c in p]
+            if any(c < 0 or c > 999 for c in coords):
+                return False
+            _, num_match, _ = PrimitiveParser.match_points(
+                pred_points, gt_points, point_dist_threshold
+            )
+            if num_match == 0:
+                return False
+            return True
+        else:
+            pred_answer = PrimitiveParser.normalize_answer_text(
+                PrimitiveParser.extract_answer(pred_text)
+            )
+            gt_answer = PrimitiveParser.normalize_answer_text(
+                PrimitiveParser.extract_answer(gt_text)
+            )
+            if pred_answer is None or gt_answer is None or pred_answer != gt_answer:
+                return False
+            return True
 
     # Maze-specific: reuse process_reward for wall/answer checks.
     if task_type == "maze":
@@ -74,8 +120,12 @@ def is_rollout_correct(
         )
         if not proc.get("answer_correct", False):
             return False
+        return True
 
-    return True
+    # Fallback: exact answer match for other task types.
+    pred_answer = PrimitiveParser.normalize_answer_text(PrimitiveParser.extract_answer(pred_text))
+    gt_answer = PrimitiveParser.normalize_answer_text(PrimitiveParser.extract_answer(gt_text))
+    return pred_answer is not None and gt_answer is not None and pred_answer == gt_answer
 
 
 def filter_normal_level_data(
@@ -89,6 +139,7 @@ def filter_normal_level_data(
     point_dist_threshold: float = 10.0,
     batch_size: int = 4,
     empty_cache_every: int = 50,
+    reward_threshold: float = None,
     logger=None,
 ) -> List[dict]:
     """Pre-filter GRPO training data to keep only Normal-difficulty samples.
@@ -101,10 +152,15 @@ def filter_normal_level_data(
         * Hard:   all rollouts are incorrect.
         * Normal: at least one correct and at least one incorrect rollout.
 
-    A rollout is considered correct when its final answer is correct AND the
-    output satisfies basic syntax constraints (see ``is_rollout_correct``).
-    This mirrors the paper's binary "correct response" counting rather than
-    thresholding a continuous reward value.
+    When ``reward_threshold`` is set (recommended), a rollout is considered
+    correct when ``total_reward >= reward_threshold``.  This uses the
+    continuous reward signal (Format RM + Accuracy RM) as the correctness
+    indicator — more robust than binary checks and better captures partial
+    correctness, aligning with the paper's intent of identifying prompts
+    where the model sometimes succeeds and sometimes fails.
+
+    When ``reward_threshold`` is None (legacy mode), the binary
+    ``is_rollout_correct`` function is used instead.
 
     Batched generation is used to saturate the GPU: we process ``batch_size``
     distinct prompts at once and repeat each prompt ``num_generations`` times,
@@ -192,13 +248,17 @@ def filter_normal_level_data(
             correct_count = sum(
                 1
                 for r in rollouts
-                if is_rollout_correct(
-                    pred_text=r["pred_text"],
-                    gt_text=gt_text,
-                    task_type=task_type,
-                    iou_threshold=iou_threshold,
-                    point_dist_threshold=point_dist_threshold,
-                    maze_grid=sample.get("maze_grid"),
+                if (
+                    r["total_reward"] >= reward_threshold
+                    if reward_threshold is not None
+                    else is_rollout_correct(
+                        pred_text=r["pred_text"],
+                        gt_text=gt_text,
+                        task_type=task_type,
+                        iou_threshold=iou_threshold,
+                        point_dist_threshold=point_dist_threshold,
+                        maze_grid=sample.get("maze_grid"),
+                    )
                 )
             )
             if correct_count == num_generations:
@@ -245,13 +305,17 @@ def filter_normal_level_data(
         correct_count = sum(
             1
             for r in rollouts
-            if is_rollout_correct(
-                pred_text=r["pred_text"],
-                gt_text=gt_text,
-                task_type=task_type,
-                iou_threshold=iou_threshold,
-                point_dist_threshold=point_dist_threshold,
-                maze_grid=sample.get("maze_grid"),
+            if (
+                r["total_reward"] >= reward_threshold
+                if reward_threshold is not None
+                else is_rollout_correct(
+                    pred_text=r["pred_text"],
+                    gt_text=gt_text,
+                    task_type=task_type,
+                    iou_threshold=iou_threshold,
+                    point_dist_threshold=point_dist_threshold,
+                    maze_grid=sample.get("maze_grid"),
+                )
             )
         )
         if correct_count == num_generations:

@@ -74,6 +74,7 @@ def create_sft_trainer(
     logging_steps: int = 10,
     save_steps: int = 500,
     warmup_steps: int = 100,
+    max_grad_norm: float = 0.3,
     use_wandb: bool = True,
     additional_callbacks: Optional[list] = None,
     format_token_weight: float = 5.0,
@@ -106,7 +107,7 @@ def create_sft_trainer(
         dataloader_num_workers=0,
         remove_unused_columns=False,
         label_names=["labels"],
-        max_grad_norm=0.3,
+        max_grad_norm=max_grad_norm,
         lr_scheduler_type="cosine",
     )
 

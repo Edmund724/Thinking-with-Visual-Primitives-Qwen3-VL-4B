@@ -89,7 +89,7 @@ def train(runner: StageRunner) -> None:
 
     # 70% general data (text-only pretrain data)
     general_data = []
-    if os.path.exists(args.general_data_path):
+    if args.general_data_path and os.path.exists(args.general_data_path):
         import json
         with open(args.general_data_path, "r") as f:
             raw_general = json.load(f)
@@ -147,6 +147,7 @@ def train(runner: StageRunner) -> None:
         save_steps=args.save_steps,
         warmup_steps=args.warmup_steps,
         use_wandb=False,
+        max_grad_norm=args.max_grad_norm,
         format_token_weight=args.format_token_weight,
     )
 
@@ -170,7 +171,7 @@ if __name__ == "__main__":
     )
     runner.add_arg("--model_path", type=str, default=None)
     runner.add_arg("--output_dir", type=str, default=None)
-    runner.add_arg("--general_data_path", type=str, default=None)
+    runner.add_arg("--general_data_path", type=str, default="data/pretrain/pretrain_data.json")
     runner.add_arg("--coco_image_dir", type=str, default=None)
     runner.add_arg("--coco_ann_file", type=str,
                    default=None)
@@ -199,4 +200,6 @@ if __name__ == "__main__":
                    help="Path to checkpoint dir to resume from, e.g. outputs/stage3a_sft_box/checkpoint-500")
     runner.add_arg("--format_token_weight", type=float, default=None,
                    help="Loss weight multiplier for visual-primitive / think format tokens.")
+    runner.add_arg("--max_grad_norm", type=float, default=None,
+                   help="Maximum gradient norm for clipping.")
     runner.run(train)

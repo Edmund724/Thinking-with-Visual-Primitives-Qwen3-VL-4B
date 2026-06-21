@@ -31,8 +31,9 @@ from src.utils.quality_rm_api import make_quality_reward_api_fn
 logger = None  # Set by train() from runner.logger
 
 
-def make_box_reward_fn(iou_threshold: float, tokenizer=None):
+def make_box_reward_fn(iou_threshold: float, tokenizer=None, logger=None):
     """Factory: box-only reward with Format RM + Box Accuracy RM + difficulty grading."""
+    _log = logger if logger is not None else globals().get("logger")
 
     def grpo_reward(completions, prompts=None, **kwargs):
         # Support both training format (inputs=dict list) and test format (separate kwargs)
@@ -78,7 +79,7 @@ def make_box_reward_fn(iou_threshold: float, tokenizer=None):
                 length_r = length_reward(comp_len, target_length=240, max_penalty=0.05)
                 rewards.append(total["total_reward"] + length_r)
             except Exception as e:
-                logger.warning(f"Reward computation failed for sample {i}: {e}")
+                _log.warning(f"Reward computation failed for sample {i}: {e}")
                 rewards.append(0.0)
         return rewards
 
@@ -157,9 +158,10 @@ def train(runner: StageRunner) -> None:
             num_generations=args.num_generations,
             max_completion_length=args.filter_max_completion_length,
             task_type="box",
-            iou_threshold=0.3 if num_rounds > 0 else 0.5,
+            iou_threshold=args.filter_iou_threshold,
             batch_size=args.filter_batch_size,
             empty_cache_every=args.filter_empty_cache_every,
+            reward_threshold=args.filter_reward_threshold,
             logger=logger,
         ))
 
@@ -217,10 +219,16 @@ if __name__ == "__main__":
     runner.add_arg("--save_steps", type=int, default=None)
     runner.add_arg("--warmup_steps", type=int, default=None)
     runner.add_arg("--num_generations", type=int, default=None)
+    runner.add_arg("--generation_batch_size", type=int, default=None,
+                   help="Prompts per generation batch (must be divisible by num_generations). Defaults to num_generations.")
     runner.add_arg("--filter_batch_size", type=int, default=None,
                    help="Batch size for difficulty-filter generation (prompts per batch)")
     runner.add_arg("--filter_max_completion_length", type=int, default=None,
                    help="Max completion length used only during difficulty filtering")
+    runner.add_arg("--filter_iou_threshold", type=float, default=None,
+                   help="IoU threshold used only during difficulty filtering (box task)")
+    runner.add_arg("--filter_reward_threshold", type=float, default=None,
+                   help="Reward threshold for correctness in difficulty filtering (overrides binary check)")
     runner.add_arg("--filter_empty_cache_every", type=int, default=None)
     runner.add_arg("--skip_difficulty_filter", action="store_true",
                    help="Skip difficulty filtering and use all generated samples")

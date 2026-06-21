@@ -95,7 +95,7 @@ def train(runner: StageRunner) -> None:
 
         # 70% general data (text-only pretrain data)
         general_data = []
-        if os.path.exists(args.general_data_path):
+        if args.general_data_path and os.path.exists(args.general_data_path):
             import json
             with open(args.general_data_path, "r") as f:
                 raw_general = json.load(f)
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     )
     runner.add_arg("--model_path", type=str, default=None)
     runner.add_arg("--output_dir", type=str, default=None)
-    runner.add_arg("--general_data_path", type=str, default=None)
+    runner.add_arg("--general_data_path", type=str, default="data/pretrain/pretrain_data.json")
     runner.add_arg("--coco_image_dir", type=str, default=None)
     runner.add_arg("--coco_ann_file", type=str,
                    default=None)

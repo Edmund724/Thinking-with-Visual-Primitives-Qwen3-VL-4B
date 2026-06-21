@@ -151,7 +151,7 @@ def run_grpo_rounds(
             max_grad_norm=0.3,
             lr_scheduler_type="cosine",
             num_generations=args.num_generations,
-            generation_batch_size=args.batch_size,
+            generation_batch_size=getattr(args, "generation_batch_size", None) or args.num_generations,
             max_completion_length=args.max_completion_length,
             beta=args.beta,
             temperature=args.temperature,

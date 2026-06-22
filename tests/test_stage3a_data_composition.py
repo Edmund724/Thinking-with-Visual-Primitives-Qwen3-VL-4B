@@ -48,6 +48,7 @@ def _make_args():
         warmup_steps=0,
         resume_from_checkpoint=None,
         format_token_weight=5.0,
+        max_grad_norm=1.0,
     )
 
 

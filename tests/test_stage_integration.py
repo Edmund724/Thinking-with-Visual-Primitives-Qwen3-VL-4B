@@ -167,7 +167,7 @@ class TestStage3bSFTPoint:
     def test_generate_path_samples(self):
         from src.data.generators.path_tracing import generate_path_tracing_dataset
         data = generate_path_tracing_dataset(n=10, seed=42)
-        _verify_sample_dicts(data, 8, {"point"})
+        _verify_sample_dicts(data, 8, {"path"})
 
 
 # ── Stage 4a: GRPO Box Expert ───────────────────────────────────────────────

@@ -176,11 +176,12 @@ python scripts/run_stage2_merge.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **当前默认配置**：15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box，并混入 general pretrain 数据。`num_epochs=2`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8`（有效 batch=8），`lr=1e-4`。
+> **当前默认配置**：15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box，并混入 general pretrain 数据。`num_epochs=3`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8`（有效 batch=8），`lr=1e-4`，`format_token_weight=40.0`，`max_grad_norm=1.0`。
 >
 > **近期改进**：
 > - SFT 目标会先经过 `clean_primitive_tags()` 清洗，修复生成数据中错序/重复的标签。
-> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=5.0`），让格式语法学得更快。
+> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=40.0`），让格式语法学得更快、ref token 梯度信号更强。
+> - `max_grad_norm=1.0` 在高 format token 权重下稳定训练。
 > - 支持 `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` 断点续训。
 >
 > **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
@@ -199,7 +200,13 @@ python scripts/run_stage3a_sft_box.py \
 
 ### Stage 3b: Point Expert SFT ✅
 
-> **实测数据**: 约 96K 样本 (25K general + 10K point + 50K maze + 10K path tracing + 1K 负样本 point)，1 epoch，batch_size=4, grad_accum=2 (有效 batch=8)，lr=1e-4，约 12K 步，~2.9s/step，耗时 **~9.7h** (含负样本预估，含 resume)。
+> **当前配置**：5K point + 10K maze + 5K path tracing + 500 负样本 point，并混入 general pretrain 数据。`num_epochs=3`，`max_seq_length=2048`，`batch_size=1`, `grad_accum=8`（有效 batch=8），`lr=1e-4`，`format_token_weight=40.0`，`max_grad_norm=1.0`。
+>
+> **近期改进（与 Stage 3a 对齐）**：
+> - SFT 目标会先经过 `clean_primitive_tags()` 清洗，修复生成数据中错序/重复的标签。
+> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=40.0`），让格式语法学得更快、ref token 梯度信号更强。
+> - `max_grad_norm=1.0` 在高 format token 权重下稳定训练。
+> - 3 个 epoch 让 embedding 获得更多更新机会，与 stage3a 训练调度一致。
 > 
 > 训练中途曾因显存碎片化导致速度从 3s/it 降至 30s/it，通过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` resume 后恢复正常。
 
@@ -209,16 +216,18 @@ python scripts/run_stage3b_sft_point.py \
     --model_path outputs/stage2_merged_base \
     --output_dir outputs/stage3b_sft_point \
     --num_point 10000 --num_maze 50000 \
-    --num_epochs 1 --learning_rate 1e-4 \
-    --batch_size 4 --gradient_accumulation_steps 2
+    --num_epochs 3 --learning_rate 1e-4 \
+    --batch_size 4 --gradient_accumulation_steps 2 \
+    --format_token_weight 40.0 --max_grad_norm 1.0
 
 # 若中途显存碎片化减速，resume 时加环境变量
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_point.py \
     --model_path outputs/stage2_merged_base \
     --output_dir outputs/stage3b_sft_point \
     --num_point 10000 --num_maze 50000 \
-    --num_epochs 1 --learning_rate 1e-4 \
+    --num_epochs 3 --learning_rate 1e-4 \
     --batch_size 4 --gradient_accumulation_steps 2 \
+    --format_token_weight 40.0 --max_grad_norm 1.0 \
     --resume_from_checkpoint outputs/stage3b_sft_point/checkpoint-5000
 ```
 

@@ -23,6 +23,7 @@ from src.data.generators.coco_box_generator import (
     generate_coco_negative_point_samples,
     generate_coco_point_samples,
 )
+from src.data.formatters.primitive_formatter import clean_primitive_tags
 from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.models.qwen_vl_loader import load_qlora_model
@@ -131,6 +132,21 @@ def train(runner: StageRunner) -> None:
             pickle.dump(all_data, f)
         logger.info(f"Cached training data to {cache_path}")
 
+    # Data cleaning: fix any wrong-order / duplicate primitive tags in the
+    # SFT targets so the model is not trained on corrupted syntax.
+    cleaned_count = 0
+    for d in all_data:
+        if d.get("task_type") in ("box", "point"):
+            original = d.get("reasoning", "")
+            cleaned = clean_primitive_tags(original, task_type=d.get("task_type", "point"))
+            if cleaned != original:
+                d["reasoning"] = cleaned
+                cleaned_count += 1
+    if cleaned_count > 0:
+        logger.info(f"  Cleaned primitive tags in {cleaned_count} samples")
+
+    logger.info(f"Total training samples: {len(all_data)}")
+
     # 3. Train
     trainer = create_sft_trainer(
         model=model,
@@ -146,6 +162,8 @@ def train(runner: StageRunner) -> None:
         save_steps=args.save_steps,
         warmup_steps=args.warmup_steps,
         use_wandb=False,
+        max_grad_norm=args.max_grad_norm,
+        format_token_weight=args.format_token_weight,
     )
 
     logger.info("Starting Point Expert SFT training...")
@@ -190,4 +208,8 @@ if __name__ == "__main__":
     runner.add_arg("--warmup_steps", type=int, default=None)
     runner.add_arg("--resume_from_checkpoint", type=str, default=None,
                    help="Path to checkpoint dir to resume from, e.g. outputs/stage3b_sft_point/checkpoint-500")
+    runner.add_arg("--format_token_weight", type=float, default=None,
+                   help="Loss weight multiplier for visual-primitive / think format tokens.")
+    runner.add_arg("--max_grad_norm", type=float, default=None,
+                   help="Maximum gradient norm for clipping.")
     runner.run(train)

@@ -4,6 +4,13 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Stage 3a/3b SFT 配置对齐：`format_token_weight=40`, `num_epochs=3`**
+  - `configs/stage3a_sft_box.yaml`：`format_token_weight` 从默认值上调至 40.0（ref token 梯度信号更强），`num_epochs` 1 → 3（embedding 获得更多更新机会）。
+  - `configs/stage3b_sft_point.yaml`：同步应用 `format_token_weight: 40.0`、`num_epochs: 3`、`max_grad_norm: 1.0`，与 stage3a 保持一致。
+  - `scripts/run_stage3b_sft_point.py`：新增 `--format_token_weight` 和 `--max_grad_norm` CLI 参数；新增 `clean_primitive_tags()` 数据清洗步骤（与 stage3a 对齐，防止训练数据包含损坏语法）；`create_sft_trainer()` 调用传入上述两个参数。
+
 ### Fixed
 
 - **Stage 4 GRPO `generation_batch_size` 与 `num_generations` 不兼容导致 ValueError**

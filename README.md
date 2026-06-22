@@ -167,11 +167,12 @@ python scripts/run_stage2_merge.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **Current config**: 15K box localization + 10K coarse-grained counting + 5K CLEVR spatial/VQA + 2K negative box, plus general pretrain mix. `num_epochs=2`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8` (effective batch=8), `lr=1e-4`.
+> **Current config**: 15K box localization + 10K coarse-grained counting + 5K CLEVR spatial/VQA + 2K negative box, plus general pretrain mix. `num_epochs=3`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8` (effective batch=8), `lr=1e-4`, `format_token_weight=40.0`, `max_grad_norm=1.0`.
 >
 > **Recent improvements**:
 > - SFT targets are now passed through `clean_primitive_tags()` to fix any wrong-order / duplicate tags in the generated data.
-> - `WeightedSFTTrainer` up-weights visual-primitive and `<think>` tokens (`format_token_weight=5.0`) so the format syntax is learned faster.
+> - `WeightedSFTTrainer` up-weights visual-primitive and `<think>` tokens (`format_token_weight=40.0`) so the format syntax is learned faster and the ref-token gradient signal is stronger.
+> - `max_grad_norm=1.0` stabilizes training under high format-token loss weights.
 > - Supports `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` to continue training.
 >
 > **Note**: Stage 3a does not enable data caching (pickle cache) to preserve accurate timing data. From Stage 3b onward, all scripts support training data pickle caching — auto-saved on first run, loaded directly on subsequent runs.
@@ -190,7 +191,13 @@ python scripts/run_stage3a_sft_box.py \
 
 ### Stage 3b: Point Expert SFT ✅
 
-> **Benchmark**: ~96K samples (25K general + 10K point + 50K maze + 10K path tracing + 1K negative point), 1 epoch, batch_size=4, grad_accum=2 (effective batch=8), lr=1e-4, ~12K steps, ~2.9s/step, duration **~9.7h** (estimated with negatives, including resume).
+> **Current config**: 5K point + 10K maze + 5K path tracing + 500 negative point, plus general pretrain mix. `num_epochs=3`, `max_seq_length=2048`, `batch_size=1`, `grad_accum=8` (effective batch=8), `lr=1e-4`, `format_token_weight=40.0`, `max_grad_norm=1.0`.
+>
+> **Recent improvements (aligned with Stage 3a)**:
+> - SFT targets are now passed through `clean_primitive_tags()` to fix any wrong-order / duplicate tags in the generated data.
+> - `WeightedSFTTrainer` up-weights visual-primitive and `<think>` tokens (`format_token_weight=40.0`) so the format syntax is learned faster and the ref-token gradient signal is stronger.
+> - `max_grad_norm=1.0` stabilizes training under high format-token loss weights.
+> - 3 epochs give embeddings more update opportunities, matching the stage3a training schedule.
 >
 > Mid-training VRAM fragmentation once caused speed degradation from 3s/it to 30s/it, resolved by resuming with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
@@ -200,16 +207,18 @@ python scripts/run_stage3b_sft_point.py \
     --model_path outputs/stage2_merged_base \
     --output_dir outputs/stage3b_sft_point \
     --num_point 10000 --num_maze 50000 \
-    --num_epochs 1 --learning_rate 1e-4 \
-    --batch_size 4 --gradient_accumulation_steps 2
+    --num_epochs 3 --learning_rate 1e-4 \
+    --batch_size 4 --gradient_accumulation_steps 2 \
+    --format_token_weight 40.0 --max_grad_norm 1.0
 
 # Resume with env var if VRAM fragmentation causes slowdown
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_point.py \
     --model_path outputs/stage2_merged_base \
     --output_dir outputs/stage3b_sft_point \
     --num_point 10000 --num_maze 50000 \
-    --num_epochs 1 --learning_rate 1e-4 \
+    --num_epochs 3 --learning_rate 1e-4 \
     --batch_size 4 --gradient_accumulation_steps 2 \
+    --format_token_weight 40.0 --max_grad_norm 1.0 \
     --resume_from_checkpoint outputs/stage3b_sft_point/checkpoint-5000
 ```
 

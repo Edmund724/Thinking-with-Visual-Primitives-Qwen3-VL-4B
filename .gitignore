@@ -54,5 +54,8 @@ wandb/
 # pip install 错误产生的临时文件（如 "=0.21.0"）
 =*
 
+# Agent 配置（本地）
+AGENTS.md
+
 # Windows 下载残留 Zone.Identifier 文件
 *:Zone.Identifier

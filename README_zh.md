@@ -100,7 +100,7 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 训练流程（Separated Experts + On-Policy Distillation）
 
 ```
-Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~11.5h  ✅
+Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~7.4h  ✅
 Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型          ~1m     ✅
 Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~12h   ✅
 Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~?    ✅ (含 resume)
@@ -126,7 +126,7 @@ Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert
 
 > **当前默认配置**：`num_box=30000`, `num_point=10000`, `num_clevr=5000`（共 45K 样本）, `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4`（有效 batch=4）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`，启用 curriculum。
 >
-> **训练结果**：22,500 步（2 epochs），loss 6.88 → 2.34（−66%），grad norm 14.48 → 1.25，收敛稳定。**耗时：~11.5h GPU 时间**（从 checkpoint-10000 resume，最终段 6h21m 完成 12.5K 步 @ ~1.8s/步）。墙钟时间 ~29h（含多次配置调整重启）。
+> **训练结果**：22,500 步（2 epochs），loss 6.88 → 2.34（−66%），grad norm 14.48 → 1.25，收敛稳定。**耗时：~7.4h 墙钟时间**（2026-06-23 13:34:45 → 20:57:45；45K 样本，2 epochs，data cache hit）。
 > - 输出：`outputs/stage1_visual_pretrain/`
 
 ```bash
@@ -134,6 +134,12 @@ python scripts/run_stage1_visual_pretrain.py --config configs/stage1_visual_pret
 ```
 
 **输出**: `outputs/stage1_visual_pretrain/`
+
+> **数据缓存**：Stage 1 现在会把生成的 COCO + CLEVR 训练数据 pickle 缓存到 `outputs/stage1_visual_pretrain/train_data_cache_<hash>.pkl`。resume 或重新运行时直接加载缓存，跳过耗时的数据生成。缓存 key 包含 `num_box`、`num_point`、`num_clevr`、`coco_image_dir` 和 `coco_ann_file`，修改这些参数会自动生成新缓存。如需强制重建，可加 `--regenerate_data`。
+>
+> **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage1_visual_pretrain/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复。
+>
+> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
 
 ---
 
@@ -176,17 +182,24 @@ python scripts/run_stage2_merge.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **当前默认配置**：15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box，并混入 general pretrain 数据。`num_epochs=3`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8`（有效 batch=8），`lr=1e-4`，`format_token_weight=40.0`，`max_grad_norm=1.0`。
+> **当前默认配置**：15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box，并混入 general pretrain 数据。`num_epochs=3`, `max_seq_length=2048`, `batch_size=2`, `grad_accum=6`（有效 batch=12），`lr=1e-4`，`format_token_weight=10.0`，`max_grad_norm=1.0`。
+>
+> **显存说明**：为避免 Stage 3a 在 RTX 5090D 24 GB 上爆显存，`max_seq_length` 从 4096 降到 2048，`batch_size` 从 4 降到 2，同时 `gradient_accumulation_steps` 从 3 提升到 6，保持有效 batch size 不变。
 >
 > **近期改进**：
 > - SFT 目标会先经过 `clean_primitive_tags()` 清洗，修复生成数据中错序/重复的标签。
-> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=40.0`），让格式语法学得更快、ref token 梯度信号更强。
+> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=10.0`），让格式语法学得更快、ref token 梯度信号更强。
 > - `max_grad_norm=1.0` 在高 format token 权重下稳定训练。
 > - 支持 `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` 断点续训。
+> - **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage3a_sft_box/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复。这样可以把长时间训练拆成多次跑，无需手动记录路径。
+> - **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间，方便分多次跑时核对进度和估算剩余时间。
+> - **数据缓存**：训练数据自动缓存到 `outputs/stage3a_sft_box/train_data_cache_<hash>.pkl`。resume 或重新运行时直接加载，跳过耗时的数据生成。可加 `--regenerate_data` 强制重建。
 >
-> **注**：Stage 3a 未启用数据缓存（pickle cache），保持原始生成逻辑以确保耗时数据的准确性。从 Stage 3b 起，所有脚本均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行直接加载，跳过耗时的数据生成步骤。
+> **注**：所有训练阶段（Stage 1、3a、3b、4a、4b、5、6）现在均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行或 resume 直接加载，跳过耗时的数据生成。每个阶段使用基于参数的缓存 key，修改任何数据生成参数会自动生成新缓存。如需强制重建，可加 `--regenerate_data`。
 >
 > **训练结果**：14,250 步（2 epochs），loss 2.87 → 1.62（−44%），均值 1.65，grad norm 6.20 → 0.44，收敛稳定。57,000 样本（15K box + 10K 计数 + 5K CLEVR + 2K 负样本 + 25K general）。**耗时：~12.1h GPU 时间** @ ~2.6 samples/sec。输出：`outputs/stage3a_sft_box/`。
+>
+> **⚠️ 重要提示（2026-06-22 修复后）**：如果 Stage 4a/4b 仍输出乱码（如 `personsยิง药材[[...]]`），根本原因是特殊 token（`<|box|>`、`<|ref|>` 等）的 embedding 在 SFT 阶段被冻结。请确认使用最新代码（`src/models/qwen_vl_loader.py` 已将 `embed_tokens` / `lm_head` 加入 `modules_to_save`），然后重新训练 Stage 3a/3b（最好从 Stage 1 重跑，使 merged base 也携带训练好的 embedding）。Stage 3 配置里的 `format_token_weight` 也已从 40.0 降到 10.0（40.0 原是为补偿 embedding 冻结的权宜之计）。
 
 ```bash
 # 从头训练
@@ -207,7 +220,9 @@ python scripts/run_stage3a_sft_box.py \
 > - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=40.0`），让格式语法学得更快、ref token 梯度信号更强。
 > - `max_grad_norm=1.0` 在高 format token 权重下稳定训练。
 > - 3 个 epoch 让 embedding 获得更多更新机会，与 stage3a 训练调度一致。
-> 
+> - **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage3b_sft_point/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复。
+> - **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
+>
 > 训练中途曾因显存碎片化导致速度从 3s/it 降至 30s/it，通过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` resume 后恢复正常。
 
 ```bash
@@ -235,7 +250,11 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
 
 > **注**：GRPO 采用多轮循环结构，每轮结束后模型会被 reload，轮间是天然断点。每轮本身应一次性跑完；若中途 OOM，脚本会自动查找最新的 `checkpoint-*` 并从中断处恢复。已完成的轮次在重跑时自动跳过。
 >
+> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
+>
 > **显存提示**：所有 stage 脚本现已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，无需手动添加，可有效缓解长时间训练中的 CUDA 显存碎片化问题。
+
+> **乱码提示**：如果 rollout 在坐标附近出现非英文学符乱码，通常是 Stage 3a/3b adapter 训练时特殊 token embedding 不可训练导致的。请先用最新版 `qwen_vl_loader.py`（`embed_tokens` / `lm_head` 加入 `modules_to_save`）重新训练 Stage 3a/3b，再进入 GRPO。
 
 > **难度筛选（论文 Sec 2.5.2）**：论文在 GRPO 训练前会筛选“Normal”难度样本（模型有时对有时错）。对单卡环境，这个步骤需要额外的 on-policy rollout 推理，容易引发 OOM。我们**默认跳过**该步骤（`skip_difficulty_filter: true`），并将数据量加倍来补偿。Hard 样本（全错）在 GRPO 训练中 reward 方差为 0，梯度接近 0，只会浪费算力但不会损害训练效果；Easy 样本（全对）同理。若在多卡环境希望重新启用筛选，将 YAML 中的 `skip_difficulty_filter` 设为 `false` 即可。
 
@@ -248,6 +267,10 @@ python scripts/run_stage4a_grpo_box.py \
 
 ### Stage 4b: Point Expert GRPO（默认 3 轮循环）
 
+> **注**：与 Stage 4a 相同，Stage 4b 会自动检测 `round_N/checkpoint-*` 中最新 checkpoint，中断的轮次会自动续训，已完成轮次自动跳过。
+>
+> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
+
 ```bash
 python scripts/run_stage4b_grpo_point.py \
     --model_path outputs/stage3b_sft_point \
@@ -257,6 +280,12 @@ python scripts/run_stage4b_grpo_point.py \
 
 ### Stage 5: Unified RFT（专家生成 rollout）
 
+> **数据缓存**：prompt 池和专家生成的过滤后训练数据均缓存到 `outputs/stage5_rft_unified/`。resume 或重新运行时直接加载，跳过专家模型加载和推理生成。缓存 key 包含专家模型路径，更换专家自动触发重新生成。可加 `--regenerate_data` 强制重建。
+>
+> **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage5_rft_unified/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复 SFT 阶段。
+>
+> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
+
 ```bash
 python scripts/run_stage5_rft_unified.py \
     --model_path outputs/stage2_merged_base \
@@ -264,6 +293,10 @@ python scripts/run_stage5_rft_unified.py \
 ```
 
 ### Stage 6: OPD（On-Policy Distillation）
+
+> **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage6_opd/checkpoint-*` 存在，脚本会自动从最新 checkpoint 恢复并行蒸馏（恢复 optimizer/scheduler/epoch/step 状态）。
+>
+> **带时间戳的训练日志**：OPD 的每步日志已通过 stage logger 自动带上墙钟时间戳，便于分多次跑时跟踪进度。
 
 ```bash
 python scripts/run_stage6_opd.py \
@@ -444,6 +477,7 @@ for name, path in stages.items():
 > - 12GB 显卡建议在运行前设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 减少显存碎片。
 > - OPD 阶段需同时加载 3 个模型（student + 2 experts），教师模型自动使用 4-bit 量化，峰值显存约为单模型 SFT 的 1.8 倍。
 > - GRPO 阶段显存占用与 `num_generations` 正相关，12GB 下建议 `num_generations=3`，24GB 下可用 `num_generations=5`。
+> - **Windows 共享 GPU 内存**：如果任务管理器显示“共享 GPU 内存”一直被占用，而专用+共享的总量远未达到上限，这通常是 WDDM 的分配问题，不是显存不够。Stage 脚本已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 以缓解显存碎片。若仍持续出现，可尝试关闭 Windows 的“硬件加速 GPU 调度（HAGS）”，并确保没有其他程序占用显存。
 
 ### 过程奖励函数 (Process Reward)
 

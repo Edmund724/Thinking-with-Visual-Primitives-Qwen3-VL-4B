@@ -18,6 +18,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
+# Helper: find latest checkpoint-* directory under a stage output dir.
+_latest_checkpoint() {
+    local dir="$1"
+    ls -d "${dir}/checkpoint-"* 2>/dev/null | sort -V | tail -n 1
+}
+
+# Helper: find latest checkpoint-* directory inside GRPO round_* subdirs.
+_latest_grpo_checkpoint() {
+    local dir="$1"
+    find "$dir" -maxdepth 2 -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -n 1
+}
+
 echo "============================================================"
 echo "TVP Pipeline: Separated Experts + OPD"
 echo "============================================================"
@@ -29,7 +41,12 @@ STAGE1_ADAPTER="${STAGE1_DIR}/adapter_model.safetensors"
 if [ -f "$STAGE1_ADAPTER" ]; then
     echo "✅ Stage 1 Visual Pretrain already done"
 else
-    echo "🔄 Running Stage 1: Unified Visual Grounding Pretrain..."
+    LATEST_CKPT=$(_latest_checkpoint "$STAGE1_DIR")
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "🔄 Resuming Stage 1: Unified Visual Grounding Pretrain from ${LATEST_CKPT}..."
+    else
+        echo "🔄 Running Stage 1: Unified Visual Grounding Pretrain..."
+    fi
     python scripts/run_stage1_visual_pretrain.py \
         --model_path models/Qwen3-VL-4B-Thinking \
         --output_dir outputs/stage1_visual_pretrain
@@ -58,7 +75,13 @@ STAGE3A_ADAPTER="${STAGE3A_DIR}/adapter_model.safetensors"
 if [ -f "$STAGE3A_ADAPTER" ]; then
     echo "✅ Stage 3a Box Expert SFT already done"
 else
-    echo "🔄 Running Stage 3a: Box Expert SFT..."
+    # If previous run was interrupted, resume from the latest checkpoint automatically.
+    LATEST_CKPT=$(ls -d "${STAGE3A_DIR}/checkpoint-"* 2>/dev/null | sort -V | tail -n 1)
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "🔄 Resuming Stage 3a: Box Expert SFT from ${LATEST_CKPT}..."
+    else
+        echo "🔄 Running Stage 3a: Box Expert SFT..."
+    fi
     python scripts/run_stage3a_sft_box.py \
         --model_path outputs/stage2_merged_base \
         --output_dir outputs/stage3a_sft_box
@@ -72,7 +95,12 @@ STAGE3B_ADAPTER="${STAGE3B_DIR}/adapter_model.safetensors"
 if [ -f "$STAGE3B_ADAPTER" ]; then
     echo "✅ Stage 3b Point Expert SFT already done"
 else
-    echo "🔄 Running Stage 3b: Point Expert SFT..."
+    LATEST_CKPT=$(_latest_checkpoint "$STAGE3B_DIR")
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "🔄 Resuming Stage 3b: Point Expert SFT from ${LATEST_CKPT}..."
+    else
+        echo "🔄 Running Stage 3b: Point Expert SFT..."
+    fi
     python scripts/run_stage3b_sft_point.py \
         --model_path outputs/stage2_merged_base \
         --output_dir outputs/stage3b_sft_point
@@ -86,7 +114,12 @@ STAGE4A_FINAL="${STAGE4A_DIR}/round_2/adapter_model.safetensors"
 if [ -f "$STAGE4A_FINAL" ]; then
     echo "✅ Stage 4a Box Expert GRPO already done"
 else
-    echo "🔄 Running Stage 4a: Box Expert GRPO..."
+    LATEST_CKPT=$(_latest_grpo_checkpoint "$STAGE4A_DIR")
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "🔄 Resuming Stage 4a: Box Expert GRPO from ${LATEST_CKPT}..."
+    else
+        echo "🔄 Running Stage 4a: Box Expert GRPO..."
+    fi
     python scripts/run_stage4a_grpo_box.py \
         --model_path outputs/stage3a_sft_box \
         --output_dir outputs/stage4a_grpo_box
@@ -100,7 +133,12 @@ STAGE4B_FINAL="${STAGE4B_DIR}/round_2/adapter_model.safetensors"
 if [ -f "$STAGE4B_FINAL" ]; then
     echo "✅ Stage 4b Point Expert GRPO already done"
 else
-    echo "🔄 Running Stage 4b: Point Expert GRPO..."
+    LATEST_CKPT=$(_latest_grpo_checkpoint "$STAGE4B_DIR")
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "🔄 Resuming Stage 4b: Point Expert GRPO from ${LATEST_CKPT}..."
+    else
+        echo "🔄 Running Stage 4b: Point Expert GRPO..."
+    fi
     python scripts/run_stage4b_grpo_point.py \
         --model_path outputs/stage3b_sft_point \
         --output_dir outputs/stage4b_grpo_point
@@ -114,7 +152,12 @@ STAGE5_FINAL="${STAGE5_DIR}/final_model/adapter_model.safetensors"
 if [ -f "$STAGE5_FINAL" ]; then
     echo "✅ Stage 5 Unified RFT already done"
 else
-    echo "🔄 Running Stage 5: Unified RFT..."
+    LATEST_CKPT=$(_latest_checkpoint "$STAGE5_DIR")
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "🔄 Resuming Stage 5: Unified RFT from ${LATEST_CKPT}..."
+    else
+        echo "🔄 Running Stage 5: Unified RFT..."
+    fi
     python scripts/run_stage5_rft_unified.py \
         --model_path outputs/stage2_merged_base \
         --output_dir outputs/stage5_rft_unified
@@ -128,7 +171,12 @@ STAGE6_ADAPTER="${STAGE6_DIR}/adapter_model.safetensors"
 if [ -f "$STAGE6_ADAPTER" ]; then
     echo "✅ Stage 6 OPD already done"
 else
-    echo "🔄 Running Stage 6: OPD..."
+    LATEST_CKPT=$(_latest_checkpoint "$STAGE6_DIR")
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "🔄 Resuming Stage 6: OPD from ${LATEST_CKPT}..."
+    else
+        echo "🔄 Running Stage 6: OPD..."
+    fi
     python scripts/run_stage6_opd.py \
         --student_path outputs/stage5_rft_unified/final_model \
         --output_dir outputs/stage6_opd

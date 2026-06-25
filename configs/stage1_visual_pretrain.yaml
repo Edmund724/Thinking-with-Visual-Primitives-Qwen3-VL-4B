@@ -3,9 +3,9 @@ model_path: models/Qwen3-VL-4B-Thinking
 output_dir: outputs/stage1_visual_pretrain
 coco_image_dir: data/coco/train2017
 coco_ann_file: data/coco/annotations/instances_train2017.json
-max_seq_length: 2048
-batch_size: 1
-gradient_accumulation_steps: 4
+max_seq_length: 1024
+batch_size: 4
+gradient_accumulation_steps: 1
 learning_rate: 2.0e-6
 lora_r: 256
 lora_alpha: 512

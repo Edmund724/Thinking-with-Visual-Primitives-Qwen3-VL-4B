@@ -49,6 +49,7 @@ def _make_args():
         resume_from_checkpoint=None,
         format_token_weight=5.0,
         max_grad_norm=1.0,
+        regenerate_data=False,
     )
 
 
@@ -63,6 +64,9 @@ def test_stage3a_includes_negative_boxes_without_crash():
     runner.args = _make_args()
     runner.logger = MagicMock()
 
+    def _fake_cached_data(cache_path, generate_fn):
+        return generate_fn()
+
     with (
         patch.object(stage3a, "generate_coco_box_samples", return_value=box_samples),
         patch.object(stage3a, "generate_coco_counting_samples", return_value=counting_samples),
@@ -75,6 +79,7 @@ def test_stage3a_includes_negative_boxes_without_crash():
         patch.object(stage3a.torch.cuda, "empty_cache"),
         patch("src.utils.logging_utils.setup_logging", return_value=MagicMock()),
     ):
+        runner.cached_data.side_effect = _fake_cached_data
         stage3a.train(runner)
 
     trainer_mock.assert_called_once()

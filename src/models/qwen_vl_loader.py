@@ -22,6 +22,13 @@ from ..utils.constants import (
     SPECIAL_TOKENS,
 )
 
+# Modules whose full parameters must be trainable (not just LoRA) so that
+# newly-added special-token embeddings (<|box|>, <|ref|>, etc.) are learned and
+# saved with the adapter.  Without this, the embeddings/lm_head stay frozen at
+# their random/base-model initialization and the model emits garbage non-Latin
+# characters instead of the visual-primitive tokens.
+_MODULES_TO_SAVE = ["model.language_model.embed_tokens", "lm_head"]
+
 logger = logging.getLogger(__name__)
 
 
@@ -240,8 +247,11 @@ def load_qlora_model(
             lora_dropout=lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
+            modules_to_save=_MODULES_TO_SAVE,
+            ensure_weight_tying=True,
         )
         model = get_peft_model(model, peft_config)
+        logger.info(f"embed_tokens/lm_head set as modules_to_save for special-token learning")
 
     # After PEFT wrapping, ensure use_cache=False on ALL nested config objects.
     # Qwen3VL nesting: PeftModel → LoraModel → Qwen3VLForConditionalGeneration

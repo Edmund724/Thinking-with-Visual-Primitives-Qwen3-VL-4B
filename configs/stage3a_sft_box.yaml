@@ -3,12 +3,16 @@ model_path: outputs/stage2_merged_base
 output_dir: outputs/stage3a_sft_box
 coco_image_dir: data/coco/train2017
 coco_ann_file: data/coco/annotations/instances_train2017.json
-max_seq_length: 4096
-batch_size: 4
-gradient_accumulation_steps: 3
+max_seq_length: 2048
+batch_size: 2
+gradient_accumulation_steps: 6
 learning_rate: 1.0e-4
 num_epochs: 3
-format_token_weight: 40.0
+# format_token_weight: previously 40.0 as a workaround for frozen special-token embeddings.
+# After the embed_tokens/lm_head modules_to_save fix, 10.0 is sufficient to reach the
+# ~80-90% format compliance needed for GRPO warm-start while leaving more capacity
+# for content/reasoning/coordinate tokens.
+format_token_weight: 10.0
 max_grad_norm: 1.0
 lora_r: 256
 lora_alpha: 512

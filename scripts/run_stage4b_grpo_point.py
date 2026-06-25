@@ -5,6 +5,7 @@ Continues training the Point Expert LoRA adapter with GRPO on point+maze data.
 Uses Format RM + Accuracy RM with difficulty grading (Normal only).
 """
 
+import hashlib
 import os
 
 import sys
@@ -138,10 +139,20 @@ def train(runner: StageRunner) -> None:
         logger.info(f"Total GRPO samples: {len(all_data)}")
         return all_data
 
-    all_data = runner.cached_data(
-        os.path.join(args.output_dir, "train_data_cache.pkl"),
-        _generate_raw_data,
+    raw_cache_key = (
+        f"{args.num_point}|{args.num_maze}|{args.num_path}|"
+        f"{args.coco_image_dir}|{args.coco_ann_file}"
     )
+    raw_cache_hash = hashlib.md5(raw_cache_key.encode()).hexdigest()[:8]
+    raw_cache_path = os.path.join(
+        args.output_dir, f"train_data_cache_{raw_cache_hash}.pkl"
+    )
+
+    if args.regenerate_data and os.path.exists(raw_cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {raw_cache_path}")
+        os.remove(raw_cache_path)
+
+    all_data = runner.cached_data(raw_cache_path, _generate_raw_data)
 
     num_rounds = args.num_rounds
 
@@ -165,10 +176,21 @@ def train(runner: StageRunner) -> None:
                 logger=logger,
             )
 
-        all_data = runner.cached_data(
-            os.path.join(args.output_dir, "filtered_train_data_cache.pkl"),
-            _filter_data,
+        filtered_cache_key = (
+            f"{raw_cache_key}|{args.model_path}|{args.num_generations}|"
+            f"{args.filter_max_completion_length}|{args.filter_point_dist_threshold}|"
+            f"{args.filter_batch_size}|{args.filter_reward_threshold}"
         )
+        filtered_cache_hash = hashlib.md5(filtered_cache_key.encode()).hexdigest()[:8]
+        filtered_cache_path = os.path.join(
+            args.output_dir, f"filtered_train_data_cache_{filtered_cache_hash}.pkl"
+        )
+
+        if args.regenerate_data and os.path.exists(filtered_cache_path):
+            logger.info(f"--regenerate_data set; removing old cache {filtered_cache_path}")
+            os.remove(filtered_cache_path)
+
+        all_data = runner.cached_data(filtered_cache_path, _filter_data)
 
     # Build quality RM factory (captures use_quality_rm_api flag in closure).
     quality_fn_factory = (
@@ -267,4 +289,6 @@ if __name__ == "__main__":
         default=None,
         help="Stop after this many evals without improvement.",
     )
+    runner.add_arg("--regenerate_data", action="store_true",
+                   help="Force regeneration of all cached data (raw + filtered).")
     runner.run(train)

@@ -11,9 +11,9 @@ Following the paper (Sec 2.5.4), we distill from each expert separately:
 Only one expert is kept in GPU memory at a time to avoid VRAM pressure.
 """
 
+import hashlib
 import os
 import gc
-import glob
 import sys
 
 import torch
@@ -29,34 +29,50 @@ from src.data.generators.coco_box_generator import (
 )
 from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.models.qwen_vl_loader import load_qlora_model
-from src.training.opd_trainer import train_opd, train_opd_parallel
+from src.training.opd_trainer import train_opd_parallel
 from src.training.memory_utils import log_memory_status, clear_memory
 from src.utils.constants import DEFAULT_DISTILL_TEMPERATURE
-
-
-def _latest_opd_checkpoint(output_dir: str):
-    """Return the latest checkpoint-* directory under output_dir, or None."""
-    ckpt_dirs = sorted(
-        glob.glob(os.path.join(output_dir, "checkpoint-*")),
-        key=lambda d: int(d.split("-")[-1]),
-    )
-    return ckpt_dirs[-1] if ckpt_dirs else None
 
 
 def train(runner: StageRunner) -> None:
     args, logger = runner.args, runner.logger
 
-    # 1. Load Student (Unified RFT model)
-    logger.info(f"Loading student from {args.student_path}...")
+    # 1. Determine resume checkpoint (explicit flag or latest auto checkpoint)
+    resume_ckpt = getattr(args, "resume_from_checkpoint", None)
+    if resume_ckpt and not os.path.isdir(resume_ckpt):
+        logger.error(f"Requested checkpoint not found: {resume_ckpt}")
+        sys.exit(1)
+    if not resume_ckpt:
+        latest = runner.latest_checkpoint(args.output_dir)
+        if latest:
+            logger.info(f"Auto-resuming from latest checkpoint: {latest}")
+            resume_ckpt = latest
+        else:
+            logger.info(f"No checkpoint found; starting fresh from {args.student_path}")
+
+    # 2. Load Student (Unified RFT model) from checkpoint when resuming
+    load_path = resume_ckpt if resume_ckpt else args.student_path
+    logger.info(f"Loading student from: {load_path}")
     student_model, processor = load_qlora_model(
-        model_name=args.student_path,
+        model_name=load_path,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
     )
     log_memory_status("Student loaded:")
 
     # 2. Generate or load cached OPD training data
-    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
+    cache_key = (
+        f"{args.num_box}|{args.num_point}|{args.num_maze}|"
+        f"{args.coco_image_dir}|{args.coco_ann_file}"
+    )
+    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+    cache_path = os.path.join(
+        args.output_dir, f"train_data_cache_{cache_hash}.pkl"
+    )
+
+    if args.regenerate_data and os.path.exists(cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {cache_path}")
+        os.remove(cache_path)
 
     def generate_opd_data():
         logger.info("Generating OPD training data...")
@@ -100,12 +116,6 @@ def train(runner: StageRunner) -> None:
     box_data = [d for d in all_data if d.get("task_type") == "box"]
     point_data = [d for d in all_data if d.get("task_type") in ("point", "maze")]
     logger.info(f"Routing: {len(box_data)} box samples, {len(point_data)} point/maze samples")
-
-    # Validate user-provided checkpoint if any
-    resume_ckpt = args.resume_from_checkpoint
-    if resume_ckpt and not os.path.isdir(resume_ckpt):
-        logger.error(f"Checkpoint not found: {resume_ckpt}")
-        sys.exit(1)
 
     # 3. Load both experts for parallel distillation (gradient accumulation)
     logger.info(f"Loading Box Expert from {args.box_expert_path}...")
@@ -190,4 +200,6 @@ if __name__ == "__main__":
     runner.add_arg("--save_steps", type=int, default=None)
     runner.add_arg("--resume_from_checkpoint", type=str, default=None,
                    help="Path to checkpoint dir to resume from, e.g. outputs/stage6_opd/checkpoint-500")
+    runner.add_arg("--regenerate_data", action="store_true",
+                   help="Force regeneration of training data and ignore existing cache.")
     runner.run(train)

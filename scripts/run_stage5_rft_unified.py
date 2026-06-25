@@ -10,6 +10,7 @@ Key design (corrected per paper):
 """
 
 import gc
+import hashlib
 import os
 import random
 import sys
@@ -32,6 +33,7 @@ from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.data.datasets.image_loader import load_image
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
+from src.training.callbacks import TimeLoggingCallback
 from src.training.memory_utils import log_memory_status, clear_memory
 from src.utils.reward.accuracy_rm import compute_total_reward
 from src.models.visual_primitive_parser import PrimitiveParser
@@ -141,10 +143,24 @@ def difficulty_grading(rollouts, gt_text, task_type, maze_grid, iou_threshold, d
 def train(runner: StageRunner) -> None:
     args, logger = runner.args, runner.logger
 
-    # 1. Load Unified model from merged Stage 2 base (fresh LoRA)
-    logger.info(f"Loading Unified model from merged base: {args.model_path}")
+    # 1. Determine resume checkpoint (explicit flag or latest auto checkpoint)
+    resume_ckpt = getattr(args, "resume_from_checkpoint", None)
+    if resume_ckpt and not os.path.isdir(resume_ckpt):
+        logger.error(f"Requested checkpoint not found: {resume_ckpt}")
+        sys.exit(1)
+    if not resume_ckpt:
+        latest = runner.latest_checkpoint(args.output_dir)
+        if latest:
+            logger.info(f"Auto-resuming from latest checkpoint: {latest}")
+            resume_ckpt = latest
+        else:
+            logger.info(f"No checkpoint found; starting fresh from {args.model_path}")
+
+    # 2. Load Unified model from checkpoint when resuming, otherwise from merged Stage 2 base
+    load_path = resume_ckpt if resume_ckpt else args.model_path
+    logger.info(f"Loading Unified model from: {load_path}")
     unified_model, processor = load_qlora_model(
-        model_name=args.model_path,
+        model_name=load_path,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
     )
@@ -217,95 +233,127 @@ def train(runner: StageRunner) -> None:
         logger.info(f"Total prompts: {len(prompts)}")
         return prompts
 
-    all_prompts = runner.cached_data(
-        os.path.join(args.output_dir, "prompts_cache.pkl"),
-        _generate_prompts,
+    prompt_cache_key = (
+        f"{args.num_box_prompts}|{args.num_counting_prompts}|{args.num_clevr_prompts}|"
+        f"{args.num_point_prompts}|{args.num_maze_prompts}|{args.num_path_prompts}|"
+        f"{args.coco_image_dir}|{args.coco_ann_file}"
+    )
+    prompt_cache_hash = hashlib.md5(prompt_cache_key.encode()).hexdigest()[:8]
+    prompt_cache_path = os.path.join(
+        args.output_dir, f"prompts_cache_{prompt_cache_hash}.pkl"
     )
 
-    # 3. Load Box Expert (teacher)
-    logger.info(f"Loading Box Expert from {args.box_expert_path}...")
-    box_expert, _ = load_qlora_model(
-        model_name=args.box_expert_path,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
+    if args.regenerate_data and os.path.exists(prompt_cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {prompt_cache_path}")
+        os.remove(prompt_cache_path)
+
+    all_prompts = runner.cached_data(prompt_cache_path, _generate_prompts)
+
+    # 3. Generate or load cached filtered data (expert generation + difficulty grading)
+    filtered_cache_key = (
+        f"{args.num_box_prompts}|{args.num_counting_prompts}|{args.num_clevr_prompts}|"
+        f"{args.num_point_prompts}|{args.num_maze_prompts}|{args.num_path_prompts}|"
+        f"{args.box_expert_path}|{args.point_expert_path}|"
+        f"{args.num_rollouts}|{args.max_new_tokens}|"
+        f"{args.iou_threshold}|{args.point_dist_threshold}"
+    )
+    filtered_cache_hash = hashlib.md5(filtered_cache_key.encode()).hexdigest()[:8]
+    filtered_cache_path = os.path.join(
+        args.output_dir, f"filtered_data_cache_{filtered_cache_hash}.pkl"
     )
 
-    # 4. Load Point Expert (teacher)
-    logger.info(f"Loading Point Expert from {args.point_expert_path}...")
-    point_expert, _ = load_qlora_model(
-        model_name=args.point_expert_path,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-    )
+    if args.regenerate_data and os.path.exists(filtered_cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {filtered_cache_path}")
+        os.remove(filtered_cache_path)
 
-    # 5. Expert generation + difficulty grading
-    logger.info("Running expert generation with difficulty grading...")
-    filtered_data = []
-    easy_samples = []
-    hard_count = 0
-
-    for i, sample in enumerate(all_prompts):
-        task_type = sample.get("task_type", "box")
-
-        # Select expert based on task type
-        if task_type == "box":
-            expert = box_expert
-        else:
-            expert = point_expert
-
-        rollouts, gt_text, _, maze_grid = generate_with_expert(
-            expert, processor, sample,
-            args.num_rollouts, args.max_new_tokens,
+    def _run_expert_generation():
+        # 3a. Load Box Expert (teacher)
+        logger.info(f"Loading Box Expert from {args.box_expert_path}...")
+        box_expert, _ = load_qlora_model(
+            model_name=args.box_expert_path,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
         )
 
-        difficulty, best_rollout, avg_score = difficulty_grading(
-            rollouts, gt_text, sample.get("task_type", "box"),
-            sample.get("maze_grid"),
-            args.iou_threshold, args.point_dist_threshold,
+        # 3b. Load Point Expert (teacher)
+        logger.info(f"Loading Point Expert from {args.point_expert_path}...")
+        point_expert, _ = load_qlora_model(
+            model_name=args.point_expert_path,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
         )
 
-        record = {
-            "image": sample["image"],
-            "prompt": sample["prompt"],
-            "reasoning": best_rollout or sample["reasoning"],
-            "answer": PrimitiveParser.extract_answer(best_rollout) or sample["answer"],
-            "task_type": sample.get("task_type", "box"),
-        }
+        # 3c. Expert generation + difficulty grading
+        logger.info("Running expert generation with difficulty grading...")
+        filtered_data = []
+        easy_samples = []
+        hard_count = 0
 
-        if difficulty == "normal":
-            filtered_data.append(record)
-        elif difficulty == "easy":
-            easy_samples.append(record)
-        else:
-            hard_count += 1
+        for i, sample in enumerate(all_prompts):
+            task_type = sample.get("task_type", "box")
 
-        if (i + 1) % 50 == 0:
-            logger.info(
-                f"  {i + 1}/{len(all_prompts)}: "
-                f"{len(filtered_data)} normal kept, {len(easy_samples)} easy, {hard_count} hard"
+            if task_type == "box":
+                expert = box_expert
+            else:
+                expert = point_expert
+
+            rollouts, gt_text, _, maze_grid = generate_with_expert(
+                expert, processor, sample,
+                args.num_rollouts, args.max_new_tokens,
             )
 
-    # Retain all Normal + 5% Easy to mitigate catastrophic forgetting (paper Sec 2.5.3)
-    if easy_samples:
-        random.shuffle(easy_samples)
-        retained_easy_count = max(1, int(len(easy_samples) * 0.05))
-        filtered_data.extend(easy_samples[:retained_easy_count])
+            difficulty, best_rollout, avg_score = difficulty_grading(
+                rollouts, gt_text, sample.get("task_type", "box"),
+                sample.get("maze_grid"),
+                args.iou_threshold, args.point_dist_threshold,
+            )
+
+            record = {
+                "image": sample["image"],
+                "prompt": sample["prompt"],
+                "reasoning": best_rollout or sample["reasoning"],
+                "answer": PrimitiveParser.extract_answer(best_rollout) or sample["answer"],
+                "task_type": sample.get("task_type", "box"),
+            }
+
+            if difficulty == "normal":
+                filtered_data.append(record)
+            elif difficulty == "easy":
+                easy_samples.append(record)
+            else:
+                hard_count += 1
+
+            if (i + 1) % 50 == 0:
+                logger.info(
+                    f"  {i + 1}/{len(all_prompts)}: "
+                    f"{len(filtered_data)} normal kept, {len(easy_samples)} easy, {hard_count} hard"
+                )
+
+        # Retain all Normal + 5% Easy to mitigate catastrophic forgetting
+        if easy_samples:
+            random.shuffle(easy_samples)
+            retained_easy_count = max(1, int(len(easy_samples) * 0.05))
+            filtered_data.extend(easy_samples[:retained_easy_count])
+            logger.info(
+                f"Retained {retained_easy_count} Easy samples ({0.05*100:.0f}%) alongside Normal data"
+            )
+
         logger.info(
-            f"Retained {retained_easy_count} Easy samples ({0.05*100:.0f}%) alongside Normal data"
+            f"Difficulty grading done: {len(filtered_data)} total kept "
+            f"(Normal + 5% Easy), {len(easy_samples)} Easy total, {hard_count} Hard skipped"
         )
 
-    logger.info(
-        f"Difficulty grading done: {len(filtered_data)} total kept "
-        f"(Normal + 5% Easy), {len(easy_samples)} Easy total, {hard_count} Hard skipped"
-    )
+        # Release expert models before SFT to free VRAM
+        logger.info("Releasing expert models before Unified SFT training...")
+        del box_expert
+        del point_expert
+        gc.collect()
+        clear_memory()
+        log_memory_status("Expert models released:")
 
-    # Release expert models before SFT to free VRAM for Unified model training.
-    logger.info("Releasing expert models before Unified SFT training...")
-    del box_expert
-    del point_expert
-    gc.collect()
-    clear_memory()
-    log_memory_status("Expert models released:")
+        return filtered_data
+
+    filtered_data = runner.cached_data(filtered_cache_path, _run_expert_generation)
 
     if len(filtered_data) < 100:
         logger.warning("Too few Normal samples — consider adjusting thresholds")
@@ -313,10 +361,6 @@ def train(runner: StageRunner) -> None:
 
     # 6. SFT Unified model on Normal-difficulty expert data
     logger.info("Training Unified model on Normal-difficulty expert data...")
-    resume_ckpt = args.resume_from_checkpoint
-    if resume_ckpt and not os.path.isdir(resume_ckpt):
-        logger.error(f"Checkpoint not found: {resume_ckpt}")
-        sys.exit(1)
 
     trainer = create_sft_trainer(
         model=unified_model,
@@ -332,6 +376,7 @@ def train(runner: StageRunner) -> None:
         save_steps=args.save_steps,
         warmup_steps=args.warmup_steps,
         use_wandb=False,
+        additional_callbacks=[TimeLoggingCallback()],
     )
 
     trainer.train(resume_from_checkpoint=resume_ckpt)
@@ -380,4 +425,6 @@ if __name__ == "__main__":
     runner.add_arg("--warmup_steps", type=int, default=None)
     runner.add_arg("--resume_from_checkpoint", type=str, default=None,
                    help="Path to checkpoint dir to resume SFT training, e.g. outputs/stage5_rft_unified/checkpoint-500")
+    runner.add_arg("--regenerate_data", action="store_true",
+                   help="Force regeneration of prompts and filtered data, ignoring existing caches.")
     runner.run(train)

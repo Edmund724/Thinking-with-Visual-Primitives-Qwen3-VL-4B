@@ -19,6 +19,7 @@ Data:
 After training: run scripts/merge_stage1.py to merge LoRA into base.
 """
 
+import hashlib
 import os
 import random
 
@@ -38,77 +39,97 @@ from src.data.generators.clevr_spatial import generate_clevr_spatial_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.memory_utils import log_memory_status
 from src.training.trainers.sft_trainer import create_sft_trainer
+from src.training.callbacks import TimeLoggingCallback
 
 
 def train(runner: StageRunner) -> None:
     args, logger = runner.args, runner.logger
 
-    # 1. Load model with LoRA. Special tokens are randomly initialized —
+    # 1. Determine resume checkpoint (explicit flag or latest auto checkpoint)
+    resume_ckpt = getattr(args, "resume_from_checkpoint", None)
+    if resume_ckpt and not os.path.isdir(resume_ckpt):
+        logger.error(f"Requested checkpoint not found: {resume_ckpt}")
+        return
+    if not resume_ckpt:
+        latest = runner.latest_checkpoint(args.output_dir)
+        if latest:
+            logger.info(f"Auto-resuming Stage 1 from latest checkpoint: {latest}")
+            resume_ckpt = latest
+        else:
+            logger.info(f"No checkpoint found; starting Stage 1 fresh from {args.model_path}")
+
+    # 2. Load model with LoRA. Special tokens are randomly initialized —
     #    they will be learned during visual pretrain (no pretrain embedding
     #    injection needed in the unified flow).
-    resume_ckpt = getattr(args, "resume_from_checkpoint", None)
+    load_path = resume_ckpt if resume_ckpt else args.model_path
     vit_unfreeze = getattr(args, "unfreeze_vit_layers", 0)
-    if resume_ckpt:
-        logger.info(f"Resuming Stage 1 from checkpoint: {resume_ckpt}")
-        model, processor = load_qlora_model(
-            model_name=resume_ckpt,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            unfreeze_vit_layers=vit_unfreeze,
-        )
-    else:
-        logger.info(
-            f"Loading base model from {args.model_path} "
-            f"(special tokens will be randomly initialized)"
-        )
-        model, processor = load_qlora_model(
-            model_name=args.model_path,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            unfreeze_vit_layers=vit_unfreeze,
-        )
+    logger.info(f"Loading model from: {load_path}")
+    model, processor = load_qlora_model(
+        model_name=load_path,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        unfreeze_vit_layers=vit_unfreeze,
+    )
     log_memory_status("After model loading:")
 
-    # 2. Generate visual pretrain data (COCO + CLEVR)
-    logger.info("Generating unified visual pretrain data...")
+    # 2. Generate or load cached visual pretrain data (COCO + CLEVR)
+    def _generate_stage1_data():
+        logger.info("Generating unified visual pretrain data...")
+        all_data = []
 
-    all_data = []
-
-    # COCO box samples (localization)
-    box_data = generate_coco_box_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_box,
-        use_thinking=False,  # simplified format: learn "see → mark"
-    )
-    for d in box_data:
-        d["task_type"] = "box"
-    all_data.extend(box_data)
-    logger.info(f"  COCO box samples: {len(box_data)}")
-
-    # COCO point samples (object centers)
-    point_data = generate_coco_point_samples(
-        image_dir=args.coco_image_dir,
-        ann_file=args.coco_ann_file,
-        num_samples=args.num_point,
-        use_thinking=False,
-    )
-    for d in point_data:
-        d["task_type"] = "point"
-    all_data.extend(point_data)
-    logger.info(f"  COCO point samples: {len(point_data)}")
-
-    # CLEVR spatial reasoning / VQA (adds shape/color/material diversity)
-    if args.num_clevr > 0:
-        clevr_data = generate_clevr_spatial_dataset(
-            n=args.num_clevr,
-            seed=43,
-            cache_dir=os.path.join(args.output_dir, "clevr_cache"),
+        # COCO box samples (localization)
+        box_data = generate_coco_box_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_box,
+            use_thinking=False,  # simplified format: learn "see → mark"
         )
-        for d in clevr_data:
+        for d in box_data:
             d["task_type"] = "box"
-        all_data.extend(clevr_data)
-        logger.info(f"  CLEVR spatial samples: {len(clevr_data)}")
+        all_data.extend(box_data)
+        logger.info(f"  COCO box samples: {len(box_data)}")
+
+        # COCO point samples (object centers)
+        point_data = generate_coco_point_samples(
+            image_dir=args.coco_image_dir,
+            ann_file=args.coco_ann_file,
+            num_samples=args.num_point,
+            use_thinking=False,
+        )
+        for d in point_data:
+            d["task_type"] = "point"
+        all_data.extend(point_data)
+        logger.info(f"  COCO point samples: {len(point_data)}")
+
+        # CLEVR spatial reasoning / VQA (adds shape/color/material diversity)
+        if args.num_clevr > 0:
+            clevr_data = generate_clevr_spatial_dataset(
+                n=args.num_clevr,
+                seed=43,
+                cache_dir=os.path.join(args.output_dir, "clevr_cache"),
+            )
+            for d in clevr_data:
+                d["task_type"] = "box"
+            all_data.extend(clevr_data)
+            logger.info(f"  CLEVR spatial samples: {len(clevr_data)}")
+
+        return all_data
+
+    # Cache key depends on the parameters that affect data generation.
+    cache_key = (
+        f"{args.num_box}|{args.num_point}|{args.num_clevr}|"
+        f"{args.coco_image_dir}|{args.coco_ann_file}"
+    )
+    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+    cache_path = os.path.join(
+        args.output_dir, f"train_data_cache_{cache_hash}.pkl"
+    )
+
+    if args.regenerate_data and os.path.exists(cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {cache_path}")
+        os.remove(cache_path)
+
+    all_data = runner.cached_data(cache_path, _generate_stage1_data)
 
     if args.curriculum:
         def _visual_complexity(d):
@@ -121,6 +142,7 @@ def train(runner: StageRunner) -> None:
         all_data.sort(key=_visual_complexity)
         logger.info("Applied Stage 1 curriculum: short-to-long token sequences.")
     else:
+        random.seed(42)
         random.shuffle(all_data)
     logger.info(f"Total training samples: {len(all_data)}")
 
@@ -139,10 +161,11 @@ def train(runner: StageRunner) -> None:
         save_steps=args.save_steps,
         warmup_steps=args.warmup_steps,
         use_wandb=False,
+        additional_callbacks=[TimeLoggingCallback()],
     )
 
     logger.info("Starting unified visual pretrain...")
-    trainer.train(resume_from_checkpoint=resume_ckpt if resume_ckpt else None)
+    trainer.train(resume_from_checkpoint=resume_ckpt)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
@@ -182,4 +205,6 @@ if __name__ == "__main__":
                    help="Path to a Stage 1 checkpoint directory to resume from.")
     runner.add_arg("--unfreeze_vit_layers", type=int, default=None,
                    help="Unfreeze last N ViT blocks + merger (0 = all frozen)")
+    runner.add_arg("--regenerate_data", action="store_true",
+                   help="Force regeneration of training data and ignore existing cache.")
     runner.run(train)

@@ -32,9 +32,11 @@ Usage (in a stage script)::
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import os
 import pickle
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -135,6 +137,27 @@ class StageRunner:
             pickle.dump(data, f)
         self.logger.info(f"Cached {len(data)} samples to {cache_path}")
         return data
+
+    def latest_checkpoint(self, output_dir: str) -> str | None:
+        """Return the latest ``checkpoint-*`` directory under *output_dir*.
+
+        The returned path is the directory with the largest step number, or
+        ``None`` if no checkpoint directory exists.  This is used by all
+        training stages to resume automatically after an interruption.
+        """
+        if not os.path.isdir(output_dir):
+            return None
+        checkpoints = []
+        for path in glob.glob(os.path.join(output_dir, "checkpoint-*")):
+            if not os.path.isdir(path):
+                continue
+            m = re.search(r"checkpoint-(\d+)$", path)
+            if m:
+                checkpoints.append((int(m.group(1)), path))
+        if not checkpoints:
+            return None
+        checkpoints.sort(key=lambda x: x[0])
+        return checkpoints[-1][1]
 
     # ── execution ─────────────────────────────────────────────────────
 

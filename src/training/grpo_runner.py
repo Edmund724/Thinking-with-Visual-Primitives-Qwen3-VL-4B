@@ -17,7 +17,7 @@ from trl import GRPOConfig, GRPOTrainer
 
 from ..models.qwen_vl_loader import _set_use_cache_deep, load_qlora_model
 from ..utils.constants import GPU_MEMORY_WARNING_GB
-from .callbacks import ValidationSubsetEarlyStoppingCallback
+from .callbacks import TimeLoggingCallback, ValidationSubsetEarlyStoppingCallback
 from .grpo_fixes import apply_grpo_fixes
 from .memory_utils import GPUMemoryMonitor, clear_memory, log_memory_status
 
@@ -182,7 +182,7 @@ def run_grpo_rounds(
         )
 
         # ── Callbacks ──────────────────────────────────────────────
-        callbacks = [GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb)]
+        callbacks = [GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb), TimeLoggingCallback()]
         if args.early_stopping_subset_size > 0:
             callbacks.append(
                 ValidationSubsetEarlyStoppingCallback(

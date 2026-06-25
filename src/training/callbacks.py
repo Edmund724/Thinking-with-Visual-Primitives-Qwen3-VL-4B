@@ -1,6 +1,7 @@
 """Training callbacks for TVP project."""
 
 import logging
+import time
 
 import torch
 from transformers import TrainerCallback
@@ -9,6 +10,44 @@ from ..utils.conversation_builder import ConversationBuilder
 from .memory_utils import clear_memory, get_gpu_memory_gb, log_memory_status
 
 logger = logging.getLogger(__name__)
+
+
+class TimeLoggingCallback(TrainerCallback):
+    """Log training progress with wall-clock timestamps and elapsed time.
+
+    This makes it easy to correlate training steps with clock time and to
+    estimate remaining time when a run is split across multiple sessions.
+    """
+
+    def __init__(self):
+        self.start_time: float | None = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+        logger.info(
+            f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(output_dir: {args.output_dir})"
+        )
+        return control
+
+    def on_log(self, args, state, control, logs: dict | None = None, **kwargs):
+        if logs is None:
+            return control
+        elapsed = time.time() - self.start_time if self.start_time else 0.0
+        # Keep the Trainer's own metric names (loss, learning_rate, epoch, ...)
+        metrics = " | ".join(f"{k}={v:.6f}" if isinstance(v, float) else f"{k}={v}" for k, v in logs.items())
+        logger.info(
+            f"Step {state.global_step} | {metrics} | elapsed={elapsed:.1f}s"
+        )
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        elapsed = time.time() - self.start_time if self.start_time else 0.0
+        logger.info(
+            f"Training finished at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(total elapsed: {elapsed:.1f}s)"
+        )
+        return control
 
 
 class MemoryMonitorCallback(TrainerCallback):

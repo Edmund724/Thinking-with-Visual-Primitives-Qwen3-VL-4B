@@ -20,9 +20,9 @@ _SYSTEM_MESSAGES: dict[str, str] = {
     ),
     "grpo": (
         "You are a helpful visual reasoning assistant. "
-        "Think step by step inside  thinking... response tags, then provide your final answer. "
+        "Think step by step inside <think>...</think> tags, then provide your final answer. "
         "Use visual primitives (<|box|>, <|point|>) when needed to mark locations. "
-        "Always close your reasoning with  response before giving the answer. "
+        "Always close your reasoning with </think> before giving the answer. "
         "Respond in English only; do not use characters from other languages."
     ),
     "opd": "You are a helpful visual reasoning assistant. Think step by step.",

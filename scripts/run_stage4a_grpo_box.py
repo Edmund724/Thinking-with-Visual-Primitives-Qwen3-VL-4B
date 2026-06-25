@@ -5,6 +5,7 @@ Continues training the Box Expert LoRA adapter with GRPO on box-only data.
 Uses Format RM + Accuracy RM with difficulty grading (Normal only).
 """
 
+import hashlib
 import os
 
 import sys
@@ -141,13 +142,38 @@ def train(runner: StageRunner) -> None:
         logger.info(f"Total GRPO samples: {len(data)}")
         return data
 
-    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
+    cache_key = (
+        f"{args.num_samples}|{args.num_counting}|{args.num_clevr}|"
+        f"{args.coco_image_dir}|{args.coco_ann_file}"
+    )
+    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+    cache_path = os.path.join(
+        args.output_dir, f"train_data_cache_{cache_hash}.pkl"
+    )
+
+    if args.regenerate_data and os.path.exists(cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {cache_path}")
+        os.remove(cache_path)
+
     all_data = runner.cached_data(cache_path, _generate_data)
 
     num_rounds = args.num_rounds
 
     # Difficulty filtering: keep only Normal-level samples (paper Sec 2.5.2).
-    filtered_cache_path = os.path.join(args.output_dir, "filtered_train_data_cache.pkl")
+    filtered_cache_key = (
+        f"{cache_key}|{args.model_path}|{args.num_generations}|"
+        f"{args.filter_max_completion_length}|{args.filter_iou_threshold}|"
+        f"{args.filter_batch_size}|{args.filter_reward_threshold}"
+    )
+    filtered_cache_hash = hashlib.md5(filtered_cache_key.encode()).hexdigest()[:8]
+    filtered_cache_path = os.path.join(
+        args.output_dir, f"filtered_train_data_cache_{filtered_cache_hash}.pkl"
+    )
+
+    if args.regenerate_data and os.path.exists(filtered_cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {filtered_cache_path}")
+        os.remove(filtered_cache_path)
+
     if args.skip_difficulty_filter:
         logger.info("--skip_difficulty_filter is set; using all samples without filtering")
     else:
@@ -273,4 +299,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable progress bars to reduce console output.",
     )
+    runner.add_arg("--regenerate_data", action="store_true",
+                   help="Force regeneration of all cached data (raw + filtered).")
     runner.run(train)

@@ -130,19 +130,26 @@ def _load_opd_checkpoint(
     scheduler,
     checkpoint_dir: str,
     logger: logging.Logger,
+    load_adapter: bool = True,
 ) -> tuple:
     """Load OPD training checkpoint. Returns (global_step, epoch, step_in_epoch)."""
     logger.info(f"Resuming OPD from checkpoint: {checkpoint_dir}")
 
     # Load adapter weights
-    from peft import PeftModel
-    if isinstance(student_model, PeftModel):
-        student_model.load_adapter(checkpoint_dir, adapter_name="default", is_trainable=True)
-        student_model.set_adapter("default")
-    else:
-        state_dict = torch.load(os.path.join(checkpoint_dir, "adapter_model.bin"),
-                                map_location="cpu", weights_only=False)
-        student_model.load_state_dict(state_dict, strict=False)
+    if load_adapter:
+        from peft import PeftModel
+        if isinstance(student_model, PeftModel):
+            # If an adapter named "default" already exists, replace it with the
+            # checkpoint weights. This is needed when the student was initially
+            # loaded from a base path and we want to resume from a checkpoint.
+            if "default" in student_model.peft_config:
+                student_model.delete_adapter("default")
+            student_model.load_adapter(checkpoint_dir, adapter_name="default", is_trainable=True)
+            student_model.set_adapter("default")
+        else:
+            state_dict = torch.load(os.path.join(checkpoint_dir, "adapter_model.bin"),
+                                    map_location="cpu", weights_only=False)
+            student_model.load_state_dict(state_dict, strict=False)
 
     # Load optimizer + scheduler + training state
     state_path = os.path.join(checkpoint_dir, "opd_state.pt")
@@ -451,6 +458,15 @@ def train_opd_parallel(
 
     global_step = 0
     start_epoch = 0
+    start_step_in_epoch = 0
+
+    # Resume from checkpoint if provided
+    if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
+        global_step, start_epoch, start_step_in_epoch = _load_opd_checkpoint(
+            student_model, optimizer, scheduler, resume_from_checkpoint, logger,
+        )
+    elif resume_from_checkpoint:
+        logger.warning(f"Checkpoint not found: {resume_from_checkpoint}, starting from scratch")
 
     for epoch in range(start_epoch, num_epochs):
         epoch_kl = 0.0
@@ -462,6 +478,9 @@ def train_opd_parallel(
         box_expert.to(student_model.device)
         pbar = tqdm(box_loader, desc=f"OPD Box E{epoch+1}", unit="batch")
         for step, batch in enumerate(pbar):
+            # Skip already-processed steps when resuming within an epoch
+            if epoch == start_epoch and step < start_step_in_epoch:
+                continue
             kl_val = _opd_single_batch(
                 student_model, box_expert, batch, processor,
                 max_new_tokens, temperature, pad_token_id, eos_token_id,
@@ -487,6 +506,11 @@ def train_opd_parallel(
         logger.info(f"Epoch {epoch+1}: Point expert phase...")
         pbar = tqdm(point_loader, desc=f"OPD Point E{epoch+1}", unit="batch")
         for step, batch in enumerate(pbar):
+            # Skip already-processed steps when resuming within an epoch.
+            # Note: start_step_in_epoch counts across the full epoch (box + point).
+            total_steps_before_point = len(box_loader)
+            if epoch == start_epoch and (step + total_steps_before_point) < start_step_in_epoch:
+                continue
             is_last_batch = (step == len(point_loader) - 1)
             kl_val = _opd_single_batch(
                 student_model, point_expert, batch, processor,
@@ -515,7 +539,7 @@ def train_opd_parallel(
             if global_step % save_steps == 0:
                 _save_opd_checkpoint(
                     student_model, optimizer, scheduler,
-                    global_step, epoch, step + 1,
+                    global_step, epoch, step + 1 + total_steps_before_point,
                     output_dir, logger,
                 )
 

@@ -100,8 +100,8 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ## 🚀 Training Pipeline (Separated Experts + On-Policy Distillation)
 
 ```
-Stage 1:  Unified Visual Pretrain  COCO + CLEVR images, box/point grounding  ~11.5h  ✅
-Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~1m     ✅
+Stage 1:  Unified Visual Pretrain  COCO + CLEVR images, box/point grounding  ~7.4h   ✅
+Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~24s    ✅
 Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~12h  ✅
 Stage 3b: Point Expert SFT         Point+Maze SFT                             ~?    ✅ (including resume)
 Stage 4a: Box Expert GRPO          Box expert GRPO (3 rounds, default)        ~6h    (est.)
@@ -126,7 +126,7 @@ Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)
 
 > **Current config**: `num_box=30000`, `num_point=10000`, `num_clevr=5000` (total 45K samples), `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4` (effective batch=4), `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`, curriculum enabled.
 >
-> **Results**: 22,500 steps (2 epochs), loss 6.88 → 2.34 (−66%), grad norm 14.48 → 1.25, stable convergence. **Duration: ~11.5h GPU time** (resumed from checkpoint-10000; final segment 6h21m for 12.5K steps @ ~1.8s/step). Wall clock ~29h including config tuning restarts.
+> **Results**: 22,500 steps (2 epochs), loss 6.88 → 2.34 (−66%), grad norm 14.48 → 1.25, stable convergence. **Duration: ~7.4h wall-clock time** (2026-06-23 13:34:45 → 20:57:45; 45K samples, 2 epochs, data cache hit).
 > - Output: `outputs/stage1_visual_pretrain/`
 
 ```bash
@@ -134,6 +134,12 @@ python scripts/run_stage1_visual_pretrain.py --config configs/stage1_visual_pret
 ```
 
 **Output**: `outputs/stage1_visual_pretrain/`
+
+> **Data cache**: Stage 1 now pickles the generated COCO + CLEVR training data to `outputs/stage1_visual_pretrain/train_data_cache_<hash>.pkl`. On resume or re-run, the cache is loaded directly and the slow data-generation step is skipped. The cache key covers `num_box`, `num_point`, `num_clevr`, `coco_image_dir`, and `coco_ann_file`, so changing any of these creates a fresh cache automatically. Use `--regenerate_data` to force rebuilding the cache.
+>
+> **Auto-resume**: If `--resume_from_checkpoint` is omitted and `outputs/stage1_visual_pretrain/checkpoint-*` exists, the script automatically resumes from the latest checkpoint.
+>
+> **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
 
 ---
 
@@ -167,17 +173,24 @@ python scripts/run_stage2_merge.py \
 
 ### Stage 3a: Box Expert SFT ✅
 
-> **Current config**: 15K box localization + 10K coarse-grained counting + 5K CLEVR spatial/VQA + 2K negative box, plus general pretrain mix. `num_epochs=3`, `max_seq_length=4096`, `batch_size=1`, `grad_accum=8` (effective batch=8), `lr=1e-4`, `format_token_weight=40.0`, `max_grad_norm=1.0`.
+> **Current config**: 15K box localization + 10K coarse-grained counting + 5K CLEVR spatial/VQA + 2K negative box, plus general pretrain mix. `num_epochs=3`, `max_seq_length=2048`, `batch_size=2`, `grad_accum=6` (effective batch=12), `lr=1e-4`, `format_token_weight=10.0`, `max_grad_norm=1.0`.
+>
+> **VRAM note**: `max_seq_length` was lowered from 4096 → 2048 and `batch_size` from 4 → 2 (with `gradient_accumulation_steps` 3 → 6) to keep Stage 3a within the RTX 5090D 24 GB budget. Effective batch size is preserved.
 >
 > **Recent improvements**:
 > - SFT targets are now passed through `clean_primitive_tags()` to fix any wrong-order / duplicate tags in the generated data.
-> - `WeightedSFTTrainer` up-weights visual-primitive and `<think>` tokens (`format_token_weight=40.0`) so the format syntax is learned faster and the ref-token gradient signal is stronger.
+> - `WeightedSFTTrainer` up-weights visual-primitive and `<think>` tokens (`format_token_weight=10.0`) so the format syntax is learned faster and the ref-token gradient signal is stronger.
 > - `max_grad_norm=1.0` stabilizes training under high format-token loss weights.
 > - Supports `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` to continue training.
+> - **Auto-resume**: If `--resume_from_checkpoint` is omitted and `outputs/stage3a_sft_box/checkpoint-*` exists, the script automatically resumes from the latest checkpoint. This makes it safe to split long runs across multiple sessions.
+> - **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step, so the log file shows exactly when training progressed and how long each segment took.
+> - **Data cache**: Training data is cached to `outputs/stage3a_sft_box/train_data_cache_<hash>.pkl`. On resume or re-run, the cache is loaded directly and the slow data-generation step is skipped. Use `--regenerate_data` to force rebuilding.
 >
-> **Note**: Stage 3a does not enable data caching (pickle cache) to preserve accurate timing data. From Stage 3b onward, all scripts support training data pickle caching — auto-saved on first run, loaded directly on subsequent runs.
+> **Note**: All training stages (Stage 1, 3a, 3b, 4a, 4b, 5, 6) now support training-data pickle caching — auto-saved on first run and loaded directly on subsequent runs/resumes. Each stage uses parameter-based cache keys so changing any data-generation parameter automatically creates a fresh cache. Use `--regenerate_data` to force rebuilding.
 >
 > **Results**: 14,250 steps (2 epochs), loss 2.87 → 1.62 (−44%), average 1.65, grad norm 6.20 → 0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). **Duration: ~12.1h GPU time** @ ~2.6 samples/sec. Output: `outputs/stage3a_sft_box/`.
+>
+> **⚠️ Important (post-2026-06-22 fix)**: If Stage 4a/4b still outputs garbled non-Latin characters (e.g. `personsยิง药材[[...]]`), the root cause is that the special-token embeddings (`<|box|>`, `<|ref|>`, etc.) were frozen during SFT. Make sure you are using the latest code where `src/models/qwen_vl_loader.py` adds `embed_tokens` / `lm_head` to `modules_to_save`, then re-train Stage 3a/3b (ideally from Stage 1 so the merged base also carries trained embeddings). The Stage 3 config's `format_token_weight` has also been lowered from 40.0 to 10.0; 40.0 was a workaround for the frozen-embedding bug.
 
 ```bash
 # From scratch
@@ -198,6 +211,8 @@ python scripts/run_stage3a_sft_box.py \
 > - `WeightedSFTTrainer` up-weights visual-primitive and `<think>` tokens (`format_token_weight=40.0`) so the format syntax is learned faster and the ref-token gradient signal is stronger.
 > - `max_grad_norm=1.0` stabilizes training under high format-token loss weights.
 > - 3 epochs give embeddings more update opportunities, matching the stage3a training schedule.
+> - **Auto-resume**: If `--resume_from_checkpoint` is omitted and `outputs/stage3b_sft_point/checkpoint-*` exists, the script automatically resumes from the latest checkpoint.
+> - **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
 >
 > Mid-training VRAM fragmentation once caused speed degradation from 3s/it to 30s/it, resolved by resuming with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
@@ -226,7 +241,11 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
 
 > **Note**: GRPO uses a multi-round loop structure. After each round, the model is reloaded — inter-round gaps are natural checkpoints. Each round should run to completion; if interrupted mid-round, the script auto-detects the latest `checkpoint-*` and resumes from it. Completed rounds are skipped on restart.
 >
+> **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
+>
 > **VRAM tip**: All stage scripts now set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` internally to mitigate CUDA memory fragmentation during long runs.
+
+> **Garbled output tip**: If completions contain non-Latin characters around coordinates, the Stage 3a/3b adapter was likely trained without trainable special-token embeddings. Re-train Stage 3a/3b with the latest `qwen_vl_loader.py` (`embed_tokens` / `lm_head` in `modules_to_save`) before running GRPO.
 
 > **Difficulty filter (paper Sec 2.5.2)**: The paper pre-filters GRPO data to keep only "Normal" difficulty samples (model sometimes succeeds, sometimes fails). For single-GPU setups this step can cause OOM due to the extra on-policy rollouts required. We **skip it by default** (`skip_difficulty_filter: true`) and compensate by doubling the dataset size. Hard samples (all rollouts wrong) produce zero reward variance and thus near-zero gradients during GRPO — they waste compute but do not harm training. Easy samples (all correct) behave the same way. To re-enable filtering on a multi-GPU setup, set `skip_difficulty_filter: false` in the YAML.
 
@@ -239,6 +258,10 @@ python scripts/run_stage4a_grpo_box.py \
 
 ### Stage 4b: Point Expert GRPO (3 rounds by default)
 
+> **Note**: Like Stage 4a, Stage 4b auto-detects the latest `round_N/checkpoint-*` and resumes the interrupted round on restart. Completed rounds are skipped.
+>
+> **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
+
 ```bash
 python scripts/run_stage4b_grpo_point.py \
     --model_path outputs/stage3b_sft_point \
@@ -248,6 +271,12 @@ python scripts/run_stage4b_grpo_point.py \
 
 ### Stage 5: Unified RFT (Expert-generated rollouts)
 
+> **Data cache**: Both the prompt pool and expert-generated filtered training data are cached to `outputs/stage5_rft_unified/`. On resume or re-run, prompts and filtered data are loaded directly from cache, skipping expert model loading and generation. Cache keys include expert model paths, so changing experts automatically triggers regeneration. Use `--regenerate_data` to force rebuilding.
+>
+> **Auto-resume**: If `--resume_from_checkpoint` is omitted and `outputs/stage5_rft_unified/checkpoint-*` exists, the script automatically resumes the SFT phase from the latest checkpoint.
+>
+> **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
+
 ```bash
 python scripts/run_stage5_rft_unified.py \
     --model_path outputs/stage2_merged_base \
@@ -255,6 +284,10 @@ python scripts/run_stage5_rft_unified.py \
 ```
 
 ### Stage 6: OPD (On-Policy Distillation)
+
+> **Auto-resume**: If `--resume_from_checkpoint` is omitted and `outputs/stage6_opd/checkpoint-*` exists, the script automatically resumes the parallel distillation from the latest checkpoint (optimizer/scheduler/epoch/step state restored).
+>
+> **Timestamped training logs**: Per-step OPD logs already carry wall-clock timestamps from the stage logger, so you can track progress across multiple sessions.
 
 ```bash
 python scripts/run_stage6_opd.py \
@@ -435,6 +468,7 @@ Recommended configurations for different GPU VRAM sizes:
 > - 12GB GPUs: set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce VRAM fragmentation.
 > - OPD stage loads 3 models simultaneously (student + 2 experts); teacher models auto-use 4-bit quantization; peak VRAM is ~1.8x single-model SFT.
 > - GRPO stage VRAM scales with `num_generations`; 12GB: recommend `num_generations=3`, 24GB: can use `num_generations=5`.
+> - **Windows shared GPU memory**: If Task Manager shows shared GPU memory being used even though total GPU memory is far from the limit, this is usually a WDDM allocation issue, not a capacity issue. Stage scripts already set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation. For persistent issues, disable Windows Hardware-Accelerated GPU Scheduling (HAGS) and ensure no other apps are reserving VRAM.
 
 ### Process Reward Function
 

@@ -4,7 +4,59 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **全训练阶段自动断点续训 + 时间戳日志**
+  - `src/training/stage_runner.py`：新增 `latest_checkpoint()` 方法，统一查找 `checkpoint-*` 目录中 step 最大的路径，供所有训练阶段复用。
+  - `src/training/callbacks.py`：新增 `TimeLoggingCallback`，在每个 logging step 记录当前时间戳、step、loss/learning_rate/epoch 等指标和已运行时间；训练开始/结束时记录 Wall-clock 时间。
+  - `scripts/run_stage1_visual_pretrain.py`、`scripts/run_stage3a_sft_box.py`、`scripts/run_stage3b_sft_point.py`、`scripts/run_stage5_rft_unified.py`：未指定 `--resume_from_checkpoint` 时自动从各自 `outputs/.../checkpoint-*` 中最新 checkpoint 恢复；恢复时直接从 checkpoint 加载模型，避免从上游阶段输出重新初始化；`create_sft_trainer()` 调用统一附加 `TimeLoggingCallback`。
+  - `src/training/grpo_runner.py`：GRPO 每轮已有的 `checkpoint-*` 自动续训逻辑保持不变，额外添加 `TimeLoggingCallback`，让 Stage 4a/4b 的 per-step 日志也带时间戳。
+  - `scripts/run_stage6_opd.py` + `src/training/opd_trainer.py`：Stage 6 自动检测最新 OPD checkpoint；`train_opd_parallel()` 新增 `resume_from_checkpoint` 支持，可恢复 optimizer/scheduler/全局 step/epoch，从中断的 epoch 边界继续并行蒸馏；`_load_opd_checkpoint()` 增强为可安全替换已存在的 `default` adapter。
+  - `scripts/run_pipeline.sh`：所有训练阶段均检测是否存在 checkpoint，若存在则提示“从最新 checkpoint 继续”；GRPO 阶段会查找 `round_N/checkpoint-*` 中的最新 checkpoint。
+  - 效果：Stage 1、3a、3b、4a、4b、5、6 中途中止后，再次运行同一命令即可自动续训；每次 logging 都能看到精确时间戳和已运行时间，便于分多次跑时估算剩余时间和核对进度。
+  - 验证：单元测试 `test_logging_utils.py`、`test_config_utils.py` 通过；所有 stage 脚本 `python <script> --help` 可正常解析；`StageRunner.latest_checkpoint()`、`TimeLoggingCallback`、bash pipeline 语法均已手动验证。
+
 ### Changed
+
+- **Stage 3a 显存优化：降低单步 batch 与序列长度**
+  - `configs/stage3a_sft_box.yaml`：`batch_size` 4 → 2，`gradient_accumulation_steps` 3 → 6（有效 batch size 保持 12 不变），`max_seq_length` 4096 → 2048。
+  - 原因：Stage 3a 在 RTX 5090D 24 GB 上出现 OOM；降低单步激活内存占用，同时通过梯度累积保持相同的有效 batch。
+  - `README.md` 和 `README_zh.md` 已同步更新 Stage 3a 配置说明与显存提示。
+
+- **Stage 3b 缓存升级：手动 pickle → runner.cached_data + 参数 hash**
+  - `scripts/run_stage3b_sft_point.py`：将手动 pickle 缓存替换为 `runner.cached_data()`，缓存 key 覆盖 `num_point`、`num_maze`、`num_path`、`num_negative_point`、`coco_image_dir`、`coco_ann_file`、`general_data_path`。新增 `--regenerate_data` CLI 参数。
+  - 效果：缓存 key 随参数自动变化，避免旧缓存误用。
+
+- **Stage 4a/4b 缓存 key 升级：固定文件名 → 参数 hash**
+  - `scripts/run_stage4a_grpo_box.py`、`scripts/run_stage4b_grpo_point.py`：原始数据缓存和过滤后数据缓存均改用参数 hash 文件名，覆盖数据生成参数和过滤参数。新增 `--regenerate_data` CLI 参数。
+  - 效果：修改参数自动生成新缓存；`--regenerate_data` 同时清除 raw 和 filtered 两个缓存。
+
+- **Stage 6 缓存 key 升级：固定文件名 → 参数 hash**
+  - `scripts/run_stage6_opd.py`：缓存文件名改用参数 hash（覆盖 `num_box`、`num_point`、`num_maze`、`coco_image_dir`、`coco_ann_file`）。新增 `--regenerate_data` CLI 参数。
+  - 效果：修改参数自动生成新缓存。
+
+- **Stage 1 shuffle seed 固定**
+  - `scripts/run_stage1_visual_pretrain.py`：在 `random.shuffle(all_data)` 前添加 `random.seed(42)`，确保 resume 时数据顺序与首次运行一致，消除 resume 的最后一个不确定因素。
+
+- **Stage 3a 新增训练数据 pickle 缓存**
+  - `scripts/run_stage3a_sft_box.py`：将 box/counting/CLEVR/negative/general 数据生成 + 清洗步骤包装为 `runner.cached_data()` 调用。缓存 key 覆盖所有数据相关参数（`num_box`、`num_counting`、`num_clevr`、`num_negative_box`、`counting_attribute_ratio`、`clevr_negative_ratio`、`coco_image_dir`、`coco_ann_file`、`general_data_path`）。新增 `--regenerate_data` CLI 参数。
+  - 效果：Stage 3a resume 或重复运行时直接加载缓存，跳过 ~5.7 万样本的生成/清洗耗时。
+
+- **Stage 5 新增数据缓存（prompts + 过滤后训练数据）**
+  - `scripts/run_stage5_rft_unified.py`：prompts 缓存从固定文件名改为参数 hash（覆盖 `num_box_prompts`、`num_counting_prompts`、`num_clevr_prompts`、`num_point_prompts`、`num_maze_prompts`、`num_path_prompts`、`coco_image_dir`、`coco_ann_file`）。
+  - 新增 `filtered_data_cache_<hash>.pkl` 缓存，包装专家模型加载 + 生成 + 难度分级。缓存 key 包含了专家模型路径（`box_expert_path`、`point_expert_path`），更换专家自动触发重新生成。
+  - 新增 `--regenerate_data` CLI 参数，同时清除 prompts 和 filtered_data 两个缓存。
+  - 效果：Stage 5 resume 或重复运行时，若缓存存在，跳过专家模型加载和推理生成，直接加载过滤后数据进入 SFT。
+
+- **Stage 1 新增训练数据 pickle 缓存**
+  - `scripts/run_stage1_visual_pretrain.py`：将 COCO box/point + CLEVR 数据生成步骤包装为 `runner.cached_data()` 调用，缓存文件保存为 `outputs/stage1_visual_pretrain/train_data_cache_<hash>.pkl`。
+  - 缓存 key 基于 `num_box`、`num_point`、`num_clevr`、`coco_image_dir`、`coco_ann_file` 的 MD5 前缀，修改任一参数会自动生成新缓存，避免旧缓存失效导致的数据不一致。
+  - 新增 `--regenerate_data` CLI 参数，可强制删除已有缓存并重新生成数据。
+  - 效果：Stage 1 resume 或重复运行时可直接加载缓存，跳过约 4.5 万样本的生成/验证耗时。
+  - `README.md` 和 `README_zh.md` 已同步更新 Stage 1 说明与全 pipeline 缓存说明。
+
+- **Stage 1 训练加速：提升 per-device batch size，减少梯度累积步数**
+  - `configs/stage1_visual_pretrain.yaml`：`batch_size` 1 → 4，`gradient_accumulation_steps` 4 → 1（有效 batch size 保持 4，消除全部梯度累积开销）。
 
 - **Stage 3a/3b SFT 配置对齐：`format_token_weight=40`, `num_epochs=3`**
   - `configs/stage3a_sft_box.yaml`：`format_token_weight` 从默认值上调至 40.0（ref token 梯度信号更强），`num_epochs` 1 → 3（embedding 获得更多更新机会）。
@@ -12,6 +64,14 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - `scripts/run_stage3b_sft_point.py`：新增 `--format_token_weight` 和 `--max_grad_norm` CLI 参数；新增 `clean_primitive_tags()` 数据清洗步骤（与 stage3a 对齐，防止训练数据包含损坏语法）；`create_sft_trainer()` 调用传入上述两个参数。
 
 ### Fixed
+
+- **Stage 3/4 输出乱码（非拉丁字符 / 特殊标签损坏）根本原因修复**
+  - 根因：新增的视觉原语特殊 token（`<|box|>`、`<|/box|>`、`<|point|>`、`<|/point|>`、`<|ref|>`、`<|/ref|>`）虽然通过 `add_special_tokens()` 加入 tokenizer，但 `embed_tokens` / `lm_head` 始终被 LoRA 冻结，导致这些 token 的 embedding 停留在随机 / 预训练初始值。模型在生成时无法稳定输出这些特殊 token，转而生成 CJK / 泰文等乱码字符。
+  - 修复：`src/models/qwen_vl_loader.py` 在创建新 LoRA adapter 时把 `model.language_model.embed_tokens` 和 `lm_head` 加入 `modules_to_save`（并开启 `ensure_weight_tying=True`），使特殊 token 的 embedding 可以被训练并随 adapter 一起保存/加载。训练参数从 ~528M 增至 ~917M，适配器体积会相应增大。
+  - 修复：同步修正 `src/utils/conversation_builder.py` 中 GRPO system message 缺失的 `<think>` / `</think>` 尖括号（原消息被错误渲染为 "inside  thinking... response tags"）。
+  - 配置调整：由于 embedding 已可训练，`configs/stage3a_sft_box.yaml` 和 `configs/stage3b_sft_point.yaml` 的 `format_token_weight` 从 **40.0 降到 10.0**。40.0 原是为补偿冻结 embedding 的权宜之计；现在 10.0 已足够给 GRPO 提供 ~80-90% 格式合规的热启动，同时避免过度挤压内容/坐标/推理 token。
+  - 影响：需要重新训练 Stage 1 → Stage 2 → Stage 3a/3b（最稳妥）；如想节省时间，至少重新跑 Stage 3a/3b，Stage 4a 的 policy model 会加载到训练好的 embedding。
+  - 验证：50-sample 小规模 Stage 3a 训练后，模型可稳定输出 `<|box|>[[x1,y1,x2,y2]]<|/box|>`，不再出现 `𬒈` 等非拉丁字符；全部 157 个单元测试通过。
 
 - **Stage 4 GRPO `generation_batch_size` 与 `num_generations` 不兼容导致 ValueError**
   - `src/training/grpo_runner.py`：`generation_batch_size` 从硬绑定 `args.batch_size` 改为独立配置参数 `args.generation_batch_size`，默认回退到 `args.num_generations`。解决 `batch_size=2` 不能被 `num_generations=6` 整除的报错。
@@ -63,7 +123,7 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Added
 
-- **Stage 1 & 2 timing recorded** — Stage 1: ~11.5h GPU time (resumed from checkpoint-10000; final segment 6h21m for 12.5K steps @ ~1.8s/step, wall clock ~29h with config restarts). Stage 2: ~1m13s. Results: 22,500 steps, loss 6.88→2.34 (−66%), grad norm 14.48→1.25, stable convergence. Updated README.md and README_zh.md pipeline tables and Stage 1 sections.
+- **Stage 1 & 2 timing updated to latest wall-clock time** — Stage 1: **~7.4h wall-clock** (2026-06-23 13:34:45 → 20:57:45; 45K samples, 2 epochs, data cache hit). Stage 2: **~24s** (2026-06-23 21:25:15 → 21:25:24). Results: 22,500 steps, loss 6.88→2.34 (−66%), grad norm 14.48→1.25, stable convergence. Updated README.md and README_zh.md pipeline tables and Stage 1 sections.
 
 - **Stage 3a timing recorded** — Stage 3a: ~12.1h GPU time. Results: 14,250 steps (2 epochs), loss 2.87→1.62 (−44%), average 1.65, grad norm 6.20→0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). Updated README.md and README_zh.md pipeline tables, total time (~52h→~57h), and Stage 3a sections.
 

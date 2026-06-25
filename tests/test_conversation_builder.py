@@ -22,8 +22,8 @@ class TestModeSelection:
 
     def test_grpo_mode_uses_grpo_system_message(self):
         cb = ConversationBuilder("grpo")
-        assert "inside  thinking" in cb.system_message
-        assert "Always close your reasoning with  response" in cb.system_message
+        assert "inside <think>...</think> tags" in cb.system_message
+        assert "Always close your reasoning with </think>" in cb.system_message
 
     def test_opd_mode_uses_short_system_message(self):
         cb = ConversationBuilder("opd")

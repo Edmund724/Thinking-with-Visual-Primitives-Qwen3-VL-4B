@@ -7,8 +7,8 @@ Loads from merged Stage 2 base.
 Data ratio: 70% general + 30% visual primitives (20% maze + 10% point).
 """
 
+import hashlib
 import os
-import pickle
 import random
 import sys
 
@@ -28,32 +28,38 @@ from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.data.generators.path_tracing import generate_path_tracing_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.trainers.sft_trainer import create_sft_trainer
+from src.training.callbacks import TimeLoggingCallback
 from src.training.memory_utils import log_memory_status
 
 
 def train(runner: StageRunner) -> None:
     args, logger = runner.args, runner.logger
 
-    # 1. Load from merged Stage 2 base
-    logger.info(f"Loading from merged base: {args.model_path}")
+    # 1. Determine resume checkpoint (explicit flag or latest auto checkpoint)
+    resume_ckpt = getattr(args, "resume_from_checkpoint", None)
+    if resume_ckpt and not os.path.isdir(resume_ckpt):
+        logger.error(f"Requested checkpoint not found: {resume_ckpt}")
+        sys.exit(1)
+    if not resume_ckpt:
+        latest = runner.latest_checkpoint(args.output_dir)
+        if latest:
+            logger.info(f"Auto-resuming from latest checkpoint: {latest}")
+            resume_ckpt = latest
+        else:
+            logger.info(f"No checkpoint found; starting fresh from {args.model_path}")
+
+    # 2. Load model from checkpoint when resuming, otherwise from merged Stage 2 base
+    load_path = resume_ckpt if resume_ckpt else args.model_path
+    logger.info(f"Loading model from: {load_path}")
     model, processor = load_qlora_model(
-        model_name=args.model_path,
+        model_name=load_path,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
     )
     log_memory_status("After model loading:")
 
     # 2. Generate or load cached training data
-    cache_path = os.path.join(args.output_dir, "train_data_cache.pkl")
-    if os.path.exists(cache_path):
-        logger.info(f"Loading cached training data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            all_data = pickle.load(f)
-        logger.info(f"  Loaded {len(all_data)} samples from cache")
-        # Strip heavy unused fields to reduce RAM / pickle overhead
-        for d in all_data:
-            d.pop("maze_grid", None)
-    else:
+    def _generate_sft_data():
         logger.info("Generating training data (70% general + 30% point/maze/path)...")
 
         # Point data (COCO object centers)
@@ -81,7 +87,6 @@ def train(runner: StageRunner) -> None:
             seed=43,
             cache_dir=os.path.join(args.output_dir, "path_tracing_cache"),
         )
-        # task_type is already "path" from generator; no override needed
         logger.info(f"  Path tracing samples: {len(path_data)}")
 
         negative_point_data = generate_coco_negative_point_samples(
@@ -100,7 +105,6 @@ def train(runner: StageRunner) -> None:
             import json
             with open(args.general_data_path, "r") as f:
                 raw_general = json.load(f)
-            # Convert from conversations format to SFT format
             for item in raw_general:
                 convs = item.get("conversations", [])
                 user_msg = next((c["content"] for c in convs if c["role"] == "user"), "")
@@ -112,7 +116,6 @@ def train(runner: StageRunner) -> None:
                     "image": item.get("image", None),
                     "task_type": "general",
                 })
-            # 70% of total = general, 30% = visual primitives
             visual_count = len(point_data) + len(maze_data) + len(path_data) + len(negative_point_data)
             target_general = int(visual_count * 7 / 3)
             if len(general_data) > target_general:
@@ -126,11 +129,26 @@ def train(runner: StageRunner) -> None:
         random.shuffle(all_data)
         logger.info(f"Total training samples: {len(all_data)}")
 
-        # Save cache for future runs
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(all_data, f)
-        logger.info(f"Cached training data to {cache_path}")
+        # Strip heavy unused fields to reduce RAM / pickle overhead
+        for d in all_data:
+            d.pop("maze_grid", None)
+
+        return all_data
+
+    cache_key = (
+        f"{args.num_point}|{args.num_maze}|{args.num_path}|{args.num_negative_point}|"
+        f"{args.coco_image_dir}|{args.coco_ann_file}|{args.general_data_path}"
+    )
+    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+    cache_path = os.path.join(
+        args.output_dir, f"train_data_cache_{cache_hash}.pkl"
+    )
+
+    if args.regenerate_data and os.path.exists(cache_path):
+        logger.info(f"--regenerate_data set; removing old cache {cache_path}")
+        os.remove(cache_path)
+
+    all_data = runner.cached_data(cache_path, _generate_sft_data)
 
     # Data cleaning: fix any wrong-order / duplicate primitive tags in the
     # SFT targets so the model is not trained on corrupted syntax.
@@ -164,13 +182,11 @@ def train(runner: StageRunner) -> None:
         use_wandb=False,
         max_grad_norm=args.max_grad_norm,
         format_token_weight=args.format_token_weight,
+        additional_callbacks=[TimeLoggingCallback()],
     )
 
     logger.info("Starting Point Expert SFT training...")
-    if args.resume_from_checkpoint and not os.path.isdir(args.resume_from_checkpoint):
-        logger.error(f"Checkpoint not found: {args.resume_from_checkpoint}")
-        sys.exit(1)
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    trainer.train(resume_from_checkpoint=resume_ckpt)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
@@ -212,4 +228,6 @@ if __name__ == "__main__":
                    help="Loss weight multiplier for visual-primitive / think format tokens.")
     runner.add_arg("--max_grad_norm", type=float, default=None,
                    help="Maximum gradient norm for clipping.")
+    runner.add_arg("--regenerate_data", action="store_true",
+                   help="Force regeneration of training data and ignore existing cache.")
     runner.run(train)

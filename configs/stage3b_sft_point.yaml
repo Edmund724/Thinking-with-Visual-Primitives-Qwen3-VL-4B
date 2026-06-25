@@ -8,7 +8,10 @@ batch_size: 1
 gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
 num_epochs: 3
-format_token_weight: 40.0
+# format_token_weight: reduced from 40.0 after fixing special-token embedding training
+# (embed_tokens/lm_head added to modules_to_save). 10.0 gives enough format pressure
+# for GRPO initialization without over-squeezing content tokens.
+format_token_weight: 10.0
 max_grad_norm: 1.0
 lora_r: 256
 lora_alpha: 512

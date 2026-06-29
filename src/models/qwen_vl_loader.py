@@ -90,6 +90,58 @@ def _set_use_cache_deep(module: torch.nn.Module) -> None:
     logger.debug(f"Set use_cache=False on {len(seen_configs)} config object(s)")
 
 
+def _patch_lm_head_dtype_cast(model):
+    """Patch lm_head so fp32 activations are cast to the weight dtype.
+
+    ``prepare_model_for_kbit_training`` casts layer norms to fp32 for training
+    stability. During generation without autocast, hidden_states therefore stay
+    fp32 all the way to ``lm_head``. Depending on the checkpoint / PEFT state,
+    ``lm_head`` weights may be bfloat16 (or another dtype different from fp32),
+    so the matrix multiply raises ``RuntimeError: expected mat1 and mat2 to
+    have the same dtype``. This wrapper casts the input to the weight dtype
+    only when they differ, fixing generation while leaving training (run under
+    autocast) intact.
+    """
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is None:
+        return
+
+    # Unwrap PEFT ModulesToSaveWrapper to reach the actual Linear module.
+    inner = lm_head
+    while hasattr(inner, "modules_to_save"):
+        adapter = getattr(inner, "active_adapters", ["default"])[0]
+        modules_to_save = inner.modules_to_save
+        if isinstance(modules_to_save, dict):
+            next_inner = modules_to_save.get(adapter)
+        else:
+            # nn.ModuleDict: use item accessor
+            try:
+                next_inner = modules_to_save[adapter]
+            except (KeyError, IndexError, TypeError):
+                next_inner = None
+        if next_inner is None:
+            return
+        inner = next_inner
+
+    if not isinstance(inner, torch.nn.Linear):
+        return
+
+    # Idempotent: do not stack wrappers if this model is re-patched.
+    if getattr(inner.forward, "_tvp_dtype_cast_applied", False):
+        return
+
+    original_forward = inner.forward
+
+    def forward_with_dtype_cast(input, *args, **kwargs):
+        target_dtype = inner.weight.dtype
+        if input.dtype != target_dtype:
+            input = input.to(target_dtype)
+        return original_forward(input, *args, **kwargs)
+
+    forward_with_dtype_cast._tvp_dtype_cast_applied = True
+    inner.forward = forward_with_dtype_cast
+
+
 def _load_base_model_and_processor(
     model_name: str,
     bnb_config: BitsAndBytesConfig,
@@ -259,6 +311,10 @@ def load_qlora_model(
     #   decorator that reads self.config.use_cache during forward).
     _set_use_cache_deep(model)
 
+    # Fix dtype mismatch between fp32 layer-norm outputs and lm_head weights
+    # during generation (PEFT modules_to_save + prepare_model_for_kbit_training).
+    _patch_lm_head_dtype_cast(model)
+
     # Optionally unfreeze the last N ViT blocks + merger.
     # Access the base model through the PeftModel wrapper if present.
     if unfreeze_vit_layers > 0:
@@ -388,6 +444,10 @@ def load_reference_model(
     if adapter_to_load is not None:
         model = PeftModel.from_pretrained(model, adapter_to_load)
         logger.info(f"Reference: loaded adapter: {adapter_to_load}")
+
+    # Fix dtype mismatch between fp32 layer-norm outputs and lm_head weights
+    # during generation (same PEFT modules_to_save issue as policy).
+    _patch_lm_head_dtype_cast(model)
 
     # Freeze everything
     for param in model.parameters():

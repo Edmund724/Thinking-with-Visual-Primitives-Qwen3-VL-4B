@@ -17,7 +17,7 @@ from trl import GRPOConfig, GRPOTrainer
 
 from ..models.qwen_vl_loader import _set_use_cache_deep, load_qlora_model
 from ..utils.constants import GPU_MEMORY_WARNING_GB
-from .callbacks import TimeLoggingCallback, ValidationSubsetEarlyStoppingCallback
+from .callbacks import CastRefAdapterCallback, TimeLoggingCallback, ValidationSubsetEarlyStoppingCallback
 from .grpo_fixes import apply_grpo_fixes
 from .memory_utils import GPUMemoryMonitor, clear_memory, log_memory_status
 
@@ -114,18 +114,22 @@ def run_grpo_rounds(
             logger.info(
                 f"Found checkpoint {resume_from.name} for round {round_idx + 1}, resuming."
             )
-            try:
-                policy_model, processor = load_qlora_model(
-                    model_name=str(resume_from),
-                    lora_r=args.lora_r,
-                    lora_alpha=args.lora_alpha,
-                )
-                log_memory_status(f"Loaded checkpoint {resume_from.name}:")
-            except Exception as e:
+            # Keep the policy_model loaded from this round's starting point
+            # (args.model_path for round 1, previous round's output otherwise).
+            # Trainer.train(resume_from_checkpoint=...) will load the adapter
+            # weights, optimizer state, and trainer state from the checkpoint.
+            # Reloading the adapter here first causes double-loading and can
+            # leave several extra GB in the CUDA allocator / memory pool.
+            adapter_config_path = resume_from / "adapter_config.json"
+            if not adapter_config_path.exists():
                 logger.warning(
-                    f"Could not load checkpoint {resume_from}: {e}, starting from scratch."
+                    f"Checkpoint {resume_from} has no adapter_config.json; cannot resume."
                 )
                 resume_from = None
+            else:
+                log_memory_status(
+                    f"Will resume from checkpoint {resume_from.name}:"
+                )
 
         # ── Build reward function ──────────────────────────────────
         reward_fn = reward_fn_factory(threshold, tokenizer=processor.tokenizer, logger=logger)
@@ -156,6 +160,7 @@ def run_grpo_rounds(
             beta=args.beta,
             temperature=args.temperature,
             scale_rewards="group",
+            num_iterations=2,
         )
 
         # ── Dataset ────────────────────────────────────────────────
@@ -182,7 +187,11 @@ def run_grpo_rounds(
         )
 
         # ── Callbacks ──────────────────────────────────────────────
-        callbacks = [GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb), TimeLoggingCallback()]
+        callbacks = [
+            GPUMemoryMonitor(clear_threshold_gb=mem_threshold_gb),
+            TimeLoggingCallback(),
+            CastRefAdapterCallback(),
+        ]
         if args.early_stopping_subset_size > 0:
             callbacks.append(
                 ValidationSubsetEarlyStoppingCallback(
@@ -216,10 +225,23 @@ def run_grpo_rounds(
         log_memory_status(f"Round {round_idx + 1} complete:")
 
         # ── Cleanup between rounds ─────────────────────────────────
+        # Aggressively free GPU memory before loading the next round's model.
+        # Moving the model to CPU first releases its CUDA allocations; then we
+        # delete the trainer (which may hold references to the model) and force
+        # a full garbage collection + cache clear. This prevents the common
+        # failure mode where Round 2 OOMs because Round 1 left the allocator
+        # pool/fragmentation populated.
+        if policy_model is not None:
+            try:
+                policy_model.to("cpu")
+            except Exception as e:
+                logger.debug(f"Moving model to CPU before cleanup failed: {e}")
         del trainer
         del policy_model
         gc.collect()
         clear_memory()
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
 
         # Reload for next round
         try:
@@ -228,5 +250,6 @@ def run_grpo_rounds(
                 lora_r=args.lora_r,
                 lora_alpha=args.lora_alpha,
             )
+            log_memory_status("Reloaded model for next round:")
         except Exception as e:
             logger.warning(f"Could not reload: {e}, continuing")

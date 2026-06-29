@@ -102,14 +102,14 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ```
 Stage 1:  Unified Visual Pretrain  COCO + CLEVR images, box/point grounding  ~7.4h   ✅
 Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~24s    ✅
-Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~12h  ✅
+Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~13.4h ✅
 Stage 3b: Point Expert SFT         Point+Maze SFT                             ~?    ✅ (including resume)
-Stage 4a: Box Expert GRPO          Box expert GRPO (3 rounds, default)        ~6h    (est.)
-Stage 4b: Point Expert GRPO        Point expert GRPO (3 rounds, default)      ~6h    (est.)
+Stage 4a: Box Expert GRPO          Box expert GRPO (1 round, no early stop)   ~20.1h  ✅
+Stage 4b: Point Expert GRPO        Point expert GRPO (1 round, no early stop) ~6h    (est.)
 Stage 5:  Unified RFT              Expert-generated rollouts → Unified learning ~5h  (est.)
 Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
                                 ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~57h
+                                Total（已实测部分）:                         ~72h
 ```
 
 **Core Design**:
@@ -188,9 +188,11 @@ python scripts/run_stage2_merge.py \
 >
 > **Note**: All training stages (Stage 1, 3a, 3b, 4a, 4b, 5, 6) now support training-data pickle caching — auto-saved on first run and loaded directly on subsequent runs/resumes. Each stage uses parameter-based cache keys so changing any data-generation parameter automatically creates a fresh cache. Use `--regenerate_data` to force rebuilding.
 >
-> **Results**: 14,250 steps (2 epochs), loss 2.87 → 1.62 (−44%), average 1.65, grad norm 6.20 → 0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). **Duration: ~12.1h GPU time** @ ~2.6 samples/sec. Output: `outputs/stage3a_sft_box/`.
+> **Results**: 14,250 steps (2 epochs), loss 2.87 → 1.62 (−44%), average 1.65, grad norm 6.20 → 0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). **Duration: ~13.4h wall-clock** @ ~2.3 samples/sec. Split into 3 segments: (1) 2026-06-25 11:40→19:12 ~7.5h, (2) 2026-06-26 16:09→17:35 ~1.4h, (3) 2026-06-26 17:35→22:01 ~4.4h. Output: `outputs/stage3a_sft_box/`.
 >
 > **⚠️ Important (post-2026-06-22 fix)**: If Stage 4a/4b still outputs garbled non-Latin characters (e.g. `personsยิง药材[[...]]`), the root cause is that the special-token embeddings (`<|box|>`, `<|ref|>`, etc.) were frozen during SFT. Make sure you are using the latest code where `src/models/qwen_vl_loader.py` adds `embed_tokens` / `lm_head` to `modules_to_save`, then re-train Stage 3a/3b (ideally from Stage 1 so the merged base also carries trained embeddings). The Stage 3 config's `format_token_weight` has also been lowered from 40.0 to 10.0; 40.0 was a workaround for the frozen-embedding bug.
+>
+> **Why both `embed_tokens` and `lm_head` are trained separately**: Qwen3-VL-4B has `tie_word_embeddings=True`, so the base model shares the input-embedding and output-projection weights. However, PEFT's `ensure_weight_tying` cannot detect this tie for Qwen3-VL's nested architecture (`_get_module_names_tied_with_embedding` is invoked on the tuner object rather than the base model), so it warns and falls back to placing both layers in `modules_to_save`. We intentionally keep this setup: it makes the special-token embeddings trainable and fixes the garbled-output bug, at the cost of ~2× trainable parameters for these layers. The warning is harmless.
 
 ```bash
 # From scratch
@@ -237,9 +239,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
     --resume_from_checkpoint outputs/stage3b_sft_point/checkpoint-5000
 ```
 
-### Stage 4a: Box Expert GRPO (3 rounds by default)
+### Stage 4a: Box Expert GRPO (1 round, no early stopping)
 
-> **Note**: GRPO uses a multi-round loop structure. After each round, the model is reloaded — inter-round gaps are natural checkpoints. Each round should run to completion; if interrupted mid-round, the script auto-detects the latest `checkpoint-*` and resumes from it. Completed rounds are skipped on restart.
+> **Note**: The default config now uses a single GRPO round with `num_epochs=1` and disables the tiny-subset early-stopping callback (`early_stopping_subset_size: 0`). The multi-round loop structure is still supported; if you raise `num_rounds`, each round runs to completion and the script auto-detects the latest `checkpoint-*` to resume an interrupted round.
 >
 > **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
 >
@@ -247,26 +249,36 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
 
 > **Garbled output tip**: If completions contain non-Latin characters around coordinates, the Stage 3a/3b adapter was likely trained without trainable special-token embeddings. Re-train Stage 3a/3b with the latest `qwen_vl_loader.py` (`embed_tokens` / `lm_head` in `modules_to_save`) before running GRPO.
 
-> **Difficulty filter (paper Sec 2.5.2)**: The paper pre-filters GRPO data to keep only "Normal" difficulty samples (model sometimes succeeds, sometimes fails). For single-GPU setups this step can cause OOM due to the extra on-policy rollouts required. We **skip it by default** (`skip_difficulty_filter: true`) and compensate by doubling the dataset size. Hard samples (all rollouts wrong) produce zero reward variance and thus near-zero gradients during GRPO — they waste compute but do not harm training. Easy samples (all correct) behave the same way. To re-enable filtering on a multi-GPU setup, set `skip_difficulty_filter: false` in the YAML.
+> **Dtype mismatch fix**: A `RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16` during GRPO generation is fixed by `_patch_lm_head_dtype_cast()` in `src/models/qwen_vl_loader.py`. It casts fp32 layer-norm outputs to the `lm_head` weight dtype before the final linear projection. No config change is required.
+
+> **Multi-round OOM tip**: If you increase `num_rounds` and Round 2 (or later) fills up VRAM/RAM, it is usually because the previous round left PyTorch/BitsAndBytes allocator pools populated. `src/training/grpo_runner.py` moves the policy model back to CPU and runs an aggressive cache clear between rounds. The default Stage 4a config uses `batch_size=2`, `gradient_accumulation_steps=3`, `generation_batch_size=8`, `num_generations=8` to keep per-step rollout memory low. If you still hit it, delete the interrupted `outputs/stage4a_grpo_box/round_N` and re-run; completed rounds are skipped.
+
+> **Resume VRAM fix**: Previously, resuming a GRPO round from `round_N/checkpoint-*` loaded the adapter once in `grpo_runner.py` and then again inside `Trainer.train(resume_from_checkpoint=...)`, leaving several extra GB in the CUDA memory pool and often pushing optimizer states to system RAM. The resume path now keeps the policy model loaded from the round's starting point and lets the Trainer load the checkpoint only once. Additionally, the GRPO reference adapter (`ref`) is cast from fp32 to bf16 at training start, saving roughly half of the reference adapter's VRAM (~2.6 GB). Both changes apply automatically; no config change is required.
+
+> **Difficulty filter (paper Sec 2.5.2)**: The paper pre-filters GRPO data to keep only "Normal" difficulty samples (model sometimes succeeds, sometimes fails). For single-GPU setups this step can cause OOM due to the extra on-policy rollouts required. We **skip it by default** (`skip_difficulty_filter: true`) and keep the default dataset small (Stage 4a: 4K samples, Stage 4b: 4K samples) so the pipeline finishes quickly. Hard samples (all rollouts wrong) produce zero reward variance and thus near-zero gradients during GRPO — they waste compute but do not harm training. Easy samples (all correct) behave the same way. To re-enable filtering on a multi-GPU setup, set `skip_difficulty_filter: false` in the YAML and scale the sample counts back up.
 
 ```bash
+# Default: 2000 box + 1000 counting + 1000 CLEVR (4K samples)
 python scripts/run_stage4a_grpo_box.py \
     --model_path outputs/stage3a_sft_box \
-    --output_dir outputs/stage4a_grpo_box \
-    --num_samples 5000
+    --output_dir outputs/stage4a_grpo_box
 ```
 
-### Stage 4b: Point Expert GRPO (3 rounds by default)
+> **Results**: 4,000 steps (1 epoch, 4K samples), completed in **~20.1h wall-clock** across 3 resume segments: (1) 2026-06-27 16:53 → 2026-06-28 00:03 ~7h 10m (checkpoint-3800), (2) 2026-06-28 06:53 → 08:26 ~1h 33m (checkpoint-4000), (3) 2026-06-28 08:58 → 20:22 ~11h 24m (final). Output: `outputs/stage4a_grpo_box/`.
 
-> **Note**: Like Stage 4a, Stage 4b auto-detects the latest `round_N/checkpoint-*` and resumes the interrupted round on restart. Completed rounds are skipped.
+### Stage 4b: Point Expert GRPO (1 round, no early stopping)
+
+> **Note**: Like Stage 4a, the default config uses a single round with `num_epochs=1` and disabled tiny-subset early stopping. The multi-round loop is still supported; completed rounds are skipped on restart and interrupted rounds auto-resume from the latest `round_N/checkpoint-*`.
 >
 > **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
+>
+> **Dtype mismatch fix**: Same Stage 4a fix applies: `src/models/qwen_vl_loader.py` injects a dtype-cast wrapper around `lm_head` to prevent `float != c10::BFloat16` errors during GRPO generation.
 
 ```bash
+# Default: 1000 point + 2000 maze + 1000 path (4K samples)
 python scripts/run_stage4b_grpo_point.py \
     --model_path outputs/stage3b_sft_point \
-    --output_dir outputs/stage4b_grpo_point \
-    --num_point 2000 --num_maze 5000
+    --output_dir outputs/stage4b_grpo_point
 ```
 
 ### Stage 5: Unified RFT (Expert-generated rollouts)

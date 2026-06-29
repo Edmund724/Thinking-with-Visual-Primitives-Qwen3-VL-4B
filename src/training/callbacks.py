@@ -7,7 +7,7 @@ import torch
 from transformers import TrainerCallback
 
 from ..utils.conversation_builder import ConversationBuilder
-from .memory_utils import clear_memory, get_gpu_memory_gb, log_memory_status
+from .memory_utils import cast_ref_adapter_to_bf16, clear_memory, get_gpu_memory_gb, log_memory_status
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,19 @@ class MemoryMonitorCallback(TrainerCallback):
     def on_epoch_end(self, args, state, control, **kwargs):
         log_memory_status(f"Epoch {state.epoch:.1f} end (peak: {self.peak_memory:.2f}GB):")
         self.peak_memory = 0.0
+        return control
+
+
+class CastRefAdapterCallback(TrainerCallback):
+    """Cast the GRPO reference adapter to bfloat16 at training start.
+
+    This must run *after* the checkpoint has been loaded (so the reference
+    adapter is already present) but *before* the first forward pass.
+    """
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            cast_ref_adapter_to_bf16(model)
         return control
 
 

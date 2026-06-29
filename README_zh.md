@@ -102,14 +102,14 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 ```
 Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~7.4h  ✅
 Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型          ~1m     ✅
-Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~12h   ✅
+Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~13.4h ✅
 Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~?    ✅ (含 resume)
-Stage 4a: Box Expert GRPO         Box 专家 GRPO (3 轮循环，默认)          ~6h    (预计)
-Stage 4b: Point Expert GRPO       Point 专家 GRPO (3 轮循环，默认)        ~6h    (预计)
+Stage 4a: Box Expert GRPO         Box 专家 GRPO (1 轮，无早停)            ~20.1h  ✅
+Stage 4b: Point Expert GRPO       Point 专家 GRPO (1 轮，无早停)          ~6h    (预计)
 Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~5h    (预计)
 Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
                                 ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~57h
+                                Total（已实测部分）:                         ~72h
 ```
 
 **核心设计**：
@@ -197,9 +197,11 @@ python scripts/run_stage2_merge.py \
 >
 > **注**：所有训练阶段（Stage 1、3a、3b、4a、4b、5、6）现在均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行或 resume 直接加载，跳过耗时的数据生成。每个阶段使用基于参数的缓存 key，修改任何数据生成参数会自动生成新缓存。如需强制重建，可加 `--regenerate_data`。
 >
-> **训练结果**：14,250 步（2 epochs），loss 2.87 → 1.62（−44%），均值 1.65，grad norm 6.20 → 0.44，收敛稳定。57,000 样本（15K box + 10K 计数 + 5K CLEVR + 2K 负样本 + 25K general）。**耗时：~12.1h GPU 时间** @ ~2.6 samples/sec。输出：`outputs/stage3a_sft_box/`。
+> **训练结果**：14,250 步（2 epochs），loss 2.87 → 1.62（−44%），均值 1.65，grad norm 6.20 → 0.44，收敛稳定。57,000 样本（15K box + 10K 计数 + 5K CLEVR + 2K 负样本 + 25K general）。**耗时：~13.4h 墙钟时间** @ ~2.3 samples/sec。分 3 段跑：(1) 2026-06-25 11:40→19:12 ~7.5h, (2) 2026-06-26 16:09→17:35 ~1.4h, (3) 2026-06-26 17:35→22:01 ~4.4h。输出：`outputs/stage3a_sft_box/`。
 >
 > **⚠️ 重要提示（2026-06-22 修复后）**：如果 Stage 4a/4b 仍输出乱码（如 `personsยิง药材[[...]]`），根本原因是特殊 token（`<|box|>`、`<|ref|>` 等）的 embedding 在 SFT 阶段被冻结。请确认使用最新代码（`src/models/qwen_vl_loader.py` 已将 `embed_tokens` / `lm_head` 加入 `modules_to_save`），然后重新训练 Stage 3a/3b（最好从 Stage 1 重跑，使 merged base 也携带训练好的 embedding）。Stage 3 配置里的 `format_token_weight` 也已从 40.0 降到 10.0（40.0 原是为补偿 embedding 冻结的权宜之计）。
+>
+> **为什么 `embed_tokens` 和 `lm_head` 是分开训练的**：Qwen3-VL-4B 的 `tie_word_embeddings=True`，基座模型本共享输入 embedding 和输出投影权重。但 PEFT 的 `ensure_weight_tying` 对 Qwen3-VL 的嵌套结构检测不到这一绑定（`_get_module_names_tied_with_embedding` 被作用在 tuner 对象上而非 base model），因此会报 warning 并回退到把两层都放进 `modules_to_save`。我们有意保持这一设置：它让特殊 token 的 embedding 可训练，并解决了之前的乱码问题，代价是这两层的可训练参数约翻倍。该 warning 无害。
 
 ```bash
 # 从头训练
@@ -246,36 +248,46 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_
     --resume_from_checkpoint outputs/stage3b_sft_point/checkpoint-5000
 ```
 
-### Stage 4a: Box Expert GRPO（默认 3 轮循环）
+### Stage 4a: Box Expert GRPO（默认 1 轮，无早停）
 
-> **注**：GRPO 采用多轮循环结构，每轮结束后模型会被 reload，轮间是天然断点。每轮本身应一次性跑完；若中途 OOM，脚本会自动查找最新的 `checkpoint-*` 并从中断处恢复。已完成的轮次在重跑时自动跳过。
+> **注**：默认配置现在使用单轮 GRPO，`num_epochs=1`，并关闭基于训练子集的早停（`early_stopping_subset_size: 0`）。多轮循环结构仍被支持；如果你增大 `num_rounds`，每轮会一次性跑完，若中途 OOM，脚本会自动查找最新的 `checkpoint-*` 从中断处恢复，已完成的轮次在重跑时自动跳过。
 >
 > **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
 >
 > **显存提示**：所有 stage 脚本现已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，无需手动添加，可有效缓解长时间训练中的 CUDA 显存碎片化问题。
 
 > **乱码提示**：如果 rollout 在坐标附近出现非英文学符乱码，通常是 Stage 3a/3b adapter 训练时特殊 token embedding 不可训练导致的。请先用最新版 `qwen_vl_loader.py`（`embed_tokens` / `lm_head` 加入 `modules_to_save`）重新训练 Stage 3a/3b，再进入 GRPO。
+>
+> **dtype 不匹配修复**：GRPO 生成阶段若遇到 `RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`，`src/models/qwen_vl_loader.py` 中的 `_patch_lm_head_dtype_cast()` 会在 `lm_head` 前向时把 fp32 的 layer-norm 输出自动 cast 到 `lm_head` 权重的 dtype，无需修改配置。
 
-> **难度筛选（论文 Sec 2.5.2）**：论文在 GRPO 训练前会筛选“Normal”难度样本（模型有时对有时错）。对单卡环境，这个步骤需要额外的 on-policy rollout 推理，容易引发 OOM。我们**默认跳过**该步骤（`skip_difficulty_filter: true`），并将数据量加倍来补偿。Hard 样本（全错）在 GRPO 训练中 reward 方差为 0，梯度接近 0，只会浪费算力但不会损害训练效果；Easy 样本（全对）同理。若在多卡环境希望重新启用筛选，将 YAML 中的 `skip_difficulty_filter` 设为 `false` 即可。
+> **多轮 OOM 提示**：如果你增大了 `num_rounds`，某一轮把显存/内存占满并被 kill，通常是因为上一轮结束后 PyTorch/BitsAndBytes 的显存分配池和碎片没有立刻归还给系统。`src/training/grpo_runner.py` 会在每轮之间先把 policy model 移回 CPU，再执行完整的垃圾回收和 CUDA cache 清理。Stage 4a 默认配置使用 `batch_size=2`、`gradient_accumulation_steps=3`、`generation_batch_size=8`、`num_generations=8`，在保持 GRPO clip 条件有效的同时进一步降低每步 rollout 峰值显存。如果仍出现，可直接删除被中断的 `outputs/stage4a_grpo_box/round_N` 后重新运行 stage 脚本；脚本会自动跳过已完成轮次，并从干净进程继续训练被中断的轮次。
+
+> **Resume 显存修复**：之前从 `round_N/checkpoint-*` 续训时，`grpo_runner.py` 会预先加载一次 adapter，随后 `Trainer.train(resume_from_checkpoint=...)` 又会再加载一次，导致 CUDA 内存池中多占用几个 GB，常常把 optimizer 状态挤到系统内存中显著降速。现在 resume 路径会保持从本轮起始点加载的 policy model，仅由 Trainer 统一加载 checkpoint；同时在训练开始时把 GRPO 的参考 adapter（`ref`）从 fp32 转到 bf16，可节省参考 adapter 约一半显存（约 2.6 GB）。两项优化均自动生效，无需修改配置。
+
+> **难度筛选（论文 Sec 2.5.2）**：论文在 GRPO 训练前会筛选“Normal”难度样本（模型有时对有时错）。对单卡环境，这个步骤需要额外的 on-policy rollout 推理，容易引发 OOM。我们**默认跳过**该步骤（`skip_difficulty_filter: true`），并把默认数据集设得比较小（Stage 4a：4K 样本，Stage 4b：4K 样本），让流程能快速跑通。Hard 样本（全错）在 GRPO 训练中 reward 方差为 0，梯度接近 0，只会浪费算力但不会损害训练效果；Easy 样本（全对）同理。若在多卡环境希望重新启用筛选，将 YAML 中的 `skip_difficulty_filter` 设为 `false`，并相应放大样本量。
 
 ```bash
+# 默认：2000 box + 1000 counting + 1000 CLEVR（共 4K 样本）
 python scripts/run_stage4a_grpo_box.py \
     --model_path outputs/stage3a_sft_box \
-    --output_dir outputs/stage4a_grpo_box \
-    --num_samples 5000
+    --output_dir outputs/stage4a_grpo_box
 ```
 
-### Stage 4b: Point Expert GRPO（默认 3 轮循环）
+> **训练结果**：4,000 步（1 epoch，4K 样本），**~20.1h 墙钟时间**，分 3 段 resume 完成：(1) 2026-06-27 16:53 → 2026-06-28 00:03 ~7h 10m（checkpoint-3800），(2) 2026-06-28 06:53 → 08:26 ~1h 33m（checkpoint-4000），(3) 2026-06-28 08:58 → 20:22 ~11h 24m（最终完成）。输出：`outputs/stage4a_grpo_box/`。
 
-> **注**：与 Stage 4a 相同，Stage 4b 会自动检测 `round_N/checkpoint-*` 中最新 checkpoint，中断的轮次会自动续训，已完成轮次自动跳过。
+### Stage 4b: Point Expert GRPO（默认 1 轮，无早停）
+
+> **注**：与 Stage 4a 相同，默认配置为单轮 `num_epochs=1`、关闭 tiny-subset 早停。多轮循环仍被支持；已完成轮次自动跳过，中断的轮次会从最新的 `round_N/checkpoint-*` 自动续训。
 >
 > **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
+>
+> **dtype 不匹配修复**：与 Stage 4a 相同，`src/models/qwen_vl_loader.py` 已对 `lm_head` 注入 dtype-cast 包装，避免 GRPO 生成时出现 `float != c10::BFloat16` 错误。
 
 ```bash
+# 默认：1000 point + 2000 maze + 1000 path（共 4K 样本）
 python scripts/run_stage4b_grpo_point.py \
     --model_path outputs/stage3b_sft_point \
-    --output_dir outputs/stage4b_grpo_point \
-    --num_point 2000 --num_maze 5000
+    --output_dir outputs/stage4b_grpo_point
 ```
 
 ### Stage 5: Unified RFT（专家生成 rollout）

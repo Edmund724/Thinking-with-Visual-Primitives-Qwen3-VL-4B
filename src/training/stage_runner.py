@@ -32,12 +32,15 @@ Usage (in a stage script)::
 from __future__ import annotations
 
 import argparse
+import atexit
 import glob
 import logging
 import os
 import pickle
 import re
+import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -174,6 +177,45 @@ class StageRunner:
         self.logger.info(f"Stage: {self.stage_name}")
         self.logger.info("=" * 60)
 
+        completed_normally = False
+        interrupted = False
+
+        def _flush_log() -> None:
+            for handler in self.logger.handlers:
+                handler.flush()
+
+        def _log_unexpected_exit() -> None:
+            if not completed_normally:
+                self.logger.info(
+                    f"Process terminated/interrupted at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+                _flush_log()
+
+        # Log unexpected exits (SIGTERM, SIGINT via KeyboardInterrupt, crashes).
+        # The transformers Trainer may install its own handlers later; atexit will
+        # still run as long as the active handler eventually exits the process.
+        atexit.register(_log_unexpected_exit)
+
+        def _sigterm_handler(signum: int, frame: Any) -> None:
+            nonlocal interrupted
+            interrupted = True
+            self.logger.info(
+                f"Received SIGTERM at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}; exiting..."
+            )
+            _flush_log()
+            sys.exit(1)
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
         torch.cuda.empty_cache()
-        train_fn(self)
-        torch.cuda.empty_cache()
+        try:
+            train_fn(self)
+            completed_normally = not interrupted
+        finally:
+            torch.cuda.empty_cache()
+            _flush_log()
+            if completed_normally:
+                self.logger.info(
+                    f"Stage completed normally at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+

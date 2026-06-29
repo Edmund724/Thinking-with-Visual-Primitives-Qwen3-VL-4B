@@ -208,7 +208,7 @@ def train(runner: StageRunner) -> None:
         output_dir=args.output_dir,
         num_rounds=num_rounds,
         reward_fn_factory=reward_fn_factory,
-        thresholds=[0.3, 0.5, 0.7],
+        thresholds=[0.5],
         quality_fn_factory=quality_fn_factory,
         quality_task_type="box",
         args=args,

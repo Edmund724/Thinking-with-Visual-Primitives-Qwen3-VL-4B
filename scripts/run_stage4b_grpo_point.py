@@ -209,7 +209,7 @@ def train(runner: StageRunner) -> None:
         output_dir=args.output_dir,
         num_rounds=num_rounds,
         reward_fn_factory=reward_fn_factory,
-        thresholds=[20.0, 10.0, 5.0],
+        thresholds=[10.0],
         quality_fn_factory=quality_fn_factory,
         quality_task_type="point",
         args=args,

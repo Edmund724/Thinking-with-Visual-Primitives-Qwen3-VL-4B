@@ -16,7 +16,53 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - 效果：Stage 1、3a、3b、4a、4b、5、6 中途中止后，再次运行同一命令即可自动续训；每次 logging 都能看到精确时间戳和已运行时间，便于分多次跑时估算剩余时间和核对进度。
   - 验证：单元测试 `test_logging_utils.py`、`test_config_utils.py` 通过；所有 stage 脚本 `python <script> --help` 可正常解析；`StageRunner.latest_checkpoint()`、`TimeLoggingCallback`、bash pipeline 语法均已手动验证。
 
+- **StageRunner 自动记录进程终止/完成时间**
+  - `src/training/stage_runner.py`：`run()` 内注册 `atexit` 与 `SIGTERM` 处理器；正常结束时记录“Stage completed normally”，被 `kill` / 超时 / 用户中断时记录“Process terminated/interrupted”或“Received SIGTERM ... exiting...”，并主动 flush 日志处理器。
+  - 效果：今后各 stage 被手动终止或异常退出后，日志文件里会留下明确的终止时间戳，不再需要手动追加。
+  - 验证：通过 `timeout` 发送 SIGTERM/SIGINT 手动验证，日志中正确出现终止时间戳。
+
+### Fixed
+
+- **Stage 4a/4b GRPO resume 后显存占用比从头训练高数 GB 的问题**
+  - `src/training/grpo_runner.py`：发现 checkpoint 后不再通过 `load_qlora_model()` 预先加载 policy adapter，而是保持当前轮次起始点加载的 policy model，让 `Trainer.train(resume_from_checkpoint=...)` 统一加载 adapter 权重、optimizer 状态与 trainer 状态。避免同一个 adapter 被加载两次，显著降低 resume 时的 CUDA 显存占用与碎片。
+  - `src/training/memory_utils.py`：新增 `cast_ref_adapter_to_bf16()`，将 GRPO 的参考 adapter（`ref`）从 float32 转换为 bfloat16。TRL 在复制 policy adapter 创建 `ref` 之后才把可训练参数 cast 到 bf16，导致 `ref` 默认留在 fp32；参考模型仅用于推理（计算 KL 惩罚的 log prob），转 bf16 安全且可节省约一半 reference adapter 显存（约 2.6 GB）。
+  - `src/training/callbacks.py`：新增 `CastRefAdapterCallback`，在训练开始、checkpoint 加载完成后执行 `cast_ref_adapter_to_bf16()`。
+  - `src/training/grpo_runner.py`：GRPO 训练回调列表中追加 `CastRefAdapterCallback`。
+  - 新增单元测试 `tests/test_grpo_memory.py`：验证 `cast_ref_adapter_to_bf16()` 只转换 `ref` 参数、`CastRefAdapterCallback` 正确触发、无 `ref` adapter 时安全 no-op。
+  - 效果：Stage 4a/4b 在从 `round_N/checkpoint-*` 续训时，显存占用与从头训练更接近，降低因 VRAM 不足导致 BitsAndBytes 把 optimizer 状态换入系统内存而大幅降速的概率。
+  - 验证：`tests/test_grpo_memory.py`、`tests/test_grpo_fixes.py` 通过。
+
 ### Changed
+
+- **Stage 4a/4b GRPO 默认数据量减半，加速流程复现**
+  - `configs/stage4a_grpo_box.yaml`：`num_samples` 4000 → 2000，`num_counting` 2000 → 1000，`num_clevr` 2000 → 1000（总计 4K 样本）。
+  - `configs/stage4b_grpo_point.yaml`：`num_point` 2000 → 1000，`num_maze` 4000 → 2000，`num_path` 2000 → 1000（总计 4K 样本）。
+  - 原因：默认配置定位为“快速跑通 pipeline”，8K 样本对单卡验证来说训练时间过长；减半后单 epoch step 数减少约 50%，更便于迭代调试。需要追论文精度时再把样本量加回来。
+  - `README.md` 和 `README_zh.md` 已同步更新 Stage 4a/4b 的默认数据量说明和示例命令。
+
+- **Stage 4a/4b GRPO 进一步降低默认显存占用（修复 resume OOM）**
+  - `configs/stage4a_grpo_box.yaml`：`generation_batch_size` 16 → 8，`num_epochs` 2 → 1。`batch_size=2`、`gradient_accumulation_steps=3`、`num_generations=8`，每步有效 completions 仍为 48，但单次 generate 调用从 16 条降到 8 条，峰值 VRAM 更低。
+  - `configs/stage4b_grpo_point.yaml`：`batch_size` 3 → 2，`gradient_accumulation_steps` 4 → 3，`num_epochs` 2 → 1。`generation_batch_size=6`、`num_generations=6`，每步有效 completions 36，并修复了之前 `grad_accum=4` 导致 `clip_ratio` 恒为 0 的问题（`4 % (1*2) == 0` → `3 % (1*2) == 1`）。
+  - `README.md` 和 `README_zh.md` 已同步更新 Stage 4a/4b 显存与配置说明。
+
+- **Stage 4a/4b GRPO 默认策略改为“单轮 + 无早停 + 固定阈值”**
+  - `configs/stage4a_grpo_box.yaml`：`num_rounds` 2 → 1，`num_epochs` 1 → 2，`early_stopping_subset_size` 16 → 0，`filter_iou_threshold` 0.3 → 0.5。
+  - `configs/stage4b_grpo_point.yaml`：`num_rounds` 2 → 1，`num_epochs` 1 → 2，`early_stopping_subset_size` 16 → 0，`filter_point_dist_threshold` 20.0 → 10.0。
+  - `scripts/run_stage4a_grpo_box.py`：多轮 IoU 阈值 `[0.3, 0.5, 0.7]` → 单轮固定 `[0.5]`。
+  - `scripts/run_stage4b_grpo_point.py`：多轮距离阈值 `[20.0, 10.0, 5.0]` → 单轮固定 `[10.0]`。
+  - 原因：原配置使用训练集前 16 条样本做早停，默认 2 轮且阈值逐步收紧，这是为了快速跑通 pipeline 的简化；改为更贴近论文思路的单轮训练到收敛，避免 tiny-subset 波动导致 Round 1 过早结束。difficulty filter 仍默认跳过（`skip_difficulty_filter: true`），以节省单卡前置 rollout 时间。
+  - `README.md` 和 `README_zh.md` 已同步更新 Stage 4a/4b 说明。
+
+- **Stage 4a GRPO 显存再优化：降低单步 rollout batch，保持 group size 与 clip 条件**
+  - `configs/stage4a_grpo_box.yaml`：`batch_size` 3 → 2，`generation_batch_size` 24 → 16；`gradient_accumulation_steps` 保持 3，`num_generations` 保持 8，`max_completion_length` 保持 384。
+  - 效果：每步同时生成的 completion 数从 24 降到 16，峰值 VRAM 显著下降；有效 completions per optimizer step 从 72 降到 48（2 × 3 × 8）。
+  - 兼容性：`generation_batch_size=16` 可被 `num_generations=8` 整除；`batch_size=2` 使得 `steps_per_generation=8`，`gradient_accumulation_steps=3` 与 `num_iterations=2` 的余数 `3 % 16 != 0`，GRPO clip_ratio 仍不会恒为 0。
+  - `README.md` 和 `README_zh.md` 已同步更新 Stage 4a 显存提示。
+
+- **Stage 4a GRPO 超参数调整：激活 clip 并扩大 group size**
+  - `configs/stage4a_grpo_box.yaml`：`gradient_accumulation_steps` 4 → 3，`num_generations` 6 → 8，`generation_batch_size` 6 → 24（有效 completions per optimizer step 保持 72 不变）。
+  - `src/training/grpo_runner.py`：`GRPOConfig` 新增 `num_iterations=2`。
+  - 原因：TRL 1.6.0 在 `gradient_accumulation_steps % (steps_per_generation * num_iterations) == 0` 时会把 `old_per_token_logps` 设为当前 policy 的 detach 版本，导致 `clip_ratio` 始终为 0；调整参数使余数非零，从而让 GRPO clip 真正生效，同时通过扩大 group size 提升组内 reward 方差。
 
 - **Stage 3a 显存优化：降低单步 batch 与序列长度**
   - `configs/stage3a_sft_box.yaml`：`batch_size` 4 → 2，`gradient_accumulation_steps` 3 → 6（有效 batch size 保持 12 不变），`max_seq_length` 4096 → 2048。
@@ -57,6 +103,21 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 - **Stage 1 训练加速：提升 per-device batch size，减少梯度累积步数**
   - `configs/stage1_visual_pretrain.yaml`：`batch_size` 1 → 4，`gradient_accumulation_steps` 4 → 1（有效 batch size 保持 4，消除全部梯度累积开销）。
+
+### Fixed
+
+- **修复 Stage 4 GRPO 多轮连续运行导致第二轮 OOM**
+  - `src/training/grpo_runner.py`：每轮结束后新增“先 `policy_model.to('cpu')` 再删除”的清理步骤，随后触发完整 `gc.collect()`、`torch.cuda.empty_cache()` / `synchronize()` / `ipc_collect()`，并在重新加载下一轮模型后记录显存状态。
+  - `src/training/memory_utils.py`：`clear_memory()` 增加 `torch.cuda.ipc_collect()`，进一步回收 CUDA IPC 共享内存碎片。
+  - 原因：单进程内连续跑多轮 GRPO 时，Round 1 训练结束后 PyTorch/BitsAndBytes 的显存池和碎片不会立即归还给系统；Round 2 再加载一份 base + adapter 时，峰值显存/内存叠加，容易在 24 GB 显存 + 19 GB 内存环境下把资源顶满。该修复让每轮之间尽可能回到干净的显存状态。
+  - 验证：`python -m py_compile src/training/grpo_runner.py src/training/memory_utils.py` 通过；`python -c "from src.training.grpo_runner import run_grpo_rounds"` 导入正常。
+
+- **修复 GRPO 生成阶段 `lm_head` dtype 不匹配错误**
+  - `src/models/qwen_vl_loader.py`：新增 `_patch_lm_head_dtype_cast()`，在 `load_qlora_model()` 和 `load_reference_model()` 完成后，为 `lm_head` 注入一个轻量前向包装：当输入 activation 的 dtype 与 `lm_head` 权重 dtype 不一致时（例如 `prepare_model_for_kbit_training` 把 layer norm 输出保留为 fp32，而 `lm_head` 权重为 bfloat16 等其他 dtype），自动将输入 cast 到权重 dtype。
+  - 修复报错：`RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`。
+  - 该包装对训练无影响：训练在 autocast 下运行时输入与权重 dtype 通常一致，不会触发 cast；生成阶段无 autocast 时会自动修正。
+  - 新增回归测试 `tests/test_qwen_vl_loader.py`，覆盖 PEFT-wrapped `lm_head`、plain `lm_head`、bf16 权重 + fp32 输入等场景。
+  - 验证：`tests/test_qwen_vl_loader.py` 通过；`load_qlora_model()` 加载 base model 与 adapter checkpoint 后均能正确注入 patch。
 
 - **Stage 3a/3b SFT 配置对齐：`format_token_weight=40`, `num_epochs=3`**
   - `configs/stage3a_sft_box.yaml`：`format_token_weight` 从默认值上调至 40.0（ref token 梯度信号更强），`num_epochs` 1 → 3（embedding 获得更多更新机会）。
@@ -126,6 +187,8 @@ All notable changes to the GRPO training pipeline are documented in this file.
 - **Stage 1 & 2 timing updated to latest wall-clock time** — Stage 1: **~7.4h wall-clock** (2026-06-23 13:34:45 → 20:57:45; 45K samples, 2 epochs, data cache hit). Stage 2: **~24s** (2026-06-23 21:25:15 → 21:25:24). Results: 22,500 steps, loss 6.88→2.34 (−66%), grad norm 14.48→1.25, stable convergence. Updated README.md and README_zh.md pipeline tables and Stage 1 sections.
 
 - **Stage 3a timing recorded** — Stage 3a: ~12.1h GPU time. Results: 14,250 steps (2 epochs), loss 2.87→1.62 (−44%), average 1.65, grad norm 6.20→0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). Updated README.md and README_zh.md pipeline tables, total time (~52h→~57h), and Stage 3a sections.
+
+- **Stage 4a completed — actual runtime recorded** — Stage 4a Box Expert GRPO completed in **~20.1h wall-clock** across 3 resume segments: (1) 2026-06-27 16:53→2026-06-28 00:03 ~7h 10m (checkpoint-3800), (2) 2026-06-28 06:53→08:26 ~1h 33m (checkpoint-4000), (3) 2026-06-28 08:58→20:22 ~11h 24m (final). 4,000 steps (1 epoch, 4K samples: 2K box + 1K counting + 1K CLEVR). Output: `outputs/stage4a_grpo_box/`. Updated README.md and README_zh.md pipeline tables (Stage 4a ~6h est. → ~20.1h measured, total ~58h→~72h) and added Stage 4a results sections.
 
 ### Removed
 
@@ -357,6 +420,9 @@ All notable changes to the GRPO training pipeline are documented in this file.
 - **README 与 requirements.txt 版本标注修正**
   - `flash-attn` 版本在 README.md、README_zh.md 和 requirements.txt 中明确标注为 `2.8.3`（实际安装版本为 `2.8.3.post1`）。
   - `wandb` 最低版本从 `>=0.19.0` 修正为 `>=0.27.0`（与实际安装版本对齐）。
+
+- **README 增加 `embed_tokens` / `lm_head` 独立训练说明**
+  - 在 README.md 和 README_zh.md 的 Stage 3a 重要提示中补充：Qwen3-VL-4B 虽配置 `tie_word_embeddings=True`，但 PEFT 的 `ensure_weight_tying` 对其嵌套结构检测不到 tied weights，因此回退到把两层都放入 `modules_to_save` 独立训练；该设计解决了特殊 token 乱码问题，代价是这两层可训练参数约翻倍，且 PEFT 会报无害 warning。
 
 ### Added
 

@@ -31,6 +31,7 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        torch.cuda.ipc_collect()
 
 
 def log_memory_status(prefix: str = ""):
@@ -42,6 +43,29 @@ def log_memory_status(prefix: str = ""):
         logger.warning(msg)
     else:
         logger.info(msg)
+
+
+def cast_ref_adapter_to_bf16(model: torch.nn.Module) -> int:
+    """Cast the GRPO reference adapter (``ref``) to bfloat16 to save VRAM.
+
+    TRL creates the ``ref`` adapter by copying the policy adapter before it
+    casts trainable parameters to bfloat16, so the reference adapter is left in
+    float32. The reference is only used for inference (computing log
+    probabilities for the KL penalty), so bfloat16 is safe and roughly halves
+    its GPU memory footprint.
+    """
+    peft_config = getattr(model, "peft_config", None)
+    if peft_config is None or "ref" not in peft_config:
+        return 0
+
+    count = 0
+    for name, param in model.named_parameters():
+        if ".ref." in name:
+            param.data = param.data.to(torch.bfloat16)
+            count += 1
+    if count:
+        logger.info(f"Cast {count} ref-adapter parameters to bfloat16")
+    return count
 
 
 def build_param_groups(

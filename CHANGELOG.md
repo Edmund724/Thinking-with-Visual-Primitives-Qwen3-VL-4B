@@ -19,6 +19,9 @@ All notable changes to the GRPO training pipeline are documented in this file.
 - **StageRunner 自动记录进程终止/完成时间**
   - `src/training/stage_runner.py`：`run()` 内注册 `atexit` 与 `SIGTERM` 处理器；正常结束时记录“Stage completed normally”，被 `kill` / 超时 / 用户中断时记录“Process terminated/interrupted”或“Received SIGTERM ... exiting...”，并主动 flush 日志处理器。
   - 效果：今后各 stage 被手动终止或异常退出后，日志文件里会留下明确的终止时间戳，不再需要手动追加。
+
+- **Stage 3b 实测耗时 ~16h**
+  - 训练日志记录两段实际跑时：(1) 2026-06-29 13:50→06-30 01:26 约 11.6h（因进程中断），(2) 2026-06-30 10:42→15:02 约 4.4h（从 checkpoint-12000 resume 到完成）。已同步更新 `README.md`、`README_zh.md` 中训练流程总耗时。
   - 验证：通过 `timeout` 发送 SIGTERM/SIGINT 手动验证，日志中正确出现终止时间戳。
 
 ### Fixed

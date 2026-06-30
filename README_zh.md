@@ -103,13 +103,13 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~7.4h  ✅
 Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型          ~1m     ✅
 Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~13.4h ✅
-Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~?    ✅ (含 resume)
+Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~16h    ✅ (含 resume)
 Stage 4a: Box Expert GRPO         Box 专家 GRPO (1 轮，无早停)            ~20.1h  ✅
 Stage 4b: Point Expert GRPO       Point 专家 GRPO (1 轮，无早停)          ~6h    (预计)
 Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~5h    (预计)
 Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
                                 ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~72h
+                                Total（已实测部分）:                         ~78h
 ```
 
 **核心设计**：
@@ -198,6 +198,8 @@ python scripts/run_stage2_merge.py \
 > **注**：所有训练阶段（Stage 1、3a、3b、4a、4b、5、6）现在均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行或 resume 直接加载，跳过耗时的数据生成。每个阶段使用基于参数的缓存 key，修改任何数据生成参数会自动生成新缓存。如需强制重建，可加 `--regenerate_data`。
 >
 > **训练结果**：14,250 步（2 epochs），loss 2.87 → 1.62（−44%），均值 1.65，grad norm 6.20 → 0.44，收敛稳定。57,000 样本（15K box + 10K 计数 + 5K CLEVR + 2K 负样本 + 25K general）。**耗时：~13.4h 墙钟时间** @ ~2.3 samples/sec。分 3 段跑：(1) 2026-06-25 11:40→19:12 ~7.5h, (2) 2026-06-26 16:09→17:35 ~1.4h, (3) 2026-06-26 17:35→22:01 ~4.4h。输出：`outputs/stage3a_sft_box/`。
+
+> - **训练结果**：45,500 样本（5K point + 10K maze + 5K path tracing + 500 负样本 point + 25K general）。**耗时：~16h 墙钟时间** @ ~0.58 samples/sec。分 2 段跑：(1) 2026-06-29 13:50→06-30 01:26 ~11.6h（中断），(2) 2026-06-30 10:42→15:02 ~4.4h（从 checkpoint-12000 resume 到完成）。输出：`outputs/stage3b_sft_point/`。
 >
 > **⚠️ 重要提示（2026-06-22 修复后）**：如果 Stage 4a/4b 仍输出乱码（如 `personsยิง药材[[...]]`），根本原因是特殊 token（`<|box|>`、`<|ref|>` 等）的 embedding 在 SFT 阶段被冻结。请确认使用最新代码（`src/models/qwen_vl_loader.py` 已将 `embed_tokens` / `lm_head` 加入 `modules_to_save`），然后重新训练 Stage 3a/3b（最好从 Stage 1 重跑，使 merged base 也携带训练好的 embedding）。Stage 3 配置里的 `format_token_weight` 也已从 40.0 降到 10.0（40.0 原是为补偿 embedding 冻结的权宜之计）。
 >

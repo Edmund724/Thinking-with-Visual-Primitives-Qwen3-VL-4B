@@ -103,13 +103,13 @@ unzip data/coco/annotations_trainval2017.zip -d data/coco
 Stage 1:  Unified Visual Pretrain  COCO + CLEVR images, box/point grounding  ~7.4h   ✅
 Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~24s    ✅
 Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~13.4h ✅
-Stage 3b: Point Expert SFT         Point+Maze SFT                             ~?    ✅ (including resume)
+Stage 3b: Point Expert SFT         Point+Maze SFT                             ~16h    ✅ (including resume)
 Stage 4a: Box Expert GRPO          Box expert GRPO (1 round, no early stop)   ~20.1h  ✅
 Stage 4b: Point Expert GRPO        Point expert GRPO (1 round, no early stop) ~6h    (est.)
 Stage 5:  Unified RFT              Expert-generated rollouts → Unified learning ~5h  (est.)
 Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
                                 ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~72h
+                                Total（已实测部分）:                         ~78h
 ```
 
 **Core Design**:
@@ -189,6 +189,8 @@ python scripts/run_stage2_merge.py \
 > **Note**: All training stages (Stage 1, 3a, 3b, 4a, 4b, 5, 6) now support training-data pickle caching — auto-saved on first run and loaded directly on subsequent runs/resumes. Each stage uses parameter-based cache keys so changing any data-generation parameter automatically creates a fresh cache. Use `--regenerate_data` to force rebuilding.
 >
 > **Results**: 14,250 steps (2 epochs), loss 2.87 → 1.62 (−44%), average 1.65, grad norm 6.20 → 0.44, stable convergence. 57,000 samples (15K box + 10K counting + 5K CLEVR + 2K negative + 25K general). **Duration: ~13.4h wall-clock** @ ~2.3 samples/sec. Split into 3 segments: (1) 2026-06-25 11:40→19:12 ~7.5h, (2) 2026-06-26 16:09→17:35 ~1.4h, (3) 2026-06-26 17:35→22:01 ~4.4h. Output: `outputs/stage3a_sft_box/`.
+>
+> - **Training results**: 45,500 samples (5K point + 10K maze + 5K path tracing + 500 negative point + 25K general). **Duration: ~16.4h wall-clock** @ ~0.58 samples/sec. Split into 2 segments: (1) 2026-06-29 13:50→06-30 01:26 ~11.6h (interrupted), (2) 2026-06-30 10:42→15:02 ~4.4h (resume from checkpoint-12000 to completion). Output: `outputs/stage3b_sft_point/`.
 >
 > **⚠️ Important (post-2026-06-22 fix)**: If Stage 4a/4b still outputs garbled non-Latin characters (e.g. `personsยิง药材[[...]]`), the root cause is that the special-token embeddings (`<|box|>`, `<|ref|>`, etc.) were frozen during SFT. Make sure you are using the latest code where `src/models/qwen_vl_loader.py` adds `embed_tokens` / `lm_head` to `modules_to_save`, then re-train Stage 3a/3b (ideally from Stage 1 so the merged base also carries trained embeddings). The Stage 3 config's `format_token_weight` has also been lowered from 40.0 to 10.0; 40.0 was a workaround for the frozen-embedding bug.
 >

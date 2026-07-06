@@ -22,6 +22,26 @@ from ..utils.constants import (
     SPECIAL_TOKENS,
 )
 
+def _disable_gradient_checkpointing_on_frozen_modules(model: torch.nn.Module) -> None:
+    """Turn off gradient checkpointing for modules whose parameters are all frozen.
+
+    Qwen3-VL enables checkpointing on every submodule that exposes the flag,
+    including the frozen vision blocks. Checkpointing frozen blocks only wastes
+    memory and triggers PyTorch warnings (``None of the inputs have
+    requires_grad=True``). This keeps checkpointing active on trainable layers
+    (text decoder LoRA) and disables it elsewhere.
+    """
+    n_disabled = 0
+    for module in model.modules():
+        if not getattr(module, "gradient_checkpointing", False):
+            continue
+        has_trainable = any(p.requires_grad for p in module.parameters(recurse=True))
+        if not has_trainable:
+            module.gradient_checkpointing = False
+            n_disabled += 1
+    logger.debug(f"Disabled gradient checkpointing on {n_disabled} frozen module(s)")
+
+
 # Modules whose full parameters must be trainable (not just LoRA) so that
 # newly-added special-token embeddings (<|box|>, <|ref|>, etc.) are learned and
 # saved with the adapter.  Without this, the embeddings/lm_head stay frozen at
@@ -64,30 +84,88 @@ def _is_adapter_checkpoint(path: str) -> bool:
     )
 
 
-def _set_use_cache_deep(module: torch.nn.Module) -> None:
-    """Recursively set use_cache=False on every config object in a module tree.
+def _resolve_grpo_expert_path(path: str) -> str:
+    """Resolve a GRPO stage output directory to its actual adapter checkpoint.
+
+    GRPO saves the final adapter of each round under ``round_N/`` inside the
+    stage output directory.  If *path* itself is already an adapter checkpoint
+    (or a base model), return it unchanged.  Otherwise, look for the latest
+    ``round_N`` subdirectory that contains an adapter and return that path.
+    """
+    if not os.path.isdir(path) or _is_adapter_checkpoint(path):
+        return path
+
+    rounds = []
+    for name in os.listdir(path):
+        if not name.startswith("round_"):
+            continue
+        try:
+            round_num = int(name.split("_")[-1])
+        except ValueError:
+            continue
+        round_path = os.path.join(path, name)
+        if _is_adapter_checkpoint(round_path):
+            rounds.append((round_num, round_path))
+
+    if rounds:
+        rounds.sort()
+        return rounds[-1][1]
+    return path
+
+
+def _set_use_cache_deep(module: torch.nn.Module, use_cache: bool) -> None:
+    """Recursively set ``use_cache`` on every config object in a module tree.
 
     Qwen3VL has deeply nested submodules; the ``@merge_with_config_defaults``
     decorator on ``Qwen3VLTextModel.forward`` reads ``self.config.use_cache``
-    from the innermost ``Qwen3VLTextConfig``.  A top-level ``model.config.use_cache
-    = False`` does NOT propagate there, so we must reach every config.
+    from the innermost ``Qwen3VLTextConfig``.  A top-level
+    ``model.config.use_cache = ...`` does NOT propagate there, so we must reach
+    every config object.
     """
     seen_configs: set[int] = set()
 
     def _walk(m: torch.nn.Module) -> None:
-        # Set on the module's own config if present
         cfg = getattr(m, "config", None)
         if cfg is not None and hasattr(cfg, "use_cache"):
             cfg_id = id(cfg)
             if cfg_id not in seen_configs:
                 seen_configs.add(cfg_id)
-                cfg.use_cache = False
-        # Recurse into children
+                cfg.use_cache = use_cache
         for child in m.children():
             _walk(child)
 
     _walk(module)
-    logger.debug(f"Set use_cache=False on {len(seen_configs)} config object(s)")
+    logger.debug(f"Set use_cache={use_cache} on {len(seen_configs)} config object(s)")
+
+
+def _get_use_cache_states(module: torch.nn.Module) -> dict[int, bool]:
+    """Capture current ``use_cache`` values for every config object."""
+    states: dict[int, bool] = {}
+
+    def _walk(m: torch.nn.Module) -> None:
+        cfg = getattr(m, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            states[id(cfg)] = cfg.use_cache
+        for child in m.children():
+            _walk(child)
+
+    _walk(module)
+    return states
+
+
+def _set_use_cache_states(module: torch.nn.Module, states: dict[int, bool]) -> None:
+    """Restore ``use_cache`` values captured by ``_get_use_cache_states``."""
+
+    def _walk(m: torch.nn.Module) -> None:
+        cfg = getattr(m, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg_id = id(cfg)
+            if cfg_id in states:
+                cfg.use_cache = states[cfg_id]
+        for child in m.children():
+            _walk(child)
+
+    _walk(module)
 
 
 def _patch_lm_head_dtype_cast(model):
@@ -190,6 +268,10 @@ def load_qlora_model(
     # Resolve relative paths to absolute to avoid HuggingFace Hub fallback
     model_name = _resolve_local_path(model_name)
 
+    # GRPO stages save adapters under round_N/ inside the stage output dir.
+    # If the user passes the stage output dir, resolve it to the actual adapter.
+    model_name = _resolve_grpo_expert_path(model_name)
+
     # Detect if model_name itself is an adapter checkpoint
     is_adapter = _is_adapter_checkpoint(model_name)
     base_model_path = model_name
@@ -266,16 +348,18 @@ def load_qlora_model(
             f"No resize needed: embedding ({current_embed_size}) covers tokenizer ({new_tokenizer_len})"
         )
 
-    # (Step 4) prepare_model_for_kbit_training
+    # (Step 4) Prepare for 4-bit training and enable gradient checkpointing in one
+    # call. Passing gradient_checkpointing_kwargs ensures ``use_reentrant=False``
+    # is forwarded to torch.utils.checkpoint, suppressing the PyTorch 2.11 warning.
+    # We call this *before* adding PEFT so the checkpoint function is set on the
+    # base modules and survives PEFT wrapping.
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if use_gradient_checkpointing else None,
+    )
     if use_gradient_checkpointing:
-        # use_cache is incompatible with gradient checkpointing; disable explicitly
-        # before enabling checkpointing to suppress the runtime warning.
-        model.config.use_cache = False
-        model.gradient_checkpointing_enable()
-        logger.info("Gradient checkpointing enabled (use_cache=False)")
-
-    # Prepare for 4-bit training
-    model = prepare_model_for_kbit_training(model)
+        logger.info("Gradient checkpointing enabled (use_reentrant=False)")
 
     if is_adapter:
         # Scenario 2: Load existing adapter
@@ -309,7 +393,12 @@ def load_qlora_model(
     # Qwen3VL nesting: PeftModel → LoraModel → Qwen3VLForConditionalGeneration
     #   → Qwen3VLModel → Qwen3VLTextModel (the one with @merge_with_config_defaults
     #   decorator that reads self.config.use_cache during forward).
-    _set_use_cache_deep(model)
+    _set_use_cache_deep(model, False)
+
+    # Gradient checkpointing is only useful on trainable layers. Frozen modules
+    # (e.g., the vision backbone) keep the flag from the base model but have no
+    # trainable parameters, which causes spurious PyTorch warnings.
+    _disable_gradient_checkpointing_on_frozen_modules(model)
 
     # Fix dtype mismatch between fp32 layer-norm outputs and lm_head weights
     # during generation (PEFT modules_to_save + prepare_model_for_kbit_training).
@@ -367,6 +456,9 @@ def load_reference_model(
     model_path = _resolve_local_path(model_path)
     if adapter_path is not None:
         adapter_path = _resolve_local_path(adapter_path)
+
+    # GRPO stages save adapters under round_N/ inside the stage output dir.
+    model_path = _resolve_grpo_expert_path(model_path)
 
     try:
         import flash_attn  # noqa: F401

@@ -2,13 +2,19 @@
 
 import sys
 import os
+import tempfile
+import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
 
-from src.models.qwen_vl_loader import _patch_lm_head_dtype_cast
+from src.models.qwen_vl_loader import (
+    _is_adapter_checkpoint,
+    _patch_lm_head_dtype_cast,
+    _resolve_grpo_expert_path,
+)
 
 
 class _FakeModulesToSaveWrapper(nn.Module):
@@ -93,9 +99,78 @@ def test_patch_lm_head_dtype_cast_bf16_weight():
     print("test_patch_lm_head_dtype_cast_bf16_weight PASSED")
 
 
+def test_is_adapter_checkpoint():
+    """Detect adapter directories by adapter_config.json or adapter_model.safetensors."""
+    with tempfile.TemporaryDirectory() as tmp:
+        adapter_dir = os.path.join(tmp, "adapter")
+        os.makedirs(adapter_dir)
+        assert not _is_adapter_checkpoint(adapter_dir)
+
+        # adapter_config.json alone is sufficient
+        with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+            f.write("{}")
+        assert _is_adapter_checkpoint(adapter_dir)
+
+        # adapter_model.safetensors alone is also sufficient
+        os.remove(os.path.join(adapter_dir, "adapter_config.json"))
+        with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "w") as f:
+            f.write("dummy")
+        assert _is_adapter_checkpoint(adapter_dir)
+
+        # Non-directory path returns False
+        assert not _is_adapter_checkpoint(os.path.join(tmp, "missing"))
+    print("test_is_adapter_checkpoint PASSED")
+
+
+def test_resolve_grpo_expert_path_unchanged():
+    """Non-GRPO paths are returned unchanged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        adapter_dir = os.path.join(tmp, "adapter")
+        os.makedirs(adapter_dir)
+        with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+            f.write("{}")
+        assert _resolve_grpo_expert_path(adapter_dir) == adapter_dir
+    print("test_resolve_grpo_expert_path_unchanged PASSED")
+
+
+def test_resolve_grpo_expert_path_round_subdirs():
+    """Resolve a GRPO parent dir to the latest round_N adapter subdir."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_dir = os.path.join(tmp, "stage4a_grpo_box")
+        os.makedirs(stage_dir)
+
+        round1 = os.path.join(stage_dir, "round_1")
+        os.makedirs(round1)
+        with open(os.path.join(round1, "adapter_config.json"), "w") as f:
+            f.write("{}")
+
+        round2 = os.path.join(stage_dir, "round_2")
+        os.makedirs(round2)
+        with open(os.path.join(round2, "adapter_model.safetensors"), "w") as f:
+            f.write("dummy")
+
+        resolved = _resolve_grpo_expert_path(stage_dir)
+        assert resolved == round2, f"Expected {round2}, got {resolved}"
+    print("test_resolve_grpo_expert_path_round_subdirs PASSED")
+
+
+def test_resolve_grpo_expert_path_no_adapter_fallback():
+    """If no round subdir has an adapter, return the original path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_dir = os.path.join(tmp, "stage4a_grpo_box")
+        os.makedirs(stage_dir)
+        os.makedirs(os.path.join(stage_dir, "round_1"))
+        assert _resolve_grpo_expert_path(stage_dir) == stage_dir
+    print("test_resolve_grpo_expert_path_no_adapter_fallback PASSED")
+
+
 if __name__ == "__main__":
     test_patch_lm_head_dtype_cast_with_peft_wrapper()
     test_patch_lm_head_dtype_cast_idempotent()
     test_patch_lm_head_dtype_cast_no_wrapper()
     test_patch_lm_head_dtype_cast_bf16_weight()
+    test_is_adapter_checkpoint()
+    test_resolve_grpo_expert_path_unchanged()
+    test_resolve_grpo_expert_path_round_subdirs()
+    test_resolve_grpo_expert_path_no_adapter_fallback()
     print("\n=== qwen_vl_loader tests PASSED ===")

@@ -77,8 +77,10 @@ class StageRunner:
         config_path: str,
         description: str = "",
     ) -> None:
-        # Mitigate CUDA memory fragmentation from variable-length sequences.
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # Use a modest max-split size to reduce fragmentation from variable-length
+        # sequences without enabling expandable segments, which triggers
+        # "CUDA driver error: device not ready" on the 5090D/Bexus driver stack.
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
 
         self.stage_name = stage_name
         self.config_path = config_path
@@ -102,6 +104,38 @@ class StageRunner:
         Call this after construction but before ``parse_args()`` / ``run()``.
         """
         self.parser.add_argument(*args, **kwargs)
+
+    def add_common_args(self) -> None:
+        """Register args shared by multiple training stages.
+
+        Currently adds the standard resume/regenerate flags so they appear
+        consistently across stage scripts.
+        """
+        self.add_arg(
+            "--resume_from_checkpoint",
+            type=str,
+            default=None,
+            help="Path to checkpoint dir to resume SFT training, e.g. outputs/stage5_rft_unified/checkpoint-500",
+        )
+        self.add_arg(
+            "--regenerate_data",
+            action="store_true",
+            help="Force regeneration of prompts and filtered data, ignoring existing caches.",
+        )
+        self.add_arg(
+            "--skip_expert_generation",
+            action="store_true",
+            help="Skip the expert rollout generation / difficulty grading step. "
+                 "Use this when you already have prepared training data or want to "
+                 "go straight to SFT training.",
+        )
+        self.add_arg(
+            "--train_data_path",
+            type=str,
+            default=None,
+            help="Path to a pickle file containing pre-filtered training records. "
+                 "Used only when --skip_expert_generation is set.",
+        )
 
     def parse_args(self, cli_args: list[str] | None = None) -> argparse.Namespace:
         """Parse CLI args, overlay YAML defaults, and create the logger.

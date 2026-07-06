@@ -13,7 +13,6 @@ Only one expert is kept in GPU memory at a time to avoid VRAM pressure.
 
 import hashlib
 import os
-import gc
 import sys
 
 import torch
@@ -30,7 +29,7 @@ from src.data.generators.coco_box_generator import (
 from src.data.generators.synthetic_maze import generate_maze_dataset
 from src.models.qwen_vl_loader import load_qlora_model
 from src.training.opd_trainer import train_opd_parallel
-from src.training.memory_utils import log_memory_status, clear_memory
+from src.training.memory_utils import log_memory_status
 from src.utils.constants import DEFAULT_DISTILL_TEMPERATURE
 
 
@@ -114,32 +113,16 @@ def train(runner: StageRunner) -> None:
 
     # Split by teacher routing
     box_data = [d for d in all_data if d.get("task_type") == "box"]
-    point_data = [d for d in all_data if d.get("task_type") in ("point", "maze")]
-    logger.info(f"Routing: {len(box_data)} box samples, {len(point_data)} point/maze samples")
+    point_data = [d for d in all_data if d.get("task_type") in ("point", "maze", "path")]
+    logger.info(f"Routing: {len(box_data)} box samples, {len(point_data)} point/maze/path samples")
 
-    # 3. Load both experts for parallel distillation (gradient accumulation)
-    logger.info(f"Loading Box Expert from {args.box_expert_path}...")
-    box_expert, _ = load_qlora_model(
-        model_name=args.box_expert_path,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-    )
-    log_memory_status("Box Expert loaded:")
-
-    logger.info(f"Loading Point Expert from {args.point_expert_path}...")
-    point_expert, _ = load_qlora_model(
-        model_name=args.point_expert_path,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-    )
-    log_memory_status("Point Expert loaded:")
-
-    # 4. Parallel OPD with gradient accumulation
+    # 3. Parallel OPD with gradient accumulation; experts are loaded on demand
+    #    so that only one teacher (plus the student) is in GPU memory at a time.
     logger.info("Starting parallel OPD (gradient accumulation mode)...")
     train_opd_parallel(
         student_model=student_model,
-        box_expert=box_expert,
-        point_expert=point_expert,
+        box_expert_path=args.box_expert_path,
+        point_expert_path=args.point_expert_path,
         processor=processor,
         box_data=box_data,
         point_data=point_data,
@@ -155,13 +138,6 @@ def train(runner: StageRunner) -> None:
         resume_from_checkpoint=resume_ckpt,
         logger=logger,
     )
-
-    # Release experts before saving
-    logger.info("Releasing experts after OPD training...")
-    del box_expert, point_expert
-    gc.collect()
-    clear_memory()
-    log_memory_status("Experts released:")
 
     # Save student model
     os.makedirs(args.output_dir, exist_ok=True)

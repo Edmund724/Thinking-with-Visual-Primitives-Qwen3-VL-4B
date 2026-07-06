@@ -76,7 +76,7 @@ def make_point_reward_fn(point_dist_threshold: float, tokenizer=None, logger=Non
                 # completions of different conciseness.
                 comp_id = completion_ids_list[i] if i < len(completion_ids_list) else None
                 comp_len = len(comp_id) if comp_id is not None else len(pred_text.split())
-                target_len = 150 if task_type == "maze" else (120 if task_type == "path" else 80)
+                target_len = 300 if task_type == "maze" else (150 if task_type == "path" else 120)
                 length_r = length_reward(comp_len, target_length=target_len, max_penalty=0.1)
                 rewards.append(total["total_reward"] + length_r)
             except Exception as e:

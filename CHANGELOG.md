@@ -6,6 +6,96 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Added
 
+- **Stage 5 Unified RFT 默认 Fast mode（忠实论文的小规模 pipeline）**
+  - 根因：Stage 5 完整数据流程（17,000 prompts × 5 rollouts）耗时过长，但用户希望尽快走通论文机制，不要求最终精度。
+  - `configs/stage5_rft_unified.yaml`：默认 prompt 数量下调为 `num_box_prompts: 100`、`num_counting_prompts: 50`、`num_clevr_prompts: 50`、`num_point_prompts: 100`、`num_maze_prompts: 50`、`num_path_prompts: 50`，`num_rollouts: 2`，`skip_expert_generation: false`。这样完整保留论文流程（Experts → rejection sampling → Easy/Normal/Hard difficulty grading → Normal + 5% Easy → Unified SFT），但数据筛选可在数分钟内完成。
+  - 新增 `min_normal_samples: 10`，避免 fast mode 下 Normal 样本不足（如 73/81 个）导致 SFT 被跳过。该阈值可通过 `--min_normal_samples` 在命令行覆盖，或改回 100/更高用于生产训练。
+  - 实测：本次 fast mode 运行生成 400 prompts、2 rollouts，共保留 81 条 Normal+Easy 样本，SFT 1 epoch 约 45s，总 wall-clock 约 **2.7h**，train_loss=2.236，模型保存至 `outputs/stage5_rft_unified/final_model`。
+  - 说明：如果需要高质量的 Stage 5 模型，可手动把这些数值调大；只要数值变了，缓存 key 会变，会自动重新生成。
+  - `README.md` / `README_zh.md`：Stage 5 章节训练流程概览表更新为实测 ~2.7h ✅，并新增/更新「Fast mode（默认）」说明。
+  - 验证：`python -m py_compile scripts/run_stage5_rft_unified.py` 通过；配置解析后 `skip_expert_generation=False`、`num_rollouts=2`、`min_normal_samples=10`（通过 `StageRunner.apply_yaml_defaults`）。
+
+### Fixed
+
+- **强化 Stage 5 expert 切换时的显存释放，修复加载第二个 expert 时的 `CUDA driver error: device not ready`**
+  - 根因：`src/training/memory_utils.py` 的 `clear_memory()` 在 `torch.cuda.empty_cache()` 之后才调用 `torch.cuda.synchronize()`。某些驱动/运行时状态下，先释放显存池再等待未完成 kernel 可能触发 `device not ready`，尤其是在第一个 expert 刚卸载、第二个 expert 的 adapter 权重要立即分配时。
+  - `src/training/memory_utils.py`：调整 `clear_memory()` 顺序为 `synchronize → empty_cache → synchronize → ipc_collect`，确保所有 pending kernel 完成后再释放显存块，释放后再等待一次，降低新模型加载时遇到 driver 未就绪的概率。
+  - `scripts/run_stage5_rft_unified.py`：expert 卸载时显式把 `expert = None` 后再 `del expert; gc.collect(); clear_memory()`，避免局部变量仍持有引用。
+  - 效果：Box Expert → Point Expert 切换更稳健，单卡 24 GB 上加载第二个 adapter 时更不容易触发 `CUDA driver error: device not ready`。
+  - 验证：`python -m py_compile scripts/run_stage5_rft_unified.py src/training/memory_utils.py` 通过；`python -m pytest tests/test_config_utils.py -v` 通过；`clear_memory()` 调用路径被 `tests/test_logging_utils.py` 间接覆盖（保留原测试通过）。
+
+- **修复 Stage 6 OPD 加载第二个 expert 时的爆显存 / `CUDA driver error: device not ready`**
+  - 根因：`scripts/run_stage6_opd.py` 在训练开始前同时加载 student + box expert + point expert 三个 QLoRA 模型，单卡 24 GB 显存在加载第三个模型时触发 OOM，表现为 `safe_load_file`/`PeftModel.from_pretrained` 阶段报错 `CUDA driver error: device not ready`。
+  - 修复思路：保持论文 Sec 2.5.4 的并行蒸馏目标（每 epoch 内 Box 专家与 Point 专家信号通过梯度累积合成），但把专家加载时机推迟到各自 phase 开始、并在 phase 结束后立即释放，确保任意时刻 GPU 中只有 student + 一个 expert。
+  - `src/training/opd_trainer.py`：`train_opd_parallel()` 签名由传入 `box_expert`/`point_expert` 模型对象改为传入 `box_expert_path`/`point_expert_path` 字符串；函数内部在每个 epoch 的 Box phase 开始时 `load_qlora_model(box_expert_path)`，phase 结束后 `del box_expert; clear_memory()`；Point phase 同理。梯度累积与单 `optimizer.step()` 逻辑不变。
+  - `scripts/run_stage6_opd.py`：不再预先加载两个 expert，直接传递路径给 `train_opd_parallel()`；移除训练结束后的 `del box_expert, point_expert; gc.collect(); clear_memory()` 块（现由 trainer 内部处理）；移除因此不再使用的 `gc`/`clear_memory` 导入。
+  - 效果：OPD 峰值显存从约 3 个 QLoRA 模型降为约 2 个（student + 当前 expert），避免加载第二个 expert 时爆显存；论文的“Box / Point 双专家蒸馏”思路保持不变。
+  - 验证：`python -m py_compile scripts/run_stage6_opd.py src/training/opd_trainer.py` 通过；`python -c "from src.training.opd_trainer import train_opd_parallel"` 导入成功；`README.md`/`README_zh.md` 中关于 Stage 6 显存占用的描述已同步修正。
+
+- **修复 Stage 6 OPD 运行时报 `TypeError: cannot unpack non-iterable int object`**
+  - 根因：`src/training/opd_trainer.py` 的 `_opd_single_batch()` 为了适配 `batch_size=1`，对 batch 中所有 tensor 统一使用 `v[0]` 取第一个样本。这对 `input_ids` 等 1D sequence 张量正确，但对 `image_grid_thw` 会错误地把形状 `[num_images, 3]` 压成 `[3]`。`Qwen3-VL` 的 `get_vision_bilinear_indices_and_weights()` 期望 `for t, h, w in grid_thw.tolist()`，即二维列表 `[[t, h, w], ...]`；当 `grid_thw` 变成 `[3]` 后，`tolist()` 得到 `[1, h, w]`，解包单个 int 触发 `TypeError`。
+  - `src/training/opd_trainer.py`：修改 `_opd_single_batch()` 的 prompt_inputs 构建逻辑，对 `image_grid_thw` 保持 collate 后的 `[num_images, 3]` 形状并整体 `to(device)`，其余张量仍用 `v[0]` 取单样本。
+  - 效果：OPD 在 image sample 上可正常进入 `student_model.generate()`，不再因 `image_grid_thw` 形状错误崩溃。
+  - 验证：构造了复现脚本——processor 输出 → squeeze(0) → `_opd_collate` → 模拟修复后的 prompt_inputs 构建，确认 `image_grid_thw` 形状为 `[1, 3]` 且 `tolist()` 可正确解包；`python -m py_compile src/training/opd_trainer.py` 与 `python -m pytest tests/test_qwen_vl_loader.py -q` 通过。
+
+- **修复 Stage 6 OPD 运行时报 `ValueError: Multimodal data was passed but mm_token_type_ids is missing`**
+  - 根因：`src/training/opd_trainer.py` 的 `_opd_single_batch()` 将视觉 kwargs 限定为 `pixel_values` 和 `image_grid_thw`，没有传入 `mm_token_type_ids`。Qwen3-VL 的 M-RoPE 计算需要 `mm_token_type_ids` 来区分文本/图像 token，缺失时直接抛错。
+  - `src/training/opd_trainer.py`：把 `mm_token_type_ids` 加入 `image_kwargs`，与 `pixel_values`、`image_grid_thw` 一起传给 `student_model.generate()`、`student_model()` 和 `expert()`。
+  - 效果：OPD 在多模态样本上可正确触发视觉特征提取和 M-RoPE 位置编码，不再因缺少 `mm_token_type_ids` 崩溃。
+  - 验证：复现脚本确认 collated batch 包含 `mm_token_type_ids`，且修复后的 `image_kwargs` 包含该 key；`python -m py_compile src/training/opd_trainer.py scripts/run_stage6_opd.py`、`python -c "from src.training.opd_trainer import train_opd_parallel"`、`python -m pytest tests/test_qwen_vl_loader.py -q` 均通过。
+
+- **修复 Stage 6 OPD 运行时报 `IndexError: too many indices for tensor of dimension 0`**
+  - 根因：`src/training/opd_trainer.py` 的 `_opd_single_batch()` 里，`input_ids` 通过 `prompt_ids.unsqueeze(0)` 补了 batch 维度，但 `attention_mask` 和 `mm_token_type_ids` 仍是 1D（`[seq_len]`）。Qwen3-VL 的 `get_rope_index()` 在计算 M-RoPE 时会执行 `mm_token_type_ids[batch_idx]` 和 `attention_mask[batch_idx].bool()`，当 `mm_token_type_ids` 是 1D 时，`mm_token_type_ids[0]` 得到 0D scalar，再执行 `[scalar_bool]` 触发 `IndexError`。
+  - `src/training/opd_trainer.py`：在 `_opd_single_batch()` 中统一为 `input_ids`、`attention_mask`、`mm_token_type_ids` 添加 batch 维度（`unsqueeze(0)`），使三者都保持 `[1, seq_len]`；`generate()` 调用时直接使用带 batch 维度的 `prompt_ids`，不再重复 `unsqueeze(0)`。
+  - 效果：OPD 在 image sample 上可正确生成和 forward，不再因 attention_mask/mm_token_type_ids 缺少 batch 维度触发 IndexError。
+  - 验证：复现脚本模拟修复后的 prompt_inputs 构建，确认 `input_ids`、`attention_mask`、`mm_token_type_ids` 均为 `[1, seq_len]`，且 `get_rope_index` 的索引操作可正常执行；`python -m py_compile src/training/opd_trainer.py scripts/run_stage6_opd.py`、`python -c "from src.training.opd_trainer import train_opd_parallel"`、`python -m pytest tests/test_qwen_vl_loader.py -q` 均通过。
+
+- **修复 Stage 6 OPD 运行时报 `RuntimeError: The expanded size of the tensor (816) must match the existing size (304) ...`**
+  - 根因：`src/training/opd_trainer.py` 的 `_opd_single_batch()` 在 `student_model.generate()` 生成回复后，直接用 prompt 长度的 `mm_token_type_ids` 对完整序列（prompt + response）做 forward。Qwen3-VL 的 `get_rope_index()` 会根据 `input_ids` 的实际长度计算 `llm_positions`，但 `position_ids` 的初始模板尺寸由 `mm_token_type_ids` 的长度决定；两者长度不一致时，`position_ids[:, batch_idx] = llm_positions` 触发 `RuntimeError`。
+  - `src/training/opd_trainer.py`：在生成完整序列后，将 `image_kwargs["mm_token_type_ids"]` 用 0 扩展到与 `full_ids` 相同长度（response 部分没有图像 token，因此补 0），再传入 `student_model()` 和 `expert()`；forward 结束后恢复为 prompt 长度，避免影响后续 batch。
+  - 效果：OPD 中完整序列的 forward 与学生 generate 阶段的长度匹配，不再因 M-RoPE position_ids 尺寸不一致崩溃。
+  - 验证：在 GPU 上运行了真正的端到端测试——加载 Qwen3-VL-4B + LoRA（r=8）作为 student 和 expert，构造单张图片的 OPD batch，调用 `_opd_single_batch()` 成功完成 generate + student forward + expert forward + backward，`KL loss: 0.0000`；`python -m py_compile src/training/opd_trainer.py scripts/run_stage6_opd.py` 与 `python -m pytest tests/test_qwen_vl_loader.py -q` 也通过。
+
+- **正修 Stage 6 OPD 训练中的 gradient checkpointing 相关刷屏警告并降低生成阶段显存**
+  - 根因 1（警告）：Qwen3-VL 开启 gradient checkpointing 后，transformers/torch 在每次 generate/forward 时都会重复打印：`[transformers] use_cache=True is incompatible with gradient checkpointing`、`torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly`、`None of the inputs have requires_grad=True. Gradients will be None`、`[transformers] Caching is incompatible with gradient checkpointing ...`。这些消息数量与 batch 数成正比，严重污染训练日志。
+  - 根因 2（显存）：`transformers` 在 gradient checkpointing 开启时会强制 `use_cache=False`，导致 `model.generate()` 每一步都重新计算整个前缀的 attention，长 multimodal 序列下临时显存开销很大，是 Stage 6 OOM 的重要来源之一。
+  - `src/models/qwen_vl_loader.py`：调用 `prepare_model_for_kbit_training(..., gradient_checkpointing_kwargs={"use_reentrant": False})`，把 `use_reentrant=False` 正确传给 `torch.utils.checkpoint`，消除 PyTorch 2.11 的显式参数警告。
+  - `src/models/qwen_vl_loader.py`：新增 `_disable_gradient_checkpointing_on_frozen_modules()`，在 PEFT 包装后关闭 vision backbone 等无可训练参数模块的 checkpointing，消除 `None of the inputs have requires_grad=True` 警告。
+  - `src/models/qwen_vl_loader.py`：新增 `_set_use_cache_deep()` / `_get_use_cache_states()` / `_set_use_cache_states()`，递归管理所有嵌套 `config.use_cache`。
+  - `src/training/opd_trainer.py`：重写 `_no_gradient_checkpointing()` 上下文管理器，在 `student_model.generate()` 期间临时关闭 gradient checkpointing 并恢复 `use_cache=True`（生成结束后再恢复 `use_cache=False` 与 checkpointing），使生成阶段可以使用 KV cache，显著降低长序列生成的临时显存占用。
+  - `src/training/opd_trainer.py`：学生与专家的 forward 调用显式传入 `use_cache=False`，配合已开启的 gradient checkpointing，既避免警告又保证训练 forward 的显存效率。
+  - 效果：上述四类刷屏消息从日志中消失，且**不是通过隐藏/过滤 warnings 实现**；同时 `model.generate()` 在长 multimodal 序列下不再因 `use_cache=False` 而暴涨显存。
+  - 验证：`python scripts/diagnostics/test_opd_warnings.py` 在 GPU 上 PASS（未捕获到目标警告）；`python scripts/diagnostics/profile_opd_memory.py` 显示单 batch（max_new_tokens=512、512×512 图像）峰值 allocated≈19.3GB / reserved≈22.7GB；`python -m pytest tests/ -q` 通过；`python scripts/run_stage6_opd.py ... --num_box 1 --num_point 2 --num_epochs 1 --max_new_tokens 16` 端到端运行成功，`Stage completed normally`。
+
+- **修复 `path` 任务类型在 Stage 6 OPD 路由与集成测试中的识别**
+  - 根因：`generate_path_tracing_dataset()` 返回的样本 `task_type` 为 `"path"`，但 `scripts/run_stage6_opd.py` 的 `point_data` 路由仅包含 `("point", "maze")`，导致 path 样本被排除在 Point Expert 蒸馏之外；同时 `tests/test_stage_integration.py` 中 Stage 4b/5/6 的测试断言未把 `"path"` 视为合法任务类型，造成 3 个测试失败。
+  - `scripts/run_stage6_opd.py`：将 `point_data` 路由扩展为 `("point", "maze", "path")`，与 Stage 5 的 non-box 任务由 Point Expert 处理保持一致，符合论文中 Unified 模型蒸馏所有非 box 视觉primitive任务的思路。
+  - `tests/test_stage_integration.py`：更新 Stage 4b、Stage 5、Stage 6 相关断言，接受 `"path"` 作为合法 `task_type`。
+  - 效果：path tracing 样本在 Stage 6 能正确进入 Point Expert 蒸馏流程；完整测试套件回归通过。
+  - 验证：`python -m pytest tests/ -q` → 188 passed, 1 skipped。
+
+- **进一步降低 Stage 6 OPD 峰值显存并增加显存可观测性**
+  - 根因：`_opd_single_batch()` 在 `student_model()` / `expert()` 中传入 `labels`，触发内部 cross-entropy loss 计算，额外分配 `[seq_len, vocab_size]` 量级的 logits/loss 张量；变量长度序列在每个 batch 后留下不同大小的 reserved 块，长期运行容易因碎片逼近显存上限。
+  - `src/training/opd_trainer.py`：移除学生与专家 forward 中的 `labels` 参数（OPD 只使用 logits 计算 reverse KL，不需要内部 loss），减少约 300MB–1GB 的临时显存开销（取决于序列长度与词表大小）。
+  - `src/training/opd_trainer.py`：在每个 batch 的 backward/step 结束后调用 `torch.cuda.empty_cache()`，及时释放变量长度序列造成的 reserved 碎片。
+  - `src/training/opd_trainer.py`：在 Box/Point expert 加载、释放以及每个 epoch 结束时通过 stage logger 打印 allocated/reserved 显存，方便用户观察峰值并排查 OOM。
+  - 效果：单卡 24GB 上，学生+专家+单 batch 长序列（max_new_tokens=512）的峰值 reserved 控制在 ~23.9GB 以内；多 batch 连续运行不会因碎片持续增长；用户可在日志中直接看到每个 phase 的显存变化。
+  - 验证：`python scripts/diagnostics/profile_opd_memory.py` 单 batch 峰值 allocated≈19.3GB / reserved≈22.7GB；`python scripts/run_stage6_opd.py ... --num_box 3 --num_point 3 --num_epochs 1 --max_new_tokens 512` 完整通过；`python -m pytest tests/ -q` → 188 passed, 1 skipped。
+
+### Added
+
+- **Stage 4b Point Expert GRPO 训练完成并更新文档**
+  - Stage 4b 已完成：4,000 步（1 epoch，4K 样本），实际 GPU 运行时间约 **36.4 小时**，墙钟跨度约 **95.5 小时**（2026-06-30 18:04 → 2026-07-04 17:31，CST），分 7 段 resume 完成，最终 checkpoint 为 `checkpoint-6000`。输出目录：`outputs/stage4b_grpo_point/`。
+  - 更新 `README.md` / `README_zh.md` 训练流程概览表：Stage 4b 状态从「预计」改为「✅ 实测」，总实测耗时更新为 ~93.3h；Stage 4b 章节补充分 7 段 resume 的时间明细与最终 checkpoint 信息。
+  - 验证：检查 `logs/stage4b_grpo_point.log` 确认 `Stage 4b complete`，`outputs/stage4b_grpo_point/` 存在训练产物；Stage 5 配置 `configs/stage5_rft_unified.yaml` 中的 `point_expert_path` 已指向该输出目录，可直接进入 Stage 5。
+
+- **Stage 5 Unified RFT 接入 Quality RM（rollout 选择）**
+  - `scripts/run_stage5_rft_unified.py`：新增 `_build_quality_fn()` 工厂，并在 `difficulty_grading()` 的 best-rollout 选择中把 Quality RM 分数叠加到 `compute_total_reward` 之上（权重 1.0，与 Stage 4a/4b GRPO 中 quality reward 的等权处理一致），避免把 reward-hacking / 冗余的 rollout 选作 SFT 目标（论文 Sec 2.5.2 Quality RM 跨任务共享）。
+  - 新增 `--use_quality_rm_api` 开关与 `configs/stage5_rft_unified.yaml` 中 `use_quality_rm_api: false`（默认关，走规则版 `quality_reward_text`；置 true 则用 `quality_rm_api.py` 的 LLM GRM，需 `.env` 配置 `OPENAI_API_KEY`）。开关值已并入 filtered-data 缓存 key，切换后会自动重算过滤数据。
+  - 说明：Stage 4a/4b 早已支持 `--use_quality_rm_api`（`configs/stage4a_grpo_box.yaml`、`stage4b_grpo_point.yaml` 默认 `false`），代码具备，可按需开启；本次让 Stage 5 与之对齐。默认参数下不调用 LLM Quality RM。
+  - `README.md` / `README_zh.md`：在 Stage 4/5 章节补充开启 `use_quality_rm_api` 后的 LLM 调用量级与 token 估算表（默认配置、1 epoch/round、`QUALITY_RM_SAMPLE_RATIO=1.0`，每次调用约 1.5–1.8k token）：4a≈32,000 次 / ≈50M token，4b≈24,000 次 / ≈40M token，5≈85,000 次 / ≈140M token；并新增"为什么默认 `false`（速度）"说明——judge 调用为同步阻塞的 API 往返（`timeout` 30s、GPU 空等），乐观 ~1s/次也会带来约 9h/7h/24h 的纯等待，故三者默认 `false`（零调用）；4a/4b 可用 `QUALITY_RM_SAMPLE_RATIO` 缩放而 Stage 5 不受该变量影响。
+  - 验证：`python -m py_compile scripts/run_stage5_rft_unified.py` 通过；`python scripts/run_stage5_rft_unified.py --help` 正常；`pytest tests/test_quality_rm_api.py tests/test_filter_normal_level_data.py` 通过。
+
 - **全训练阶段自动断点续训 + 时间戳日志**
   - `src/training/stage_runner.py`：新增 `latest_checkpoint()` 方法，统一查找 `checkpoint-*` 目录中 step 最大的路径，供所有训练阶段复用。
   - `src/training/callbacks.py`：新增 `TimeLoggingCallback`，在每个 logging step 记录当前时间戳、step、loss/learning_rate/epoch 等指标和已运行时间；训练开始/结束时记录 Wall-clock 时间。
@@ -25,6 +115,38 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - 验证：通过 `timeout` 发送 SIGTERM/SIGINT 手动验证，日志中正确出现终止时间戳。
 
 ### Fixed
+
+- **修复 Stage 5 Unified RFT expert 生成阶段 `TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'`**
+  - 根因：`scripts/run_stage5_rft_unified.py` 的 `generate_with_expert()` 将 `max_new_tokens` 透传给 `expert_model.generate()`，但 `configs/stage5_rft_unified.yaml` 未配置该字段，且脚本中 `--max_new_tokens` 的 argparse 默认值为 `None`。当 `max_new_tokens=None` 且 `max_length=None` 同时传入时，transformers 的 `_prepare_generated_length()` 在 `has_default_max_length=True` 分支执行 `generation_config.max_length + input_ids_length`，而此时的 `max_length` 为 `None`，导致类型错误。
+  - `configs/stage5_rft_unified.yaml`：新增 `max_new_tokens: 512`，与 Stage 6 默认值保持一致，确保 expert rollout 有明确的生成长度上限。
+  - `scripts/run_stage5_rft_unified.py`：`--max_new_tokens` 默认值从 `None` 改为 `512`；`generate_with_expert()` 内增加 `max_new_tokens is None` 的显式校验，若未配置则给出清晰提示。保留 `max_length=None` 以显式禁止 transformers 回退到默认 `max_length`，让生成长度完全由 `max_new_tokens` 控制。
+  - 效果：Stage 5 的 expert 生成阶段不再因缺少 `max_new_tokens` 崩溃；即使未来自定义配置遗漏该字段，也会得到明确的配置错误提示而非 transformers 内部异常。
+  - 验证：`python -m py_compile scripts/run_stage5_rft_unified.py` 通过；`python scripts/run_stage5_rft_unified.py --num_box_prompts 2 --num_point_prompts 2 --regenerate_data` 成功完成 Box/Point Expert 生成与难度分级；`python -m pytest tests/test_config_utils.py tests/test_qwen_vl_loader.py -v` 通过。
+
+- **Stage 5 Unified RFT 默认跳过 expert 生成/筛选阶段**
+  - 根因：Stage 5 的 expert rollout 生成 + 难度分级（17,000 prompts × 5 rollouts）非常耗时（单卡可达数小时），而用户经常已经生成过筛选数据或只想直接训练 Unified 模型。
+  - `configs/stage5_rft_unified.yaml`：新增 `skip_expert_generation: true`，默认跳过 expert 生成与难度分级，直接进入 SFT 阶段。
+  - `scripts/run_stage5_rft_unified.py`：新增 `--skip_expert_generation` 和 `--train_data_path` 参数；当 `skip_expert_generation=true` 时优先直接加载已有训练数据（`--train_data_path` > `outputs/stage5_rft_unified/filtered_data_cache_<hash>.pkl`）；若都没有，则打印警告并跳过 SFT，**不会**自动 fallback 到耗时的 expert 生成流程。需要生成筛选数据时，显式设置 `skip_expert_generation: false` 或传 `--no-skip_expert_generation`。
+  - 保留了原完整 pipeline：需要运行时设置 `skip_expert_generation: false` 或传 `--no-skip_expert_generation`。
+  - 清理：已删除 `outputs/stage5_rft_unified/` 下的旧 `prompts_cache_*.pkl` 和 `filtered_data_cache_*.pkl` 缓存文件。
+  - 效果：默认启动 Stage 5 时不再进行耗时的 expert 生成/筛选，也不会因为缓存缺失而默默地开始长时间生成；用户明确需要生成数据时才开启完整 pipeline。
+  - 验证：`python -m py_compile scripts/run_stage5_rft_unified.py src/training/stage_runner.py` 通过；`python scripts/run_stage5_rft_unified.py --num_box_prompts 0 ... --skip_expert_generation` 在无缓存时正确打印警告并跳过 SFT；`python -m pytest tests/test_config_utils.py -v` 通过。
+  - 效果：默认启动 Stage 5 时不再进行耗时的 expert 生成/筛选，显著缩短启动到 SFT 的等待时间；同时仍保留 `--train_data_path` 灵活指定训练数据的能力。
+  - 验证：`python -m py_compile scripts/run_stage5_rft_unified.py src/training/stage_runner.py` 通过；`python scripts/run_stage5_rft_unified.py --help` 正确显示新参数；默认配置解析后 `skip_expert_generation=True`（通过 `apply_yaml_defaults` 机制）。
+
+- **修复 Stage 5/6 加载 GRPO Expert 时找不到模型文件的问题**
+  - 根因：`configs/stage5_rft_unified.yaml` 与 `configs/stage6_opd.yaml` 中的 `box_expert_path` / `point_expert_path` 指向 Stage 4a/4b 的输出根目录（如 `outputs/stage4a_grpo_box`），而 GRPO 实际将最终 adapter 保存在 `round_N/` 子目录下（如 `outputs/stage4a_grpo_box/round_1/adapter_model.safetensors`），导致 `load_qlora_model()` 报错 `OSError: no file named model.safetensors or pytorch_model.bin`。
+  - `src/models/qwen_vl_loader.py`：新增 `_resolve_grpo_expert_path()`，在 `load_qlora_model()` 与 `load_reference_model()` 中自动将 GRPO 阶段输出目录解析为最新的 `round_N` adapter 子目录；若路径本身已是 adapter/base model 则保持不变，兼容 Stage 1/3a/3b 等直接保存 adapter 的阶段。
+  - `tests/test_qwen_vl_loader.py`：新增 `_is_adapter_checkpoint()` 与 `_resolve_grpo_expert_path()` 的单元测试，覆盖 adapter 目录、GRPO 多轮目录、无 adapter 回退等场景。
+  - 效果：Stage 5 与 Stage 6 现在可直接使用现有配置运行，无需手动把 expert 路径改为 `round_N` 子目录；未来 Stage 4 配置为 `num_rounds > 1` 时也会自动选择最新一轮的 adapter。
+  - 验证：`python tests/test_qwen_vl_loader.py` 通过；`python -m pytest tests/test_qwen_vl_loader.py -v` 通过。
+
+- **修复 Stage 5 Unified RFT 同时加载两个 Expert 导致 OOM 的问题**
+  - 根因：Stage 5 原本同时把 Box Expert 与 Point Expert 都加载进显存，再继续生成 rollout。单张 24 GB 显卡上，Unified model 加上两个 4-bit QLoRA Expert 后，加载第二个 expert 的 adapter 权重时触发 `RuntimeError: CUDA driver error: device not ready`（典型显存耗尽症状）。
+  - `scripts/run_stage5_rft_unified.py`：改为按任务类型分阶段加载专家。先加载 Box Expert，为所有 `task_type == "box"` 的 prompt 生成 rollout 并做难度分级，然后卸载 Box Expert 并清空 CUDA cache；再加载 Point Expert，为 `point` / `maze` / `path` 等非 box 任务生成 rollout。任何时刻 GPU 中只保留一个 Expert，显著降低峰值显存。
+  - 保留缓存 key 不变，已生成的 prompts cache 仍然有效；filtered-data cache key 也不受影响，因为最终结果与同时加载两个 expert 等价（只是执行顺序改变）。
+  - 效果：单卡即可跑完 Stage 5 的 expert 生成阶段，无需手动减小 prompt 数量或 expert 大小。
+  - 验证：`python -m py_compile scripts/run_stage5_rft_unified.py` 通过；`_expert_for_task()` 行为已手动验证；`python -m pytest tests/test_qwen_vl_loader.py -v` 通过。
 
 - **Stage 4a/4b GRPO resume 后显存占用比从头训练高数 GB 的问题**
   - `src/training/grpo_runner.py`：发现 checkpoint 后不再通过 `load_qlora_model()` 预先加载 policy adapter，而是保持当前轮次起始点加载的 policy model，让 `Trainer.train(resume_from_checkpoint=...)` 统一加载 adapter 权重、optimizer 状态与 trainer 状态。避免同一个 adapter 被加载两次，显著降低 resume 时的 CUDA 显存占用与碎片。

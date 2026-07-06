@@ -29,6 +29,10 @@ def clear_memory():
     """Aggressively clear GPU memory."""
     gc.collect()
     if torch.cuda.is_available():
+        # Finish any pending kernels before releasing blocks, then wait again
+        # after empty_cache to avoid "CUDA driver error: device not ready" when
+        # a new model is loaded immediately afterwards.
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         torch.cuda.ipc_collect()

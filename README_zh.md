@@ -105,11 +105,11 @@ Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型 
 Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~13.4h ✅
 Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~16h    ✅ (含 resume)
 Stage 4a: Box Expert GRPO         Box 专家 GRPO (1 轮，无早停)            ~20.1h  ✅
-Stage 4b: Point Expert GRPO       Point 专家 GRPO (1 轮，无早停)          ~6h    (预计)
-Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~5h    (预计)
+Stage 4b: Point Expert GRPO       Point 专家 GRPO (1 轮，无早停)          ~36.4h ✅（实测，分 7 段 resume）
+Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~2.7h  ✅（fast mode：400 prompts × 2 rollouts，81 条 Normal+Easy 样本，loss 2.236）
 Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
                                 ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~78h
+                                Total（已实测部分）:                         ~96.0h
 ```
 
 **核心设计**：
@@ -279,6 +279,8 @@ python scripts/run_stage4a_grpo_box.py \
 
 ### Stage 4b: Point Expert GRPO（默认 1 轮，无早停）
 
+> **训练结果**：4,000 步（1 epoch，4K 样本），**实际 GPU 运行 ~36.4h**，墙钟跨度 **~95.5h**（2026-06-30 18:04 → 2026-07-04 17:31），分 7 段 resume 完成：(1) 06-30 18:04 → 20:54 ~2h 50m（checkpoint-600），(2) 23:26 → 07-01 00:18 ~52m（checkpoint-800），(3) 07-01 11:55 → 14:38 ~2h 43m（checkpoint-1400），(4) 16:45 → 21:08 ~4h 24m，(5) 07-02 12:17 → 20:34 ~8h 17m（checkpoint-2400），(6) 07-03 16:44 → 07-04 00:41 ~7h 57m（checkpoint-4400），(7) 08:10 → 17:31 ~9h 21m（最终 checkpoint-6000）。输出：`outputs/stage4b_grpo_point/`。
+>
 > **注**：与 Stage 4a 相同，默认配置为单轮 `num_epochs=1`、关闭 tiny-subset 早停。多轮循环仍被支持；已完成轮次自动跳过，中断的轮次会从最新的 `round_N/checkpoint-*` 自动续训。
 >
 > **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
@@ -294,7 +296,11 @@ python scripts/run_stage4b_grpo_point.py \
 
 ### Stage 5: Unified RFT（专家生成 rollout）
 
-> **数据缓存**：prompt 池和专家生成的过滤后训练数据均缓存到 `outputs/stage5_rft_unified/`。resume 或重新运行时直接加载，跳过专家模型加载和推理生成。缓存 key 包含专家模型路径，更换专家自动触发重新生成。可加 `--regenerate_data` 强制重建。
+> **Fast mode（默认）**：`configs/stage5_rft_unified.yaml` 现在默认使用较小的 prompt 预算（`num_box_prompts: 100`、`num_counting_prompts: 50`、`num_clevr_prompts: 50`、`num_point_prompts: 100`、`num_maze_prompts: 50`、`num_path_prompts: 50`）和 `num_rollouts: 2`。这样既保留了论文的完整流程（专家 → rejection sampling → 难度分级 → Normal + 5% Easy → SFT），又能把数据筛选时间从数小时缩短到数分钟。`min_normal_samples` 设为 `10`，即使大部分 rollout 是 Easy/Hard，也能继续进入 SFT。如需更高质量的 Stage 5 模型，可增大这些数值。
+>
+> **跳过专家生成**：在配置中设置 `skip_expert_generation: true` 或命令行传 `--skip_expert_generation`，可跳过耗时的 expert rollout 生成与难度分级，直接进入 SFT 训练。适用于已经生成或准备好过滤数据、只想训练 Unified 模型的场景。跳过时脚本优先使用 `--train_data_path`，其次回退到 `outputs/stage5_rft_unified/filtered_data_cache_<hash>.pkl`；若都不存在，则打印警告并跳过 SFT，不会自动启动耗时的生成流程。
+>
+> **专家路径自动解析**：`configs/stage5_rft_unified.yaml` 中的 `box_expert_path` / `point_expert_path` 指向 Stage 4a/4b 的输出目录。`load_qlora_model()` 会自动将其解析为最新的 `round_N/adapter_model.safetensors` checkpoint，因此即使 Stage 4 配置为 `num_rounds > 1` 也无需修改 Stage 5 配置。
 >
 > **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage5_rft_unified/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复 SFT 阶段。
 >
@@ -309,6 +315,8 @@ python scripts/run_stage5_rft_unified.py \
 ### Stage 6: OPD（On-Policy Distillation）
 
 > **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage6_opd/checkpoint-*` 存在，脚本会自动从最新 checkpoint 恢复并行蒸馏（恢复 optimizer/scheduler/epoch/step 状态）。
+>
+> **专家路径自动解析**：`configs/stage6_opd.yaml` 中的 `box_expert_path` / `point_expert_path` 指向 Stage 4a/4b 的输出目录。`load_qlora_model()` 会自动将其解析为最新的 `round_N/adapter_model.safetensors` checkpoint，因此即使 Stage 4 配置为 `num_rounds > 1` 也无需修改 Stage 6 配置。
 >
 > **带时间戳的训练日志**：OPD 的每步日志已通过 stage logger 自动带上墙钟时间戳，便于分多次跑时跟踪进度。
 
@@ -489,7 +497,7 @@ for name, path in stages.items():
 
 > **提示**：
 > - 12GB 显卡建议在运行前设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 减少显存碎片。
-> - OPD 阶段需同时加载 3 个模型（student + 2 experts），教师模型自动使用 4-bit 量化，峰值显存约为单模型 SFT 的 1.8 倍。
+> - OPD 阶段 student 常驻显存，每次只加载一个 expert；教师模型使用 4-bit 量化并在 phase 结束后立即释放，峰值显存约为单模型 SFT 的 1.3–1.5 倍。
 > - GRPO 阶段显存占用与 `num_generations` 正相关，12GB 下建议 `num_generations=3`，24GB 下可用 `num_generations=5`。
 > - **Windows 共享 GPU 内存**：如果任务管理器显示“共享 GPU 内存”一直被占用，而专用+共享的总量远未达到上限，这通常是 WDDM 的分配问题，不是显存不够。Stage 脚本已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 以缓解显存碎片。若仍持续出现，可尝试关闭 Windows 的“硬件加速 GPU 调度（HAGS）”，并确保没有其他程序占用显存。
 
@@ -771,17 +779,29 @@ pytest tests/ -v
   4. **MLLM 生成 thinking**: 在有标注的数据（GQA、COCO panoptic、SA-1B）上，用本地小 MLLM 或 API 合成"意图分析→Grounding→总结"三段式 thinking，替代手工模板。
 
 ### Stage 4 — 专项 RL
-- **当前**: 规则化 Quality RM + 已改为按"正确 rollout 数量"分难度（与论文 Sec 2.5.2 对齐）。**✅ Path Tracing 已实现论文 4 组件 Accuracy RM**（forward/reverse/endpoint/continuity + answer correctness）。**✅ 复杂 CLEVR 问题（multihop/compare/spatial_existence/spatial_count）已接入 LLM API judge** 替代简单答案匹配。
+- **当前**: 规则化 Quality RM + 已改为按"正确 rollout 数量"分难度（与论文 Sec 2.5.2 对齐）。**✅ Path Tracing 已实现论文 4 组件 Accuracy RM**（forward/reverse/endpoint/continuity + answer correctness）。**✅ 复杂 CLEVR 问题（multihop/compare/spatial_existence/spatial_count）已接入 LLM API judge** 替代简单答案匹配。**LLM-based GRM Quality RM 也已实现**（`src/utils/quality_rm_api.py`），可通过 `--use_quality_rm_api` 开启——**默认关闭**（`configs/stage4a_grpo_box.yaml` / `stage4b_grpo_point.yaml` 中 `use_quality_rm_api: false`），启用需在 `.env` 配置 `OPENAI_API_KEY`。
 - **论文**: LLM-based Generative Reward Model 做 Quality RM。
 - **可行优化**:
   1. 用本地小模型（如 Qwen2.5-3B-Instruct 或蒸馏后的 critic）替代规则 QM，或在边界样本上调用 API。
   2. 规则 QM 作为快速预筛，LLM judge 负责难分样本的二次打分。
 
+> **开启 `use_quality_rm_api` 后的 LLM 调用量** —— Stage 4a、4b、5 均默认 `use_quality_rm_api: false`，即**默认零 LLM Quality-RM 调用**。若开启，默认配置下（1 epoch / 1 round，`QUALITY_RM_SAMPLE_RATIO=1.0`）的量级估算：
+>
+> | 阶段 | 计算单元 | LLM 调用 ≈ | Token ≈ |
+> |---|---|---|---|
+> | 4a — box GRPO | 4,000 prompt × 8 generation | **约 32,000** | **约 50M** |
+> | 4b — point GRPO | 4,000 prompt × 6 generation | **约 24,000** | **约 40M** |
+> | 5 — unified RFT | 17,000 prompt × 5 rollout | **约 85,000** | **约 140M** |
+>
+> Token 估算按每次调用 ~700–800 input token（固定评分表 + ground truth + 模型输出，其中模型输出受 `max_completion_length` 384/512 限制）+ 最多 1,024 output token（`max_tokens`：CoT 说明 + 分数）≈ **1.5–1.8k token/次**。4a/4b 的量随 `QUALITY_RM_SAMPLE_RATIO` 缩放（如 `0.25` → 约 1/4 调用/token）；Stage 5 对每个 rollout 直接打分，该变量对其**不生效**。此外，与该开关无关，只要设置了 `OPENAI_API_KEY`，Stage 4a 还会把约 303 条复杂 CLEVR 样本（× 8 generation，≈ 额外 0.4M token）送入 spatial-VQA LLM judge。
+>
+> **为什么默认 `false`（速度）：** 每次 judge 调用都是 GRPO / rollout 奖励循环里一个**同步阻塞**的 `chat.completions.create`（默认 `timeout` 30s、最多 2 次重试），等待返回期间 GPU 基本空转。规则版 `quality_reward_text` 是本地字符串/正则计算（微秒级、无网络）。即使乐观地按每次 API ~1s 计，上表的调用量也会带来约 **~9 小时（4a）/ ~7 小时（4b）/ ~24 小时（5）** 的纯墙钟等待。追求速度、让 GPU 不空等就保持 `false`；只有需要贴论文的抗 reward-hacking 时再开启（4a/4b 可配合较小的 `QUALITY_RM_SAMPLE_RATIO`）。注意 Stage 4a 的 spatial-VQA judge 与该开关无关，只要设了 `OPENAI_API_KEY` 就仍会同步阻塞。
+
 ### Stage 5 — RFT
-- **当前**: Expert rollout → 难度分级 → Normal + 5% Easy → SFT。**✅ Prompt pool 已扩展包含 path tracing 数据**。
+- **当前**: Expert rollout → 难度分级 → Normal + 5% Easy → SFT。**✅ Prompt pool 已扩展包含 path tracing 数据**。**✅ Quality RM 已接入 best-rollout 选择**（难度分级时；默认规则版，可用 `--use_quality_rm_api` 切换 LLM GRM，`configs/stage5_rft_unified.yaml` 中 `use_quality_rm_api: false` 默认关闭）。
 
 ### Stage 6 — OPD
-- **当前**: **✅ 双专家梯度累积并行蒸馏**（`train_opd_parallel()`），每 epoch 内 Box 专家处理 box 数据累积梯度 → 切换到 Point 专家处理 point/maze 数据 → 一次 optimizer.step()，梯度方向为两个专家信号的合成。蒸馏温度从 1.0 上调到 1.2。仅单专家驻留显存。
+- **当前**: **✅ 双专家梯度累积并行蒸馏**（`train_opd_parallel()`），每 epoch 内 Box 专家处理 box 数据累积梯度 → 切换到 Point 专家处理 point/maze/path 数据 → 一次 optimizer.step()，梯度方向为两个专家信号的合成。蒸馏温度从 1.0 上调到 1.2。仅单专家驻留显存。
 
 ### 可观测性
 - **当前**: **✅ TensorBoard 原语指标回调** 已实现，每 N 步记录 format compliance rate、坐标有效率、ref 使用率、平均 reward 等指标。所有 stage config YAML 已将 `report_to` 设置为 `tensorboard`。启动 TensorBoard: `tensorboard --logdir outputs/stageX_xxx/tb_primitive_logs`

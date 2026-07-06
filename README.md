@@ -105,11 +105,11 @@ Stage 2:  Merge LoRA               Merge visual pretrain LoRA into base      ~24
 Stage 3a: Box Expert SFT           Box-specific SFT with format-token weighting ~13.4h ✅
 Stage 3b: Point Expert SFT         Point+Maze SFT                             ~16h    ✅ (including resume)
 Stage 4a: Box Expert GRPO          Box expert GRPO (1 round, no early stop)   ~20.1h  ✅
-Stage 4b: Point Expert GRPO        Point expert GRPO (1 round, no early stop) ~6h    (est.)
-Stage 5:  Unified RFT              Expert-generated rollouts → Unified learning ~5h  (est.)
+Stage 4b: Point Expert GRPO        Point expert GRPO (1 round, no early stop) ~36.4h ✅ (actual, 7 resume sessions)
+Stage 5:  Unified RFT              Expert-generated rollouts → Unified learning ~2.7h  ✅ (fast mode: 400 prompts × 2 rollouts, 81 Normal+Easy samples, loss 2.236)
 Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
                                 ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~78h
+                                Total（已实测部分）:                         ~96.0h
 ```
 
 **Core Design**:
@@ -270,6 +270,8 @@ python scripts/run_stage4a_grpo_box.py \
 
 ### Stage 4b: Point Expert GRPO (1 round, no early stopping)
 
+> **Results**: 4,000 steps (1 epoch, 4K samples), **~36.4h actual GPU time** across 7 resume sessions, wall-clock span **~95.5h** (2026-06-30 18:04 → 2026-07-04 17:31): (1) 06-30 18:04 → 20:54 ~2h 50m (checkpoint-600), (2) 23:26 → 07-01 00:18 ~52m (checkpoint-800), (3) 07-01 11:55 → 14:38 ~2h 43m (checkpoint-1400), (4) 16:45 → 21:08 ~4h 24m, (5) 07-02 12:17 → 20:34 ~8h 17m (checkpoint-2400), (6) 07-03 16:44 → 07-04 00:41 ~7h 57m (checkpoint-4400), (7) 08:10 → 17:31 ~9h 21m (final checkpoint-6000). Output: `outputs/stage4b_grpo_point/`.
+>
 > **Note**: Like Stage 4a, the default config uses a single round with `num_epochs=1` and disabled tiny-subset early stopping. The multi-round loop is still supported; completed rounds are skipped on restart and interrupted rounds auto-resume from the latest `round_N/checkpoint-*`.
 >
 > **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
@@ -287,6 +289,12 @@ python scripts/run_stage4b_grpo_point.py \
 
 > **Data cache**: Both the prompt pool and expert-generated filtered training data are cached to `outputs/stage5_rft_unified/`. On resume or re-run, prompts and filtered data are loaded directly from cache, skipping expert model loading and generation. Cache keys include expert model paths, so changing experts automatically triggers regeneration. Use `--regenerate_data` to force rebuilding.
 >
+> **Fast mode (default)**: `configs/stage5_rft_unified.yaml` now ships with a small prompt budget (`num_box_prompts: 100`, `num_counting_prompts: 50`, `num_clevr_prompts: 50`, `num_point_prompts: 100`, `num_maze_prompts: 50`, `num_path_prompts: 50`) and `num_rollouts: 2`. This keeps the paper's full pipeline (experts → rejection sampling → difficulty grading → Normal + 5% Easy → SFT) but finishes data selection in minutes rather than hours. `min_normal_samples` is set to `10` so the pipeline proceeds to SFT even when most rollouts are Easy/Hard. Increase these values for a higher-quality Stage 5 model.
+>
+> **Skip expert generation**: Set `skip_expert_generation: true` in the config or pass `--skip_expert_generation` to bypass the expert rollout generation / difficulty grading step and go straight to SFT training. This is useful when you have already generated or prepared the filtered training data and only want to train the Unified model. When skipping, the script first tries `--train_data_path`, then falls back to `outputs/stage5_rft_unified/filtered_data_cache_<hash>.pkl`; if neither exists, it prints a warning and skips SFT instead of automatically starting a long generation run.
+>
+> **Expert path resolution**: `configs/stage5_rft_unified.yaml` points `box_expert_path` / `point_expert_path` at the Stage 4a/4b output directories. `load_qlora_model()` automatically resolves these to the latest `round_N/adapter_model.safetensors` checkpoint, so you do not need to edit the config when Stage 4 runs with `num_rounds > 1`.
+>
 > **Auto-resume**: If `--resume_from_checkpoint` is omitted and `outputs/stage5_rft_unified/checkpoint-*` exists, the script automatically resumes the SFT phase from the latest checkpoint.
 >
 > **Timestamped training logs**: A `TimeLoggingCallback` records the wall-clock timestamp, step, loss/learning_rate/epoch, and elapsed time at every logging step.
@@ -300,6 +308,8 @@ python scripts/run_stage5_rft_unified.py \
 ### Stage 6: OPD (On-Policy Distillation)
 
 > **Auto-resume**: If `--resume_from_checkpoint` is omitted and `outputs/stage6_opd/checkpoint-*` exists, the script automatically resumes the parallel distillation from the latest checkpoint (optimizer/scheduler/epoch/step state restored).
+>
+> **Expert path resolution**: `configs/stage6_opd.yaml` points `box_expert_path` / `point_expert_path` at the Stage 4a/4b output directories. `load_qlora_model()` automatically resolves these to the latest `round_N/adapter_model.safetensors` checkpoint, so you do not need to edit the config when Stage 4 runs with `num_rounds > 1`.
 >
 > **Timestamped training logs**: Per-step OPD logs already carry wall-clock timestamps from the stage logger, so you can track progress across multiple sessions.
 
@@ -480,7 +490,7 @@ Recommended configurations for different GPU VRAM sizes:
 
 > **Tips**:
 > - 12GB GPUs: set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce VRAM fragmentation.
-> - OPD stage loads 3 models simultaneously (student + 2 experts); teacher models auto-use 4-bit quantization; peak VRAM is ~1.8x single-model SFT.
+> - OPD stage keeps the student in GPU and loads only one expert at a time; teachers use 4-bit quantization and are released immediately after their phase, so peak VRAM is ~1.3–1.5x single-model SFT.
 > - GRPO stage VRAM scales with `num_generations`; 12GB: recommend `num_generations=3`, 24GB: can use `num_generations=5`.
 > - **Windows shared GPU memory**: If Task Manager shows shared GPU memory being used even though total GPU memory is far from the limit, this is usually a WDDM allocation issue, not a capacity issue. Stage scripts already set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation. For persistent issues, disable Windows Hardware-Accelerated GPU Scheduling (HAGS) and ensure no other apps are reserving VRAM.
 
@@ -762,17 +772,29 @@ This reproduction prioritizes the **core idea** (visual primitives as reasoning 
   4. **MLLM-generated thinking**: Wherever you have annotations (GQA, COCO panoptic, SA-1B), use a cheap local MLLM or API to synthesize "Intent Analysis → Grounding → Summarization" chains rather than hand-crafting templates.
 
 ### Stage 4 — Specialized RL
-- **Current**: Rule-based Quality RM and binary-correctness difficulty grading (now aligned with the paper's "correct rollout count" criterion). **✅ Path Tracing now uses the full paper 4-component Accuracy RM** (forward/reverse/endpoint/continuity + answer correctness). **✅ Complex CLEVR questions (multihop/compare/spatial_existence/spatial_count) use LLM API judge** instead of simple answer matching.
+- **Current**: Rule-based Quality RM and binary-correctness difficulty grading (now aligned with the paper's "correct rollout count" criterion). **✅ Path Tracing now uses the full paper 4-component Accuracy RM** (forward/reverse/endpoint/continuity + answer correctness). **✅ Complex CLEVR questions (multihop/compare/spatial_existence/spatial_count) use LLM API judge** instead of simple answer matching. The **LLM-based GRM Quality RM is also already implemented** (`src/utils/quality_rm_api.py`) and can be turned on via `--use_quality_rm_api` — it is left **off by default** (`use_quality_rm_api: false` in `configs/stage4a_grpo_box.yaml` / `stage4b_grpo_point.yaml`) and requires an `OPENAI_API_KEY` in `.env`.
 - **Paper**: LLM-based Generative Reward Model (GRM) for Quality RM.
 - **Practical next steps**:
   1. Replace `quality_reward_text` with a small local LLM judge (e.g., Qwen2.5-3B-Instruct or a distilled critic) called via a lightweight API, or call it only on a subset of rollouts to control cost.
   2. Use the rule-based QM as a fast filter and the LLM judge for tie-breaking / borderline cases.
 
+> **LLM-call volume when `use_quality_rm_api` is enabled** — Stages 4a, 4b, and 5 all ship with `use_quality_rm_api: false`, i.e. **zero LLM Quality-RM calls by default**. If you turn it on, rough order-of-magnitude counts under the default configs (1 epoch / 1 round, `QUALITY_RM_SAMPLE_RATIO=1.0`):
+>
+> | Stage | Judged units | LLM calls ≈ | Tokens ≈ |
+> |---|---|---|---|
+> | 4a — box GRPO | 4,000 prompts × 8 generations | **~32,000** | **~50M** |
+> | 4b — point GRPO | 4,000 prompts × 6 generations | **~24,000** | **~40M** |
+> | 5 — unified RFT | 17,000 prompts × 5 rollouts | **~85,000** | **~140M** |
+>
+> Token figures assume ~700–800 input tokens per call (fixed rubric + ground truth + model completion, the completion capped by `max_completion_length` 384/512) plus up to 1,024 output tokens (`max_tokens`: CoT rationale + score) ≈ **1.5–1.8k tokens/call**. For 4a/4b the volume scales with `QUALITY_RM_SAMPLE_RATIO` (e.g. `0.25` → ~¼ the calls/tokens); Stage 5 scores every rollout directly, so that env var does **not** apply there. Independently of this flag, Stage 4a also sends ~303 complex-CLEVR samples (× 8 generations, ≈ 0.4M extra tokens) to the spatial-VQA LLM judge whenever `OPENAI_API_KEY` is set.
+>
+> **Why it defaults to `false` (speed):** each judge call is a **synchronous, blocking** `chat.completions.create` request (default `timeout` 30 s, up to 2 retries) sitting inside the GRPO / rollout reward loop, so the GPU idles while waiting for the reply. The rule-based `quality_reward_text` is a local string/regex check (microseconds — no network). Even at an optimistic ~1 s per API call, the call volumes above translate to roughly **~9 h (4a) / ~7 h (4b) / ~24 h (5)** of pure wall-clock waiting. Keep it `false` for fast, GPU-bound runs; enable it (optionally with a small `QUALITY_RM_SAMPLE_RATIO` for 4a/4b) only when you want the paper-faithful reward-hacking protection. Stage 4a's spatial-VQA judge is independent of this flag and still blocks whenever `OPENAI_API_KEY` is set.
+
 ### Stage 5 — RFT
-- **Current**: Expert rollout → difficulty grading → Normal + 5% Easy → SFT. **✅ Prompt pool now includes path tracing data.**
+- **Current**: Expert rollout → difficulty grading → Normal + 5% Easy → SFT. **✅ Prompt pool now includes path tracing data.** **✅ Quality RM now folded into best-rollout selection** during difficulty grading (rule-based by default; enable the LLM GRM with `--use_quality_rm_api`, `use_quality_rm_api: false` by default in `configs/stage5_rft_unified.yaml`).
 
 ### Stage 6 — OPD
-- **Current**: **✅ Gradient-accumulation parallel distillation** (`train_opd_parallel()`). Within each epoch: Box Expert processes box data → accumulates gradients → swaps to Point Expert for point/maze data → single `optimizer.step()`. Gradient direction is the sum of both expert signals. Only one expert in GPU at a time. Distillation temperature raised from 1.0 → 1.2.
+- **Current**: **✅ Gradient-accumulation parallel distillation** (`train_opd_parallel()`). Within each epoch: Box Expert processes box data → accumulates gradients → swaps to Point Expert for point/maze/path data → single `optimizer.step()`. Gradient direction is the sum of both expert signals. Only one expert in GPU at a time. Distillation temperature raised from 1.0 → 1.2.
 
 ### Observability
 - **Current**: **✅ TensorBoard primitive metrics callback** implemented. Every N steps logs format compliance rate, coordinate validity, ref usage rate, and average rewards. All stage config YAMLs set `report_to: tensorboard`. Launch: `tensorboard --logdir outputs/stageX_xxx/tb_primitive_logs`

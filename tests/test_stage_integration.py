@@ -204,7 +204,7 @@ class TestStage4bGRPOPoint:
         maze = generate_maze_dataset(n=6, seed=42)
         path = generate_path_tracing_dataset(n=4, seed=42)
         total = maze + path
-        _verify_sample_dicts(total, 8, {"maze", "point"})
+        _verify_sample_dicts(total, 8, {"maze", "point", "path"})
 
 
 # ── Stage 5: Unified RFT ────────────────────────────────────────────────────
@@ -235,7 +235,7 @@ class TestStage5RFTUnified:
         total = box + counting + clevr + point + maze + path
         assert len(total) >= 10, f"Total samples: {len(total)}"
         task_types = {d["task_type"] for d in total}
-        assert task_types.issubset({"box", "point", "maze"}), f"Unexpected: {task_types}"
+        assert task_types.issubset({"box", "point", "maze", "path"}), f"Unexpected: {task_types}"
 
 
 # ── Stage 6: On-Policy Distillation ─────────────────────────────────────────
@@ -250,4 +250,4 @@ class TestStage6OPD:
         maze = generate_maze_dataset(n=3, seed=42)
         path = generate_path_tracing_dataset(n=3, seed=42)
         total = maze + path
-        _verify_sample_dicts(total, 5, {"maze", "point"})
+        _verify_sample_dicts(total, 5, {"maze", "point", "path"})

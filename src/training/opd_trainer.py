@@ -19,6 +19,7 @@ Key design (per paper):
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -28,8 +29,40 @@ from transformers import AutoProcessor
 from tqdm import tqdm
 
 from ..data.datasets.image_loader import load_image
+from ..models.qwen_vl_loader import (
+    _get_use_cache_states,
+    _set_use_cache_deep,
+    _set_use_cache_states,
+    load_qlora_model,
+)
 from ..utils.constants import DEFAULT_DISTILL_TEMPERATURE
 from ..utils.conversation_builder import ConversationBuilder
+from .memory_utils import clear_memory, get_gpu_memory_gb, get_gpu_memory_reserved_gb
+
+
+@contextmanager
+def _no_gradient_checkpointing(model: torch.nn.Module):
+    """Temporarily disable gradient checkpointing and enable KV-cache for generation.
+
+    Qwen3-VL's generation is memory-hungry with long multimodal sequences. When
+    gradient checkpointing is active, ``transformers`` forces ``use_cache=False``
+    (and prints a warning), causing every autoregressive step to recompute
+    attention over the full prefix. This context manager disables gradient
+    checkpointing and temporarily sets ``use_cache=True`` on all nested config
+    objects during ``model.generate()``, then restores both states so the
+    subsequent training forward still benefits from checkpointing.
+    """
+    was_enabled = getattr(model, "is_gradient_checkpointing", False)
+    old_use_cache = _get_use_cache_states(model)
+    if was_enabled:
+        model.gradient_checkpointing_disable()
+    _set_use_cache_deep(model, True)
+    try:
+        yield
+    finally:
+        if was_enabled:
+            model.gradient_checkpointing_enable()
+        _set_use_cache_states(model, old_use_cache)
 
 
 class OPDDataset(Dataset):
@@ -393,8 +426,8 @@ def train_opd(
 
 def train_opd_parallel(
     student_model,
-    box_expert,
-    point_expert,
+    box_expert_path: str,
+    point_expert_path: str,
     processor: AutoProcessor,
     box_data: List[Dict[str, Any]],
     point_data: List[Dict[str, Any]],
@@ -417,16 +450,11 @@ def train_opd_parallel(
       1. Process box batches with box expert → backward (accumulate, no step)
       2. Swap to point expert → process point batches → backward (accumulate)
       3. optimizer.step() — gradient is the sum of both expert signals
-    Only one expert is in GPU memory at a time, keeping VRAM constant.
+    Experts are loaded on demand and released immediately after use so that only
+    one teacher (plus the student) resides in GPU memory at any time.
     """
     if logger is None:
         logger = logging.getLogger(__name__)
-
-    # Freeze both experts
-    for expert in (box_expert, point_expert):
-        for param in expert.parameters():
-            param.requires_grad = False
-        expert.eval()
 
     student_model.train()
 
@@ -474,8 +502,23 @@ def train_opd_parallel(
         batch_count = 0
 
         # Phase 1: Box expert on box data (accumulate gradients, no step)
-        logger.info(f"Epoch {epoch+1}: Box expert phase...")
+        logger.info(f"Epoch {epoch+1}: Loading Box Expert from {box_expert_path}...")
+        box_expert, _ = load_qlora_model(model_name=box_expert_path)
+        for param in box_expert.parameters():
+            param.requires_grad = False
+        box_expert.eval()
+        # Experts are frozen teachers; gradient checkpointing is unnecessary and
+        # produces checkpoint warnings when called under no_grad.
+        if getattr(box_expert, "is_gradient_checkpointing", False):
+            box_expert.gradient_checkpointing_disable()
         box_expert.to(student_model.device)
+        allocated = get_gpu_memory_gb()
+        reserved = get_gpu_memory_reserved_gb()
+        logger.info(
+            f"Epoch {epoch+1} Box expert loaded: "
+            f"GPU allocated={allocated:.2f}GB, reserved={reserved:.2f}GB"
+        )
+        logger.info(f"Epoch {epoch+1}: Box expert phase...")
         pbar = tqdm(box_loader, desc=f"OPD Box E{epoch+1}", unit="batch")
         for step, batch in enumerate(pbar):
             # Skip already-processed steps when resuming within an epoch
@@ -497,12 +540,31 @@ def train_opd_parallel(
                 scheduler.step()
             pbar.set_postfix({"kl": f"{kl_val:.4f}", "phase": "box"})
 
-        # Release box expert, load point expert
-        box_expert.cpu()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        point_expert.to(student_model.device)
+        # Release box expert before loading point expert
+        del box_expert
+        clear_memory()
+        allocated = get_gpu_memory_gb()
+        reserved = get_gpu_memory_reserved_gb()
+        logger.info(
+            f"Epoch {epoch+1} Box expert released: "
+            f"GPU allocated={allocated:.2f}GB, reserved={reserved:.2f}GB"
+        )
 
         # Phase 2: Point expert on point data (accumulate, then step)
+        logger.info(f"Epoch {epoch+1}: Loading Point Expert from {point_expert_path}...")
+        point_expert, _ = load_qlora_model(model_name=point_expert_path)
+        for param in point_expert.parameters():
+            param.requires_grad = False
+        point_expert.eval()
+        if getattr(point_expert, "is_gradient_checkpointing", False):
+            point_expert.gradient_checkpointing_disable()
+        point_expert.to(student_model.device)
+        allocated = get_gpu_memory_gb()
+        reserved = get_gpu_memory_reserved_gb()
+        logger.info(
+            f"Epoch {epoch+1} Point expert loaded: "
+            f"GPU allocated={allocated:.2f}GB, reserved={reserved:.2f}GB"
+        )
         logger.info(f"Epoch {epoch+1}: Point expert phase...")
         pbar = tqdm(point_loader, desc=f"OPD Point E{epoch+1}", unit="batch")
         for step, batch in enumerate(pbar):
@@ -543,9 +605,15 @@ def train_opd_parallel(
                     output_dir, logger,
                 )
 
-        # Release point expert for next epoch
-        point_expert.cpu()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        # Release point expert before next epoch
+        del point_expert
+        clear_memory()
+        allocated = get_gpu_memory_gb()
+        reserved = get_gpu_memory_reserved_gb()
+        logger.info(
+            f"Epoch {epoch+1} Point expert released: "
+            f"GPU allocated={allocated:.2f}GB, reserved={reserved:.2f}GB"
+        )
 
         avg_kl = epoch_kl / max(batch_count, 1)
         logger.info(
@@ -573,21 +641,40 @@ def _opd_single_batch(
 
     Returns the KL loss value.
     """
-    prompt_inputs = {
-        k: v[0].to(student_model.device)
-        for k, v in batch.items()
-        if k not in ("task_type", "prompt_text")
-    }
+    # Convert batch tensors to the student device. For image_grid_thw we keep
+    # the collated [num_images, 3] shape; using v[0] would collapse it to [3]
+    # and break Qwen3-VL's vision bilinear sampling (it expects rows of [t,h,w]).
+    prompt_inputs = {}
+    for k, v in batch.items():
+        if k in ("task_type", "prompt_text"):
+            continue
+        if k == "image_grid_thw":
+            prompt_inputs[k] = v.to(student_model.device)
+        else:
+            prompt_inputs[k] = v[0].to(student_model.device)
+
+    # Add batch dimension to sequence tensors so generate()/forward() receive
+    # 2D inputs as expected by Qwen3-VL (input_ids and attention_mask must both
+    # be [1, seq_len] to avoid IndexError in M-RoPE position-ids computation).
+    prompt_inputs["input_ids"] = prompt_inputs["input_ids"].unsqueeze(0)
+    if "attention_mask" in prompt_inputs:
+        prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"].unsqueeze(0)
+    if "mm_token_type_ids" in prompt_inputs:
+        prompt_inputs["mm_token_type_ids"] = prompt_inputs["mm_token_type_ids"].unsqueeze(0)
+
     prompt_ids = prompt_inputs["input_ids"]
+    # Qwen3-VL needs mm_token_type_ids alongside image_grid_thw to compute M-RoPE.
     image_kwargs = {
         k: v for k, v in prompt_inputs.items()
-        if k in ("pixel_values", "image_grid_thw")
+        if k in ("pixel_values", "image_grid_thw", "mm_token_type_ids")
     }
 
     # 1. Student generates (on-policy)
-    with torch.no_grad():
+    # Generation is under no_grad and does not benefit from gradient
+    # checkpointing; temporarily disable it to avoid use_cache/checkpoint warnings.
+    with torch.no_grad(), _no_gradient_checkpointing(student_model):
         generated = student_model.generate(
-            input_ids=prompt_ids.unsqueeze(0),
+            input_ids=prompt_ids,
             max_new_tokens=max_new_tokens,
             temperature=max(temperature, 0.1),
             do_sample=True,
@@ -598,9 +685,27 @@ def _opd_single_batch(
     full_ids = generated[0]
 
     # 2. Forward student
+    # The full sequence (prompt + generated response) is longer than the prompt,
+    # but image kwargs from the processor describe the prompt only. Extend
+    # mm_token_type_ids with zeros for generated tokens so M-RoPE can compute
+    # position_ids for the full length.
+    full_len = full_ids.shape[0]
+    prompt_len = prompt_ids.shape[1]
+    if "mm_token_type_ids" in image_kwargs and full_len > prompt_len:
+        mm = image_kwargs["mm_token_type_ids"]
+        generated_only_len = full_len - prompt_len
+        mm_padding = torch.zeros(
+            1, generated_only_len, dtype=mm.dtype, device=mm.device,
+        )
+        image_kwargs = {
+            **image_kwargs,
+            "mm_token_type_ids": torch.cat([mm, mm_padding], dim=1),
+        }
+
+    # 2. Forward student on full sequence (no internal loss; we compute KL below)
     student_outputs = student_model(
         input_ids=full_ids.unsqueeze(0),
-        labels=full_ids.unsqueeze(0),
+        use_cache=False,
         **image_kwargs,
     )
     student_logits = student_outputs.logits[:, :-1, :]
@@ -609,11 +714,17 @@ def _opd_single_batch(
     with torch.no_grad():
         expert_outputs = expert(
             input_ids=full_ids.unsqueeze(0),
+            use_cache=False,
             **image_kwargs,
         )
         expert_logits = expert_outputs.logits[:, :-1, :]
 
-    # Align lengths
+    # Restore image_kwargs to prompt-length for the next batch
+    if "mm_token_type_ids" in image_kwargs and full_len > prompt_len:
+        image_kwargs = {
+            **image_kwargs,
+            "mm_token_type_ids": mm,
+        }
     min_len = min(student_logits.shape[1], expert_logits.shape[1])
     student_logits = student_logits[:, :min_len, :]
     expert_logits = expert_logits[:, :min_len, :]
@@ -633,5 +744,10 @@ def _opd_single_batch(
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.3)
         optimizer.step()
         optimizer.zero_grad()
+
+    # Variable-length sequences can leave large reserved blocks behind;
+    # release them after each batch to keep fragmentation in check.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return kl_loss.item()

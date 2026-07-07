@@ -1,342 +1,49 @@
 **[English](README.md)** | 中文
 
-# Thinking with Visual Primitives — Qwen3-VL-4B Reproduction
+# Thinking with Visual Primitives — Qwen3-VL-4B 复现
 
-> **单卡 RTX 5090D (24GB) 复现 DeepSeek「Thinking with Visual Primitives」核心思想。**
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![ModelScope](https://img.shields.io/badge/ModelScope-Collection-cyan)](https://modelscope.cn/collections/EdmundYY/Thinking-with-Visual-Primitives-Qwen3-VL-4B)
 
----
+> 在单张 **RTX 5090D (24GB)** 上复现 DeepSeek **「Thinking with Visual Primitives」** 的核心思想，基座模型为 **Qwen3-VL-4B-Thinking**。
 
-## 📄 论文背景
-
-**Thinking with Visual Primitives** (DeepSeek, 2026) 提出了一种全新的推理框架：
-> 模型不仅要"看清"(see clearer)，更要**"一边推理一边指点"（"point while it reasons"）**。通过在 Chain-of-Thought (CoT) 推理过程中**直接交织 spatial markers（空间标记，即 point 和 bounding box）**作为 **Visual Primitives（视觉原语）**，将空间标记提升为 **"最小思维单元"（minimal units of thought）**——将抽象的语言概念锚定到具体的物理坐标，从而弥合复杂视觉推理中的 **Reference Gap（引用鸿沟）**。
-
-论文识别了多模态推理中的两个不同挑战：
-- **Perception Gap（感知鸿沟）**：模型感知细节的能力（通过高分辨率裁剪、动态 patching 等技术解决）
-- **Reference Gap（引用鸿沟）**：自然语言无法在复杂场景中精确指代物体的固有问题
-
-与传统的"先语言推理、后输出坐标"或"用后验框验证"（post-hoc grounding）的路线不同，论文的核心主张是：**spatial markers 既不是推理的结果也不是辅助证据，而是推理本身的主体介质**——它们是认知轨迹（cognitive trajectory）的内在组成部分。
+模型不再只是"看清"，而是**一边推理一边指点**——把 spatial marker（box 与 point）直接交织进 Chain-of-Thought 作为**视觉原语**，从而弥合复杂视觉推理中的 *Reference Gap*。
 
 ---
 
-## 🎯 本项目定位
+## 核心特点
 
-| 维度 | 论文 (DeepSeek) | 本复现 |
-|------|----------------|--------|
-| 基座模型 | DeepSeek-V4-Flash (284B MoE) | **Qwen3-VL-4B-Thinking** (4B Dense) |
-| 训练方法 | 大规模 GRPO + 自研训练框架 | **QLoRA + TRL GRPO + RFT** |
-| 视觉原语 | 自定义 tokens | `<|box|>` / `<|point|>` |
-| 显存要求 | 多卡 A100/H100 | **单卡 RTX 5090D 24GB** |
-| 数据规模 | 460K+ 迷宫 / 125K+ 路径 | 50K 迷宫 / 10K 路径 (可扩展) |
-
-由于 24GB 显存无法容纳 284B MoE 的在线多 rollout 训练，本项目采用**轻量级 Separated Experts（Specialist）架构 + On-Policy Distillation (OPD)**，在保持核心思想不变的前提下，通过 **4-bit QLoRA (r=256) + Gradient Checkpointing + Paged AdamW 8-bit** 实现单卡可跑。
-
-> **⚠️ Pretrain Limitation**: 原论文的 Pretrain 是 **trillion-scale 多模态预训练**，模型在 4000 万+ 筛选后的网页 grounding 数据上建立"Visual Primitives 作为思维单元"的基础能力。由于算力限制，本项目采用**统一视觉 Grounding 预训练**作为直接入口——模型在 COCO + CLEVR 数据上通过 QLoRA 同时学习 special token embedding 和视觉→坐标映射，避免了先文本后视觉的分裂路径，更贴近论文的单阶段多模态预训练范式。
+- **单卡可跑**：4-bit QLoRA + Gradient Checkpointing + Paged AdamW 8-bit；OPD 阶段峰值显存约 **18.5GB**。
+- **轻量专家 + 蒸馏**：Box/Point 两个 Specialist 在 SFT 后冻结，通过 On-Policy Distillation（OPD）蒸馏为单个 Unified 模型。
+- **完整 6 阶段流水线**：预训练 → 合并 → Box SFT → Point SFT → Box GRPO → Point GRPO → Unified RFT → OPD。
+- **内联视觉原语**：`<|box|>[[x1,y1,x2,y2]]<|/box|>` 与 `<|point|>[[x,y]]<|/point|>` 直接嵌入 `<think>`。
+- **ModelScope 权重**：所有中间阶段与最终模型均已发布（见下表）。
 
 ---
 
-## 🖥️ 硬件与软件要求
-
-### 硬件
-- **GPU**: NVIDIA RTX 5090D (24GB VRAM)
-- **显存上限**: 建议预留 22GB 以内（留 2GB 给 CUDA 上下文与显存碎片）
-
-### 软件（Blackwell 兼容）
-
-| 包 | 最低版本 |
-|----|---------|
-| PyTorch | 2.11.0 |
-| transformers | 5.10.0 |
-| flash-attn | 2.8.3 (自动 fallback 到 eager) |
-| bitsandbytes | 0.49.0 |
-| accelerate | 1.13.0 |
-| peft | 0.19.0 |
-| trl | 1.6.0 |
-
----
-
-## ⚡ 快速开始
+## 快速开始
 
 ### 1. 安装依赖
 
 ```bash
-# 创建环境（推荐）
 conda create -n tvp python=3.12 -y
 conda activate tvp
 
-# 安装 PyTorch (CUDA 13.0+)
 pip install torch>=2.11.0 torchvision>=0.26.0 --index-url https://download.pytorch.org/whl/cu130
-
-# 安装其他依赖
 pip install -r requirements.txt
 
-# 可选：安装 Flash Attention 2 加速
-# 如果编译失败，代码会自动 fallback 到 eager attention
+# 可选：Flash Attention 2（编译失败会自动 fallback 到 eager）
 pip install flash-attn --no-build-isolation
 ```
 
 ### 2. 下载基座模型
 
 ```bash
-# 自动从 Hugging Face 下载（首次运行时会缓存）
-# 或手动下载到本地
 huggingface-cli download Qwen/Qwen3-VL-4B-Thinking --local-dir models/Qwen3-VL-4B-Thinking
 ```
 
-### 3. 准备 COCO 数据集（可选，用于 Box 任务）
-
-```bash
-mkdir -p data/coco
-wget http://images.cocodataset.org/zips/train2017.zip -P data/coco
-wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip -P data/coco
-unzip data/coco/train2017.zip -d data/coco
-unzip data/coco/annotations_trainval2017.zip -d data/coco
-```
-
-> 迷宫与路径数据为**程序实时生成**，无需提前下载。
-
----
-
-## 🚀 训练流程（Separated Experts + On-Policy Distillation）
-
-```
-Stage 1:  Unified Visual Pretrain  COCO + CLEVR 图像，box/point 视觉预训练  ~7.4h  ✅
-Stage 2:  Merge LoRA              将视觉预训练 LoRA 合并入基座模型          ~1m     ✅
-Stage 3a: Box Expert SFT          格式 token 加权的 Box 专项 SFT           ~13.4h ✅
-Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~16h    ✅ (含 resume)
-Stage 4a: Box Expert GRPO         Box 专家 GRPO (1 轮，无早停)            ~20.1h  ✅
-Stage 4b: Point Expert GRPO       Point 专家 GRPO (1 轮，无早停)          ~36.4h ✅（实测，分 7 段 resume）
-Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~2.7h  ✅（fast mode：400 prompts × 2 rollouts，81 条 Normal+Easy 样本，loss 2.236）
-Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    ✅ 已验证 24GB 可跑（默认配置峰值 ~18.5GB）
-                                ──────────────────────────────────────────────
-                                Total（已实测部分）:                         ~96.0h
-```
-
-**核心设计**：
-- **Separated Experts (Specialists)**：Box Specialist 和 Point Specialist 共享同一个 4-bit 基座模型但各带独立的 LoRA adapter
-- **冻结 Specialist**：两个 Specialist 在 Stage 3 训好后不再更新，作为固定的 Teacher 模型
-- **Expert 生成 Rollout**：Stage 5 RFT 中，Specialist 负责生成 rollout（generator），Unified 模型学习（learner）
-- **难度分级**：Easy/Normal/Hard 三级，仅 Normal 级样本用于训练
-- **On-Policy Distillation (OPD)**：用 D_KL(student || expert) 将两个 Specialist 的能力蒸馏到单个 Unified 模型
-- **三步 Chain-of-Thought**：Intent Analysis（意图分析）→ Grounding → Summarization（总结）
-
-### Stage 1: Unified Visual Grounding Pretrain（统一视觉 Grounding 预训练）✅
-
-**在 COCO + CLEVR 图像上训练**，从零开始建立"视觉特征 → 坐标"的真实映射。Special token（`<|box|>`、`<|point|>`）从随机初始化开始，与 LoRA adapter 同时学习——不需要独立的文本格式预训练。
-
-> **当前默认配置**：`num_box=30000`, `num_point=10000`, `num_clevr=5000`（共 45K 样本）, `num_epochs=2`, `batch_size=1`, `gradient_accumulation_steps=4`（有效 batch=4）, `max_seq_length=2048`, `lora_r=256`, `lora_alpha=512`, `learning_rate=2e-6`，启用 curriculum。
->
-> **训练结果**：22,500 步（2 epochs），loss 6.88 → 2.34（−66%），grad norm 14.48 → 1.25，收敛稳定。**耗时：~7.4h 墙钟时间**（2026-06-23 13:34:45 → 20:57:45；45K 样本，2 epochs，data cache hit）。
-> - 输出：`outputs/stage1_visual_pretrain/`
-
-```bash
-python scripts/run_stage1_visual_pretrain.py --config configs/stage1_visual_pretrain.yaml
-```
-
-**输出**: `outputs/stage1_visual_pretrain/`
-
-> **数据缓存**：Stage 1 现在会把生成的 COCO + CLEVR 训练数据 pickle 缓存到 `outputs/stage1_visual_pretrain/train_data_cache_<hash>.pkl`。resume 或重新运行时直接加载缓存，跳过耗时的数据生成。缓存 key 包含 `num_box`、`num_point`、`num_clevr`、`coco_image_dir` 和 `coco_ann_file`，修改这些参数会自动生成新缓存。如需强制重建，可加 `--regenerate_data`。
->
-> **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage1_visual_pretrain/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复。
->
-> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
-
----
-
-### Merge Stage 2 LoRA
-
-**必须合并**！避免双层 LoRA 叠加。
-
-Special token embedding 在 Stage 1 中与 LoRA adapter 一同学习，无需额外的 pretrain embedding 注入。
-
-```bash
-python scripts/run_stage2_merge.py \
-    --base_model models/Qwen3-VL-4B-Thinking \
-    --adapter_path outputs/stage1_visual_pretrain \
-    --output_dir outputs/stage2_merged_base
-```
-
-**输出**: `outputs/stage2_merged_base/`（完整 bf16 模型，~8.8GB `model.safetensors`）
-
-> **合并后是否需要验证再进入 Stage 3？**  
-> 严格来说不需要——`run_stage2_merge.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
->
-> ```bash
-> python scripts/diagnostics/smoke_test_stage2.py
-> # 或指定图片 / 问题
-> python scripts/diagnostics/smoke_test_stage2.py \
->     --image_path data/coco/train2017/000000000009.jpg \
->     --question "Locate the main object in the image. Mark it with a box."
-> ```
-
-> **合并后是否需要验证再进入 Stage 3？**  
-> 严格来说不需要——`run_stage2_merge.py` 是确定性的，如果合并损坏 Stage 3a 会直接加载失败。但因为刚刚修复了数据格式和 reward，建议跑一个 **5 分钟 smoke test**：加载 `outputs/stage2_merged_base`，用一张 COCO 图像提问，检查模型是否在 `<think>` 里输出了空间坐标。若输出正常，即可直接进入 Stage 3a。
->
-> ```bash
-> python scripts/diagnostics/smoke_test_stage2.py
-> # 或指定图片 / 问题
-> python scripts/diagnostics/smoke_test_stage2.py \
->     --image_path data/coco/train2017/000000000009.jpg \
->     --question "Locate the main object in the image. Mark it with a box."
-> ```
-
-### Stage 3a: Box Expert SFT ✅
-
-> **当前默认配置**：15K box 定位 + 10K 粗粒度计数 + 5K CLEVR 空间/VQA + 2K 负样本 box，并混入 general pretrain 数据。`num_epochs=3`, `max_seq_length=2048`, `batch_size=2`, `grad_accum=6`（有效 batch=12），`lr=1e-4`，`format_token_weight=10.0`，`max_grad_norm=1.0`。
->
-> **显存说明**：为避免 Stage 3a 在 RTX 5090D 24 GB 上爆显存，`max_seq_length` 从 4096 降到 2048，`batch_size` 从 4 降到 2，同时 `gradient_accumulation_steps` 从 3 提升到 6，保持有效 batch size 不变。
->
-> **近期改进**：
-> - SFT 目标会先经过 `clean_primitive_tags()` 清洗，修复生成数据中错序/重复的标签。
-> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=10.0`），让格式语法学得更快、ref token 梯度信号更强。
-> - `max_grad_norm=1.0` 在高 format token 权重下稳定训练。
-> - 支持 `--resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-XXX` 断点续训。
-> - **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage3a_sft_box/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复。这样可以把长时间训练拆成多次跑，无需手动记录路径。
-> - **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间，方便分多次跑时核对进度和估算剩余时间。
-> - **数据缓存**：训练数据自动缓存到 `outputs/stage3a_sft_box/train_data_cache_<hash>.pkl`。resume 或重新运行时直接加载，跳过耗时的数据生成。可加 `--regenerate_data` 强制重建。
->
-> **注**：所有训练阶段（Stage 1、3a、3b、4a、4b、5、6）现在均支持训练数据 pickle 缓存，首次运行后自动保存，后续运行或 resume 直接加载，跳过耗时的数据生成。每个阶段使用基于参数的缓存 key，修改任何数据生成参数会自动生成新缓存。如需强制重建，可加 `--regenerate_data`。
->
-> **训练结果**：14,250 步（2 epochs），loss 2.87 → 1.62（−44%），均值 1.65，grad norm 6.20 → 0.44，收敛稳定。57,000 样本（15K box + 10K 计数 + 5K CLEVR + 2K 负样本 + 25K general）。**耗时：~13.4h 墙钟时间** @ ~2.3 samples/sec。分 3 段跑：(1) 2026-06-25 11:40→19:12 ~7.5h, (2) 2026-06-26 16:09→17:35 ~1.4h, (3) 2026-06-26 17:35→22:01 ~4.4h。输出：`outputs/stage3a_sft_box/`。
-
-> - **训练结果**：45,500 样本（5K point + 10K maze + 5K path tracing + 500 负样本 point + 25K general）。**耗时：~16h 墙钟时间** @ ~0.58 samples/sec。分 2 段跑：(1) 2026-06-29 13:50→06-30 01:26 ~11.6h（中断），(2) 2026-06-30 10:42→15:02 ~4.4h（从 checkpoint-12000 resume 到完成）。输出：`outputs/stage3b_sft_point/`。
->
-> **⚠️ 重要提示（2026-06-22 修复后）**：如果 Stage 4a/4b 仍输出乱码（如 `personsยิง药材[[...]]`），根本原因是特殊 token（`<|box|>`、`<|ref|>` 等）的 embedding 在 SFT 阶段被冻结。请确认使用最新代码（`src/models/qwen_vl_loader.py` 已将 `embed_tokens` / `lm_head` 加入 `modules_to_save`），然后重新训练 Stage 3a/3b（最好从 Stage 1 重跑，使 merged base 也携带训练好的 embedding）。Stage 3 配置里的 `format_token_weight` 也已从 40.0 降到 10.0（40.0 原是为补偿 embedding 冻结的权宜之计）。
->
-> **为什么 `embed_tokens` 和 `lm_head` 是分开训练的**：Qwen3-VL-4B 的 `tie_word_embeddings=True`，基座模型本共享输入 embedding 和输出投影权重。但 PEFT 的 `ensure_weight_tying` 对 Qwen3-VL 的嵌套结构检测不到这一绑定（`_get_module_names_tied_with_embedding` 被作用在 tuner 对象上而非 base model），因此会报 warning 并回退到把两层都放进 `modules_to_save`。我们有意保持这一设置：它让特殊 token 的 embedding 可训练，并解决了之前的乱码问题，代价是这两层的可训练参数约翻倍。该 warning 无害。
-
-```bash
-# 从头训练
-python scripts/run_stage3a_sft_box.py --config configs/stage3a_sft_box.yaml
-
-# 断点续训
-python scripts/run_stage3a_sft_box.py \
-    --config configs/stage3a_sft_box.yaml \
-    --resume_from_checkpoint outputs/stage3a_sft_box/checkpoint-500
-```
-
-### Stage 3b: Point Expert SFT ✅
-
-> **当前配置**：5K point + 10K maze + 5K path tracing + 500 负样本 point，并混入 general pretrain 数据。`num_epochs=3`，`max_seq_length=2048`，`batch_size=1`, `grad_accum=8`（有效 batch=8），`lr=1e-4`，`format_token_weight=40.0`，`max_grad_norm=1.0`。
->
-> **近期改进（与 Stage 3a 对齐）**：
-> - SFT 目标会先经过 `clean_primitive_tags()` 清洗，修复生成数据中错序/重复的标签。
-> - `WeightedSFTTrainer` 对视觉原语 token 和 `<think>` token 加权（`format_token_weight=40.0`），让格式语法学得更快、ref token 梯度信号更强。
-> - `max_grad_norm=1.0` 在高 format token 权重下稳定训练。
-> - 3 个 epoch 让 embedding 获得更多更新机会，与 stage3a 训练调度一致。
-> - **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage3b_sft_point/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复。
-> - **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
->
-> 训练中途曾因显存碎片化导致速度从 3s/it 降至 30s/it，通过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` resume 后恢复正常。
-
-```bash
-# 正常从头跑
-python scripts/run_stage3b_sft_point.py \
-    --model_path outputs/stage2_merged_base \
-    --output_dir outputs/stage3b_sft_point \
-    --num_point 10000 --num_maze 50000 \
-    --num_epochs 3 --learning_rate 1e-4 \
-    --batch_size 4 --gradient_accumulation_steps 2 \
-    --format_token_weight 40.0 --max_grad_norm 1.0
-
-# 若中途显存碎片化减速，resume 时加环境变量
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/run_stage3b_sft_point.py \
-    --model_path outputs/stage2_merged_base \
-    --output_dir outputs/stage3b_sft_point \
-    --num_point 10000 --num_maze 50000 \
-    --num_epochs 3 --learning_rate 1e-4 \
-    --batch_size 4 --gradient_accumulation_steps 2 \
-    --format_token_weight 40.0 --max_grad_norm 1.0 \
-    --resume_from_checkpoint outputs/stage3b_sft_point/checkpoint-5000
-```
-
-### Stage 4a: Box Expert GRPO（默认 1 轮，无早停）
-
-> **注**：默认配置现在使用单轮 GRPO，`num_epochs=1`，并关闭基于训练子集的早停（`early_stopping_subset_size: 0`）。多轮循环结构仍被支持；如果你增大 `num_rounds`，每轮会一次性跑完，若中途 OOM，脚本会自动查找最新的 `checkpoint-*` 从中断处恢复，已完成的轮次在重跑时自动跳过。
->
-> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
->
-> **显存提示**：所有 stage 脚本现已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，无需手动添加，可有效缓解长时间训练中的 CUDA 显存碎片化问题。
-
-> **乱码提示**：如果 rollout 在坐标附近出现非英文学符乱码，通常是 Stage 3a/3b adapter 训练时特殊 token embedding 不可训练导致的。请先用最新版 `qwen_vl_loader.py`（`embed_tokens` / `lm_head` 加入 `modules_to_save`）重新训练 Stage 3a/3b，再进入 GRPO。
->
-> **dtype 不匹配修复**：GRPO 生成阶段若遇到 `RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`，`src/models/qwen_vl_loader.py` 中的 `_patch_lm_head_dtype_cast()` 会在 `lm_head` 前向时把 fp32 的 layer-norm 输出自动 cast 到 `lm_head` 权重的 dtype，无需修改配置。
-
-> **多轮 OOM 提示**：如果你增大了 `num_rounds`，某一轮把显存/内存占满并被 kill，通常是因为上一轮结束后 PyTorch/BitsAndBytes 的显存分配池和碎片没有立刻归还给系统。`src/training/grpo_runner.py` 会在每轮之间先把 policy model 移回 CPU，再执行完整的垃圾回收和 CUDA cache 清理。Stage 4a 默认配置使用 `batch_size=2`、`gradient_accumulation_steps=3`、`generation_batch_size=8`、`num_generations=8`，在保持 GRPO clip 条件有效的同时进一步降低每步 rollout 峰值显存。如果仍出现，可直接删除被中断的 `outputs/stage4a_grpo_box/round_N` 后重新运行 stage 脚本；脚本会自动跳过已完成轮次，并从干净进程继续训练被中断的轮次。
-
-> **Resume 显存修复**：之前从 `round_N/checkpoint-*` 续训时，`grpo_runner.py` 会预先加载一次 adapter，随后 `Trainer.train(resume_from_checkpoint=...)` 又会再加载一次，导致 CUDA 内存池中多占用几个 GB，常常把 optimizer 状态挤到系统内存中显著降速。现在 resume 路径会保持从本轮起始点加载的 policy model，仅由 Trainer 统一加载 checkpoint；同时在训练开始时把 GRPO 的参考 adapter（`ref`）从 fp32 转到 bf16，可节省参考 adapter 约一半显存（约 2.6 GB）。两项优化均自动生效，无需修改配置。
-
-> **难度筛选（论文 Sec 2.5.2）**：论文在 GRPO 训练前会筛选“Normal”难度样本（模型有时对有时错）。对单卡环境，这个步骤需要额外的 on-policy rollout 推理，容易引发 OOM。我们**默认跳过**该步骤（`skip_difficulty_filter: true`），并把默认数据集设得比较小（Stage 4a：4K 样本，Stage 4b：4K 样本），让流程能快速跑通。Hard 样本（全错）在 GRPO 训练中 reward 方差为 0，梯度接近 0，只会浪费算力但不会损害训练效果；Easy 样本（全对）同理。若在多卡环境希望重新启用筛选，将 YAML 中的 `skip_difficulty_filter` 设为 `false`，并相应放大样本量。
-
-```bash
-# 默认：2000 box + 1000 counting + 1000 CLEVR（共 4K 样本）
-python scripts/run_stage4a_grpo_box.py \
-    --model_path outputs/stage3a_sft_box \
-    --output_dir outputs/stage4a_grpo_box
-```
-
-> **训练结果**：4,000 步（1 epoch，4K 样本），**~20.1h 墙钟时间**，分 3 段 resume 完成：(1) 2026-06-27 16:53 → 2026-06-28 00:03 ~7h 10m（checkpoint-3800），(2) 2026-06-28 06:53 → 08:26 ~1h 33m（checkpoint-4000），(3) 2026-06-28 08:58 → 20:22 ~11h 24m（最终完成）。输出：`outputs/stage4a_grpo_box/`。
-
-### Stage 4b: Point Expert GRPO（默认 1 轮，无早停）
-
-> **训练结果**：4,000 步（1 epoch，4K 样本），**实际 GPU 运行 ~36.4h**，墙钟跨度 **~95.5h**（2026-06-30 18:04 → 2026-07-04 17:31），分 7 段 resume 完成：(1) 06-30 18:04 → 20:54 ~2h 50m（checkpoint-600），(2) 23:26 → 07-01 00:18 ~52m（checkpoint-800），(3) 07-01 11:55 → 14:38 ~2h 43m（checkpoint-1400），(4) 16:45 → 21:08 ~4h 24m，(5) 07-02 12:17 → 20:34 ~8h 17m（checkpoint-2400），(6) 07-03 16:44 → 07-04 00:41 ~7h 57m（checkpoint-4400），(7) 08:10 → 17:31 ~9h 21m（最终 checkpoint-6000）。输出：`outputs/stage4b_grpo_point/`。
->
-> **注**：与 Stage 4a 相同，默认配置为单轮 `num_epochs=1`、关闭 tiny-subset 早停。多轮循环仍被支持；已完成轮次自动跳过，中断的轮次会从最新的 `round_N/checkpoint-*` 自动续训。
->
-> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
->
-> **dtype 不匹配修复**：与 Stage 4a 相同，`src/models/qwen_vl_loader.py` 已对 `lm_head` 注入 dtype-cast 包装，避免 GRPO 生成时出现 `float != c10::BFloat16` 错误。
-
-```bash
-# 默认：1000 point + 2000 maze + 1000 path（共 4K 样本）
-python scripts/run_stage4b_grpo_point.py \
-    --model_path outputs/stage3b_sft_point \
-    --output_dir outputs/stage4b_grpo_point
-```
-
-### Stage 5: Unified RFT（专家生成 rollout）
-
-> **Fast mode（默认）**：`configs/stage5_rft_unified.yaml` 现在默认使用较小的 prompt 预算（`num_box_prompts: 100`、`num_counting_prompts: 50`、`num_clevr_prompts: 50`、`num_point_prompts: 100`、`num_maze_prompts: 50`、`num_path_prompts: 50`）和 `num_rollouts: 2`。这样既保留了论文的完整流程（专家 → rejection sampling → 难度分级 → Normal + 5% Easy → SFT），又能把数据筛选时间从数小时缩短到数分钟。`min_normal_samples` 设为 `10`，即使大部分 rollout 是 Easy/Hard，也能继续进入 SFT。如需更高质量的 Stage 5 模型，可增大这些数值。
->
-> **跳过专家生成**：在配置中设置 `skip_expert_generation: true` 或命令行传 `--skip_expert_generation`，可跳过耗时的 expert rollout 生成与难度分级，直接进入 SFT 训练。适用于已经生成或准备好过滤数据、只想训练 Unified 模型的场景。跳过时脚本优先使用 `--train_data_path`，其次回退到 `outputs/stage5_rft_unified/filtered_data_cache_<hash>.pkl`；若都不存在，则打印警告并跳过 SFT，不会自动启动耗时的生成流程。
->
-> **专家路径自动解析**：`configs/stage5_rft_unified.yaml` 中的 `box_expert_path` / `point_expert_path` 指向 Stage 4a/4b 的输出目录。`load_qlora_model()` 会自动将其解析为最新的 `round_N/adapter_model.safetensors` checkpoint，因此即使 Stage 4 配置为 `num_rounds > 1` 也无需修改 Stage 5 配置。
->
-> **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage5_rft_unified/checkpoint-*` 存在，脚本会自动从 step 最大的 checkpoint 恢复 SFT 阶段。
->
-> **带时间戳的训练日志**：`TimeLoggingCallback` 在每个 logging step 记录当前时间、step、loss/learning_rate/epoch 和已运行时间。
-
-```bash
-python scripts/run_stage5_rft_unified.py \
-    --model_path outputs/stage2_merged_base \
-    --output_dir outputs/stage5_rft_unified
-```
-
-### Stage 6: OPD（On-Policy Distillation）
-
-> **自动断点续训**：如果未指定 `--resume_from_checkpoint`，且 `outputs/stage6_opd/checkpoint-*` 存在，脚本会自动从最新 checkpoint 恢复并行蒸馏（恢复 optimizer/scheduler/epoch/step 状态）。
->
-> **专家路径自动解析**：`configs/stage6_opd.yaml` 中的 `box_expert_path` / `point_expert_path` 指向 Stage 4a/4b 的输出目录。`load_qlora_model()` 会自动将其解析为最新的 `round_N/adapter_model.safetensors` checkpoint，因此即使 Stage 4 配置为 `num_rounds > 1` 也无需修改 Stage 6 配置。
->
-> **带时间戳的训练日志**：OPD 的每步日志已通过 stage logger 自动带上墙钟时间戳，便于分多次跑时跟踪进度。
->
-> **24GB 显存优化 + 安全保护**：OPD 在训练前冻结 `embed_tokens` / `lm_head`（这些特殊 token embedding 在前面阶段已经学好），并使用 **8-bit AdamW**，将可训练参数从约 917M 降至约 528M，优化器状态显存减少约 6GB。默认配置下（`max_new_tokens=512`、每 batch 一张图），峰值 allocated 显存约 **18.5GB**，在 RTX 5090D 24GB 上留有充足余量。为避免上游阶段训练异常导致 embedding 未学到，OPD 会在冻结前检查视觉原语特殊 token embedding 的 L2 范数；若发现范数过低（接近随机初始化），会打印 WARNING 提示重新训练 Stage 1-3/5，避免冻结后输出乱码。
-
-```bash
-python scripts/run_stage6_opd.py \
-    --student_path outputs/stage5_rft_unified/final_model \
-    --output_dir outputs/stage6_opd
-```
-
-### 一键运行（推荐）
-
-```bash
-bash scripts/run_pipeline.sh
-```
-
----
-
-## 🔬 推理示例
+### 3. 推理示例
 
 ```python
 from src.models.qwen_vl_loader import load_qlora_model
@@ -354,333 +61,94 @@ messages = [
 ]
 
 text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-inputs = processor(text=[text], images=[image], return_tensors="pt")
-inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-outputs = model.generate(
-    **inputs,
-    max_new_tokens=1024,
-    temperature=0.7,
-    do_sample=True,
-)
-response = processor.tokenizer.decode(outputs[0], skip_special_tokens=False)
-print(response)
+inputs = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
+outputs = model.generate(**inputs, max_new_tokens=1024, temperature=0.7, do_sample=True)
+print(processor.tokenizer.decode(outputs[0], skip_special_tokens=False))
 ```
 
-预期输出包含：
-```
-<think>
-I can see two cats in the image. Let me mark them.
-<|box|>[[120, 80, 340, 290]]<|/box|>
-<|box|>[[410, 95, 620, 310]]<|/box|>
-</think>
-
-The answer is 2.
-```
-
-### 批量推理
-
-支持对 JSONL 文件批量推理，适用于评估或大规模处理：
-
-```python
-import json
-from pathlib import Path
-from src.models.qwen_vl_loader import load_qlora_model
-from src.utils.metrics import process_reward
-from PIL import Image
-
-model, processor = load_qlora_model("outputs/stage6_opd")
-
-results = []
-with open("eval_data.jsonl") as f:
-    for line in f:
-        item = json.loads(line)
-        image = Image.open(item["image_path"]).convert("RGB")
-        messages = [
-            {"role": "system", "content": "You are a helpful visual reasoning assistant. Think step by step."},
-            {"role": "user", "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": item["question"]},
-            ]},
-        ]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=[image], return_tensors="pt")
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-        outputs = model.generate(**inputs, max_new_tokens=1024, temperature=0.7, do_sample=True)
-        pred = processor.tokenizer.decode(outputs[0], skip_special_tokens=False)
-
-        # 计算过程奖励（可选）
-        reward = process_reward(pred, item["answer"], task_type=item.get("task_type", "box"))
-        results.append({"pred": pred, "reward": reward, "gt": item["answer"]})
-
-with open("eval_results.jsonl", "w") as f:
-    for r in results:
-        f.write(json.dumps(r, ensure_ascii=False) + "\n")
-```
-
-### 跨 Stage 模型对比评估
-
-对比不同训练阶段的输出质量，验证各阶段效果演进：
-
-```python
-from src.models.qwen_vl_loader import load_qlora_model
-from PIL import Image
-
-# 加载各阶段模型
-stages = {
-    "Stage 2 (Pretrain)": "outputs/stage2_merged_base",
-    "Stage 3a (Box SFT)": "outputs/stage3a_sft_box",
-    "Stage 6 (OPD)":      "outputs/stage6_opd",
-}
-
-image = Image.open("test_image.jpg")
-prompt = "Locate the dog in the image."
-
-for name, path in stages.items():
-    model, processor = load_qlora_model(path)
-    messages = [
-        {"role": "system", "content": "You are a helpful visual reasoning assistant."},
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": prompt},
-        ]},
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[image], return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-    outputs = model.generate(**inputs, max_new_tokens=512, do_sample=False)
-    print(f"=== {name} ===")
-    print(processor.tokenizer.decode(outputs[0], skip_special_tokens=False))
-    print()
-    del model  # 释放显存
-```
-
-> **预期行为**：Pretrain 阶段输出格式正确但框不准确；SFT Box 阶段结构化思考 + 精确框；OPD 阶段同时具备 Box 和 Point 能力。
+批量推理与跨阶段对比见 [docs/INFERENCE.md](docs/INFERENCE.md)。
 
 ---
 
-## 🧠 关键技术设计
+## 模型权重
 
-### Visual Primitive（Spatial Marker）格式
+各阶段 checkpoints 已上传至 ModelScope（中国大陆访问友好）：
 
-论文将 Visual Primitives 定义为 Chain-of-Thought 中的 inline tokens（内联标记）：
+| 阶段 | ModelScope 模型名 |
+|------|------------------|
+| Pretrain（合并后） | `TVP-Pretrain-Qwen3-VL-4B` |
+| SFT Box 专家 | `TVP-SFT-Box-Qwen3-VL-4B` |
+| SFT Point 专家 | `TVP-SFT-Point-Qwen3-VL-4B` |
+| GRPO Box 专家 | `TVP-GRPO-Box-Qwen3-VL-4B` |
+| GRPO Point 专家 | `TVP-GRPO-Point-Qwen3-VL-4B` |
+| Unified RFT | `TVP-RFT-Unified-Qwen3-VL-4B` |
+| OPD（最终模型） | `TVP-OPD-Qwen3-VL-4B` |
 
-```
-<|box|>[[x1, y1, x2, y2]]<|/box|>        # 单个 Bounding Box
-<|box|>[[x1,y1,x2,y2],[x3,y3,x4,y4]]<|/box|>  # 多个 Box
-<|point|>[[x, y]]<|/point|>              # 点坐标（迷宫路径、关键点）
-```
+**合集地址**：[Thinking-with-Visual-Primitives-Qwen3-VL-4B](https://modelscope.cn/collections/EdmundYY/Thinking-with-Visual-Primitives-Qwen3-VL-4B)
 
-坐标统一归一化到 `[0, 999]` 区间。
-
-### 内存优化策略
-
-| 技术 | 效果 |
-|-----|------|
-| 4-bit NF4 + Double Quantization | ~6GB / 模型实例 |
-| Gradient Checkpointing | 显存换时间，降低激活值占用 |
-| Paged AdamW 8-bit | 优化器状态压缩 |
-| bf16 计算 | 速度 + 显存双赢 |
-
-单卡 24GB 可以同时容纳 **Policy 模型 + Reference 模型**（TRL 的 GRPOTrainer 对 PEFT 模型通过禁用 adapter 复用相同基座权重，峰值显存约 14-18GB，其中 KV cache 为最大支出）。
-
-### VRAM Guide 显存适配指南
-
-不同显存 GPU 的推荐配置：
-
-| GPU 显存 | batch_size | grad_accum | LoRA r | image_size | max_length | 备注 |
-|---------|-----------|-----------|--------|-----------|-----------|------|
-| **24GB** (5090D / 4090) | 2 | 2 | 256 | 448 | 2048 | 本项目默认配置 |
-| **16GB** (4080 / 4070 Ti Super) | 1 | 4 | 128 | 384 | 1536 | 降低 LoRA rank 以节省显存 |
-| **12GB** (4070 Ti / 3060 12G) | 1 | 8 | 64 | 336 | 1024 | 激进压缩，GRPO `num_generations=3` |
-| **80GB** (A100 / H100) | 4 | 1 | 256 | 448 | 4096 | 可跑全参数或更大 batch |
-
-> **提示**：
-> - 12GB 显卡建议在运行前设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 减少显存碎片。
-> - OPD 阶段 student 常驻显存，每次只加载一个 expert；教师模型使用 4-bit 量化并在 phase 结束后立即释放，峰值显存约为单模型 SFT 的 1.3–1.5 倍。
-> - GRPO 阶段显存占用与 `num_generations` 正相关，12GB 下建议 `num_generations=3`，24GB 下可用 `num_generations=5`。
-> - **Windows 共享 GPU 内存**：如果任务管理器显示“共享 GPU 内存”一直被占用，而专用+共享的总量远未达到上限，这通常是 WDDM 的分配问题，不是显存不够。Stage 脚本已内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 以缓解显存碎片。若仍持续出现，可尝试关闭 Windows 的“硬件加速 GPU 调度（HAGS）”，并确保没有其他程序占用显存。
-
-### 过程奖励函数 (Process Reward)
-
-不同于仅看最终答案正确与否，我们设计了细粒度的过程奖励——受论文三个 reward heads（**Format**、**Quality**、**Accuracy**）启发：
-
-- **Box 任务**: IoU 匹配、漏检、格式合法性
-- **Point / Maze 任务**: L2 距离、撞墙检测 (Bresenham 采样)、回溯缺失检测
-- **通用**: 标签配对合法性 (`syntax_valid`)、非拉丁文字惩罚、完成长度惩罚
-
-```python
-from src.utils.metrics import process_reward
-
-reward = process_reward(
-    pred_text=pred,
-    gt_text=gt,
-    task_type="maze",
-    iou_threshold=0.5,
-    point_dist_threshold=10.0,
-    maze_grid=grid,
-)
-# 返回: answer_correct, syntax_valid, box_avg_iou, point_avg_dist,
-#       wall_collision_count, backtracking_missing, ...
-```
-
-### 配置管理（YAML + argparse）
-
-所有 stage 脚本遵循三层默认值级联：
-
-```
-argparse default (None) → YAML config value → CLI override
-```
-
-- **YAML 配置**（`configs/*.yaml`）是超参数的**唯一真实来源**。
-- **argparse 默认值**统一为 `None`——YAML 是必须的。如果 YAML 中缺少某个键，脚本会尽早报错。
-- **CLI 参数**覆盖 YAML 和 argparse 默认值，例如 `--num_epochs 5`。
-- `StageRunner`（在 `src/training/stage_runner.py` 中）提供共享 boilerplate：argparse 设置、YAML 加载（`apply_yaml_defaults`）、日志和 pickle 数据缓存辅助。
-
-### 视觉原语 Domain Seam
-
-`PrimitiveParser`（在 `src/models/visual_primitive_parser.py` 中）是**所有视觉原语操作的唯一公共 API**——解析、验证、格式化和几何计算。底层模块（`text_parsing.py`、`geometry.py`、`primitive_formatter.py`）是内部实现细节。
-
-```python
-from src.models.visual_primitive_parser import PrimitiveParser
-
-boxes = PrimitiveParser.extract_boxes(text)            # 解析
-tags  = PrimitiveParser.format_box([(10,20,100,200)])  # 格式化
-iou   = PrimitiveParser.box_iou(pred, gt)              # 几何计算
-```
-
-### 数据生成与质量控制
-
-除原始 COCO box/point 和合成迷宫外，训练流水线现己新增多种数据生成器，以扩展模型的推理能力：
-
-| 生成器 | 任务类型 | 描述 |
-|--------|---------|------|
-| `coco_box_generator.py` | Box / 计数 | COCO 边框 + 几何过滤（剔除超大/超小/退化/贴边框）+ 粗糙计数（3–30 个实例） |
-| `clevr_spatial.py` | 空间 VQA | 2D 合成场景（球/立方体/圆柱体），支持计数、存在性、空间计数、属性查询四类问题 |
-| `path_tracing.py` | Point | 缠绕的 Bézier 曲线，模型需追踪目标路径至终点；支持 uniform-color 模式迫使模型依赖曲率连续性 |
-| `synthetic_maze.py` | Point / Maze | 随机迷宫生成 + BFS 路径求解 |
-
-**Thinking-chain 验证器**（`thinking_verifier.py`）：所有生成器在生成后自动经过校验过滤，检查内容包括：
-- Tag 配对（`<|box|>`/`<|/box|>`、`<|point|>`/`<|/point|>`）
-- 坐标范围合法性（0–999）
-- 引用有效性（thinking 步骤引用的 primitive 真实存在）
-- Counting 答案与 primitive 数量一致性
-- 迷宫自相矛盾检测
-
-未通过任何一项检查的样本会在训练前被丢弃，确保 SFT 和 GRPO 的 cold-start 数据质量。
+> 上述权重仅供研究 / 流程验证，基于单卡 24GB 显存与小规模数据训练，不建议直接用于生产环境。
 
 ---
 
-## 📁 项目结构
+## 训练流程
+
+一键运行完整流水线：
+
+```bash
+bash scripts/run_pipeline.sh
+```
+
+| 阶段 | 任务 | 主要输入 | 输出目录 | 已验证墙钟时间 |
+|------|------|---------|---------|---------------|
+| 1 | 统一视觉 Grounding 预训练 | COCO + CLEVR | `outputs/stage1_visual_pretrain/` | ~7.4h |
+| 2 | Merge LoRA | Stage 1 adapter | `outputs/stage2_merged_base/` | ~1m |
+| 3a | Box Expert SFT | Box / 计数 / CLEVR | `outputs/stage3a_sft_box/` | ~13.4h |
+| 3b | Point Expert SFT | Point / 迷宫 / 路径 | `outputs/stage3b_sft_point/` | ~16h |
+| 4a | Box Expert GRPO | Box prompts | `outputs/stage4a_grpo_box/` | ~20.1h |
+| 4b | Point Expert GRPO | Point/迷宫/路径 prompts | `outputs/stage4b_grpo_point/` | ~36.4h |
+| 5 | Unified RFT | 专家 rollout | `outputs/stage5_rft_unified/` | ~2.7h |
+| 6 | OPD | Student + 专家 | `outputs/stage6_opd/` | ~7h |
+
+每阶段的命令、配置、断点续训与显存提示见 [docs/TRAINING.md](docs/TRAINING.md)。
+
+---
+
+## 项目结构
 
 ```
 tvp-4b-5090d/
-├── configs/                          # YAML 训练配置
-│   ├── stage1_visual_pretrain.yaml
-│   ├── stage3a_sft_box.yaml
-│   ├── stage3b_sft_point.yaml
-│   ├── stage4a_grpo_box.yaml
-│   ├── stage4b_grpo_point.yaml
-│   ├── stage5_rft_unified.yaml
-│   └── stage6_opd.yaml
-├── src/
-│   ├── models/
-│   │   ├── qwen_vl_loader.py         # Qwen3VL + QLoRA 加载器
-│   │   ├── pretrain_loader.py        # Pretrain 模型加载 + embedding 注入
-│   │   └── visual_primitive_parser.py # **Domain seam**：视觉原语统一接口（解析、格式化、几何计算）
-│   ├── data/
-│   │   ├── datasets/
-│   │   │   ├── sft_dataset.py        # SFT 数据集（assistant-only loss mask）
-│   │   │   ├── grpo_dataset.py       # GRPO 数据集
-│   │   │   └── image_loader.py       # Lazy image loading（防 OOM）
-│   │   ├── generators/
-│   │   │   ├── __init__.py            # 生成器注册表
-│   │   │   ├── coco_box_generator.py # COCO → box/point/counting 训练样本（3-step thinking + 几何过滤）
-│   │   │   ├── synthetic_maze.py     # 合成迷宫生成器（3-step thinking）
-│   │   │   ├── clevr_spatial.py      # CLEVR 风格 2D 空间 / VQA 生成器
-│   │   │   ├── path_tracing.py       # Bézier 曲线路径追踪生成器
-│   │   └── formatters/
-│   │       └── primitive_formatter.py # 坐标标签格式化（内部模块）
-│   ├── training/
-│   │   ├── stage_runner.py           # **StageRunner**：共享 argparse+YAML+日志 boilerplate
-│   │   ├── trainers/
-│   │   │   └── sft_trainer.py        # SFT Trainer 封装（WeightedSFTTrainer）
-│   │   ├── opd_trainer.py            # OPD On-Policy Distillation 训练器
-│   │   ├── grpo_fixes.py             # GRPOTrainer 多模态猴补丁
-│   │   ├── grpo_utils.py             # GRPO 辅助工具（completion 文本提取）
-│   │   ├── callbacks.py              # 训练回调（内存监控）
-│   │   ├── memory_utils.py           # GPU 显存工具（build_param_groups）
-│   │   └── config_utils.py           # 阶段脚本的 YAML 配置加载工具
-│   └── utils/
-│       ├── constants.py              # 特殊 token / 超参常量
-│       ├── conversation_builder.py   # **ConversationBuilder**：统一消息构建（SFT/GRPO/OPD/pretrain）
-│       ├── text_parsing.py           # 答案 / 推理 / box / point 解析（内部模块）
-│       ├── geometry.py               # IoU、点距离、迷宫几何（内部模块）
-│       ├── thinking_verifier.py      # Thinking-chain 校验（tag 配对、坐标范围、引用检查）
-│       ├── quality_rm_api.py         # LLM-as-Judge Quality RM（OpenAI 兼容 API）
-│       ├── logging_utils.py          # 日志初始化
-│       ├── difficulty.py             # Easy/Normal/Hard 难度分级
-│       ├── batch_inference.py        # 批量生成辅助工具
-│       └── reward/
-│           ├── format_rm.py          # Format Reward Model
-│           ├── quality_rm.py         # Quality Reward Model（规则版）
-│           └── accuracy_rm.py        # Accuracy Reward Model（process_reward, compute_total_reward）
-├── scripts/                          # 阶段入口脚本
-│   ├── run_stage1_visual_pretrain.py  # Stage 1: 统一视觉 Grounding 预训练
-│   ├── run_stage2_merge.py            # Stage 2: Merge LoRA
-│   ├── run_stage3a_sft_box.py        # Stage 3a: Box Expert SFT
-│   ├── run_stage3b_sft_point.py      # Stage 3b: Point Expert SFT
-│   ├── run_stage4a_grpo_box.py       # Stage 4a: Box Expert GRPO
-│   ├── run_stage4b_grpo_point.py     # Stage 4b: Point Expert GRPO
-│   ├── run_stage5_rft_unified.py     # Stage 5: Unified RFT
-│   ├── run_stage6_opd.py             # Stage 6: OPD
-│   ├── diagnostics/
-│   │   ├── eval_stage2_structure.py      # Stage 2 结构评估
-│   │   ├── eval_stage3a_paradigm.py      # Stage 3a 范式检查
-│   │   ├── smoke_test_stage2.py          # Stage 2 冒烟测试
-│   │   └── diagnose_stage2_resume_loss.py # Stage 2 loss 诊断
-│   └── run_pipeline.sh               # Master Pipeline 一键运行
-├── tests/
-│   ├── test_primitive_parser.py      # PrimitiveParser 单元测试（30 个方法）
-│   ├── test_primitive_formatter.py   # Box/point 格式化测试
-│   ├── test_metrics.py               # 奖励函数与几何工具测试
-│   ├── test_conversation_builder.py  # ConversationBuilder 单元测试（21 测试）
-│   ├── test_quality_rm_api.py        # Quality RM API 集成测试（23 测试）
-│   ├── test_pretrain_format.py       # 预训练格式测试
-│   ├── test_weighted_sft_trainer.py  # WeightedSFTTrainer loss 测试
-│   ├── test_grpo_fixes.py            # GRPO 猴补丁单元测试
-│   ├── test_grpo_reward_integration.py # GRPO 奖励集成测试
-│   ├── test_stage_integration.py     # **Stage 集成测试**（14 测试，覆盖全部 8 个 stage）
-│   ├── test_stage3a_data_composition.py # Stage 3a 数据组成测试
-│   ├── test_logging_utils.py         # 日志工具测试
-│   └── test_filter_normal_level_data.py # 难度过滤器测试
-├── outputs/                          # 训练产物（按 stage 组织）
-│   ├── stage1_visual_pretrain/       # LoRA adapter + checkpoints
-│   ├── stage2_merged_base/           # merge 后的完整模型
-│   ├── stage3a_sft_box/              # Box Expert SFT adapter
-│   ├── stage3b_sft_point/            # Point Expert SFT adapter
-│   ├── stage4a_grpo_box/             # Box Expert GRPO adapter
-│   ├── stage4b_grpo_point/           # Point Expert GRPO adapter
-│   ├── stage5_rft_unified/           # Unified RFT adapter
-│   └── stage6_opd/                   # On-Policy Distillation 蒸馏产物
-├── logs/                             # 各 stage 训练日志
-├── data/
-│   ├── coco/                         # COCO 数据集（需手动下载）
-│   └── cache/maze/                   # 迷宫图片缓存
-├── models/Qwen3-VL-4B-Thinking/     # 基座模型（需手动下载）
-├── requirements.txt
-├── README.md
-└── README_zh.md
+├── configs/                 # 各阶段 YAML 配置
+├── docs/                    # 详细文档
+│   ├── TRAINING.md
+│   ├── ARCHITECTURE.md
+│   ├── INFERENCE.md
+│   ├── OPTIMIZATION.md
+│   └── KNOWN_ISSUES.md
+├── scripts/                 # 阶段入口脚本与一键流水线
+│   ├── run_stage1_visual_pretrain.py
+│   ├── run_stage2_merge.py
+│   ├── run_stage3a_sft_box.py
+│   ├── run_stage3b_sft_point.py
+│   ├── run_stage4a_grpo_box.py
+│   ├── run_stage4b_grpo_point.py
+│   ├── run_stage5_rft_unified.py
+│   ├── run_stage6_opd.py
+│   └── run_pipeline.sh
+├── src/                     # 数据、模型、训练、工具
+├── tests/                   # 单元测试与集成测试
+├── outputs/                 # 按 stage 组织的训练产物
+├── data/                    # COCO 与生成数据缓存
+└── models/                  # 基座模型（需手动下载）
 ```
+
+视觉原语、奖励函数、显存优化、Domain Seam 等技术设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ---
 
-## 🧪 运行测试
+## 运行测试
 
 ```bash
-# 单元测试（快速，大部分不需要 GPU）
+# 单元测试（大部分不需要 GPU）
 pytest tests/ -v --ignore=tests/test_grpo_reward_integration.py --ignore=tests/test_stage_integration.py
 
 # 集成测试（需要模型 + COCO 数据；缺失时自动跳过）
@@ -692,21 +160,17 @@ pytest tests/ -v
 
 ---
 
-## 🙏 致谢与参考
+## 致谢与参考
 
-本项目的实现参考了以下工作：
+- **论文**：*Thinking with Visual Primitives*（Lu et al., DeepSeek, 2026）
+- **参考 PyTorch 复现**：[vra/Thinking-with-Visual-Primitives-pytorch](https://github.com/vra/Thinking-with-Visual-Primitives-pytorch) —— 训练流水线、视觉原语格式、奖励函数设计从中获得大量启发。
+- **基座模型**：[Qwen3-VL-4B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking)
 
-- **论文**：*Thinking with Visual Primitives*（Lu et al., DeepSeek, 2026）—— 提出将 spatial markers（bounding box 和 point）作为多模态 Chain-of-Thought 推理中的"最小思维单元"（minimal units of thought），弥合复杂视觉推理中的 Reference Gap。本项目的核心思想即来源于此论文。
-- **[vra/Thinking-with-Visual-Primitives-pytorch](https://github.com/vra/Thinking-with-Visual-Primitives-pytorch)**（作者：Yunfeng Wang）：基于 PyTorch 的非官方复现，采用 Qwen2-VL-2B + LoRA 在单卡 12GB+ 上实现了完整的 Pretrain → SFT → OPD 训练流程。本项目的整体训练流水线设计（Separated Experts + On-Policy Distillation）、Visual Primitive 格式定义、过程奖励函数设计等均从中获得了大量启发和参考。
-- **[ailuntx/Thinking-with-Visual-Primitives](https://github.com/ailuntx/Thinking-with-Visual-Primitives)**：原论文官方仓库被删除后的社区存档/镜像，保留了原始论文的技术报告、代码和说明，作为 DeepSeek 论文原始实现的替代参考来源。
-
-> **声明**：本项目是对上述工作的独立复现与扩展，在基座模型（Qwen3-VL-4B）、训练框架（TRL + QLoRA）、硬件约束（单卡 RTX 5090D 24GB）等方面做了不同的技术选型。如有任何问题或建议，欢迎提出 Issue。
+本项目是对上述工作的独立复现与扩展，在基座模型（Qwen3-VL-4B）、训练框架（TRL + QLoRA）、硬件约束（单卡 RTX 5090D 24GB）等方面做了不同的技术选型。
 
 ---
 
-## 📚 引用
-
-首先引用原始论文：
+## 引用
 
 ```bibtex
 @article{lu2026think,
@@ -714,33 +178,14 @@ pytest tests/ -v
   author={Lu, Ruijie and Ma, Yiyang and Chen, Xiaokang and Luo, Lingxiao and Wu, Zhiyu and Pan, Zizheng and Liu, Xingchao and Lin, Yutong and Li, Hao and Liu, Wen and Hao, Zhewen and Gao, Xi and Nie, Shaoheng and Wei, Yixuan and Xie, Zhenda and Chen, Ting and Zeng, Gang},
   year={2026}
 }
-```
 
-以及参考的 PyTorch 复现：
-
-```bibtex
-@software{wang2026tvp_pytorch,
-  title={Thinking with Visual Primitives --- PyTorch Implementation},
-  author={Wang, Yunfeng},
-  url={https://github.com/vra/Thinking-with-Visual-Primitives-pytorch},
-  year={2026}
-}
-```
-
-如果你使用了本代码，也请引用 Qwen3-VL：
-
-```bibtex
 @article{bai2025qwen3vl,
   title={Qwen3-VL Technical Report},
   author={Bai, Shuai and Cai, Yuxuan and Chen, Ruizhe and others},
   journal={arXiv preprint arXiv:2511.21631},
   year={2025}
 }
-```
 
-以及本项目：
-
-```bibtex
 @misc{tvp4b5090d2026,
   title={TVP-4B-5090D: Thinking with Visual Primitives on Qwen3-VL-4B},
   author={Edmund724},
@@ -752,73 +197,6 @@ pytest tests/ -v
 
 ---
 
-## 🔧 进一步贴近原论文的优化方向
-
-本复现优先保证**核心思想**（视觉原语作为推理单元）在单卡约束下可跑。以下是在不重建万亿级预训练的前提下，仍可逐步缩小与原文差距的具体方向：
-
-### Stage 1 — 预训练
-- **当前**: 统一视觉 Grounding 预训练，COCO + CLEVR 图像通过 QLoRA 训练。Special token 随机初始化，与视觉特征同时学习，不再有独立的文本格式预训练。
-- **论文**: 在 4000 万+ 筛选后的网页 grounding 数据上进行万亿级多模态预训练。
-- **可行优化**:
-  1. 扩充视觉预训练数据来源（Flickr30k Entities、RefCOCO、SA-1B 样本等），10 万~100 万来自不同域的真实样本即可提升泛化能力。
-  2. 若无法做网页抓取，可在公开检测/grounding 数据集上复现论文的两步过滤（语义审查 + 几何质量审查）。
-  3. 解冻 ViT 最后几层（`--unfreeze_vit_layers 2-4`），让视觉特征更好地适配坐标预测任务。
-
-### Stage 1 视觉预训练 — 进一步提升数据多样性
-- **当前**: COCO + CLEVR 合成数据，通过 QLoRA 训练，ViT 冻结。
-- **论文**: DeepSeek-ViT + 3×3 token 压缩 + CSA 4× KV-cache 压缩，端到端海量数据训练。
-- **可行优化**:
-  1. 扩充视觉预训练数据来源（SA-1B、合成几何图形、领域 grounding 数据集等）。
-  2. 若显存允许，以极低学习率解冻部分 ViT 层（`--unfreeze_vit_layers 2-4`）。
-
-### Stage 3 — Cold-Start SFT
-- **当前**: COCO box/point/counting + 简化 CLEVR + 单算法矩形迷宫 + path tracing。**✅ 已实现 `<|ref|>` token 全链路：粗粒度计数用 batch ref，细粒度/Spatial 用逐个 ref，负样本无 ref**。
-- **论文**: MLLM 基于 GQA 场景图生成 thinking chain，46 万迷宫覆盖 DFS/Prim/Kruskal 与矩形/圆形/六边形拓扑，12.5 万 path tracing。
-- **可行优化**:
-  1. **细粒度计数**: 接入 GQA 场景图，用 MLLM/API 生成属性约束问题与 thinking chain，再用 `thinking_verifier.py` 校验。
-  2. **迷宫多样性**: 在现有 DFS 基础上增加 Prim、Kruskal 生成器，以及圆形、六边形拓扑。
-  3. **空间/VQA**: 把 CLEVR 问题扩展为多跳推理，并加入负样本（忠实拒绝）。
-  4. **MLLM 生成 thinking**: 在有标注的数据（GQA、COCO panoptic、SA-1B）上，用本地小 MLLM 或 API 合成"意图分析→Grounding→总结"三段式 thinking，替代手工模板。
-
-### Stage 4 — 专项 RL
-- **当前**: 规则化 Quality RM + 已改为按"正确 rollout 数量"分难度（与论文 Sec 2.5.2 对齐）。**✅ Path Tracing 已实现论文 4 组件 Accuracy RM**（forward/reverse/endpoint/continuity + answer correctness）。**✅ 复杂 CLEVR 问题（multihop/compare/spatial_existence/spatial_count）已接入 LLM API judge** 替代简单答案匹配。**LLM-based GRM Quality RM 也已实现**（`src/utils/quality_rm_api.py`），可通过 `--use_quality_rm_api` 开启——**默认关闭**（`configs/stage4a_grpo_box.yaml` / `stage4b_grpo_point.yaml` 中 `use_quality_rm_api: false`），启用需在 `.env` 配置 `OPENAI_API_KEY`。
-- **论文**: LLM-based Generative Reward Model 做 Quality RM。
-- **可行优化**:
-  1. 用本地小模型（如 Qwen2.5-3B-Instruct 或蒸馏后的 critic）替代规则 QM，或在边界样本上调用 API。
-  2. 规则 QM 作为快速预筛，LLM judge 负责难分样本的二次打分。
-
-> **开启 `use_quality_rm_api` 后的 LLM 调用量** —— Stage 4a、4b、5 均默认 `use_quality_rm_api: false`，即**默认零 LLM Quality-RM 调用**。若开启，默认配置下（1 epoch / 1 round，`QUALITY_RM_SAMPLE_RATIO=1.0`）的量级估算：
->
-> | 阶段 | 计算单元 | LLM 调用 ≈ | Token ≈ |
-> |---|---|---|---|
-> | 4a — box GRPO | 4,000 prompt × 8 generation | **约 32,000** | **约 50M** |
-> | 4b — point GRPO | 4,000 prompt × 6 generation | **约 24,000** | **约 40M** |
-> | 5 — unified RFT | 17,000 prompt × 5 rollout | **约 85,000** | **约 140M** |
->
-> Token 估算按每次调用 ~700–800 input token（固定评分表 + ground truth + 模型输出，其中模型输出受 `max_completion_length` 384/512 限制）+ 最多 1,024 output token（`max_tokens`：CoT 说明 + 分数）≈ **1.5–1.8k token/次**。4a/4b 的量随 `QUALITY_RM_SAMPLE_RATIO` 缩放（如 `0.25` → 约 1/4 调用/token）；Stage 5 对每个 rollout 直接打分，该变量对其**不生效**。此外，与该开关无关，只要设置了 `OPENAI_API_KEY`，Stage 4a 还会把约 303 条复杂 CLEVR 样本（× 8 generation，≈ 额外 0.4M token）送入 spatial-VQA LLM judge。
->
-> **为什么默认 `false`（速度）：** 每次 judge 调用都是 GRPO / rollout 奖励循环里一个**同步阻塞**的 `chat.completions.create`（默认 `timeout` 30s、最多 2 次重试），等待返回期间 GPU 基本空转。规则版 `quality_reward_text` 是本地字符串/正则计算（微秒级、无网络）。即使乐观地按每次 API ~1s 计，上表的调用量也会带来约 **~9 小时（4a）/ ~7 小时（4b）/ ~24 小时（5）** 的纯墙钟等待。追求速度、让 GPU 不空等就保持 `false`；只有需要贴论文的抗 reward-hacking 时再开启（4a/4b 可配合较小的 `QUALITY_RM_SAMPLE_RATIO`）。注意 Stage 4a 的 spatial-VQA judge 与该开关无关，只要设了 `OPENAI_API_KEY` 就仍会同步阻塞。
-
-### Stage 5 — RFT
-- **当前**: Expert rollout → 难度分级 → Normal + 5% Easy → SFT。**✅ Prompt pool 已扩展包含 path tracing 数据**。**✅ Quality RM 已接入 best-rollout 选择**（难度分级时；默认规则版，可用 `--use_quality_rm_api` 切换 LLM GRM，`configs/stage5_rft_unified.yaml` 中 `use_quality_rm_api: false` 默认关闭）。
-
-### Stage 6 — OPD
-- **当前**: **✅ 双专家梯度累积并行蒸馏**（`train_opd_parallel()`），每 epoch 内 Box 专家处理 box 数据累积梯度 → 切换到 Point 专家处理 point/maze/path 数据 → 一次 optimizer.step()，梯度方向为两个专家信号的合成。蒸馏温度从 1.0 上调到 1.2。仅单专家驻留显存。
-
-### 可观测性
-- **当前**: **✅ TensorBoard 原语指标回调** 已实现，每 N 步记录 format compliance rate、坐标有效率、ref 使用率、平均 reward 等指标。所有 stage config YAML 已将 `report_to` 设置为 `tensorboard`。启动 TensorBoard: `tensorboard --logdir outputs/stageX_xxx/tb_primitive_logs`
-
-## ⚠️ 已知限制
-
-1. **GRPO 在线 rollout 开销**: 单卡 24GB 下 `num_generations=5` 已是极限，如需更多 rollout 需要梯度累积或 offload。
-2. **Flash Attention 兼容性**: Blackwell (RTX 5090D) 对 flash-attn 2.8.3 支持仍在完善中，代码已内置 `eager` fallback。
-3. **COCO 数据**: 首次下载约 18GB，训练时按需读取。
-4. **本实现为复现**: 论文原始 pipeline 包含更多阶段和更大规模数据，本项目在单卡约束下做了精简。
-5. **vLLM 不支持**: vLLM 与 TRL GRPO + Qwen3-VL 不兼容，所有 GRPO 阶段均使用 HuggingFace 原生生成。
-6. **样本量小、质量有限**: 默认配置为了快速跑通流程做了大幅裁剪（例如 Stage 1 仅 1 万条、Stage 2 视觉预训练仅 2 万张、GRPO 仅 2 轮 2 条 rollout）。**这些默认值无法保证最终精度或生产出可用权重，仅用于验证训练流程**。如需更好效果，请按硬件承受能力放大样本量和训练轮数。
-
----
-
-## 📄 License
+## License
 
 MIT

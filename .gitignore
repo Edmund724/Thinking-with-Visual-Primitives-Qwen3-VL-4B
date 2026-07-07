@@ -57,5 +57,11 @@ wandb/
 # Agent 配置（本地）
 AGENTS.md
 
+# ModelScope 说明文件（本地生成/特定平台）
+modelscope_readmes/
+
+# Hugging Face Trainer 临时目录
+tmp_trainer/
+
 # Windows 下载残留 Zone.Identifier 文件
 *:Zone.Identifier

@@ -307,12 +307,13 @@ def _load_opd_checkpoint(
     if load_adapter:
         from peft import PeftModel
         if isinstance(student_model, PeftModel):
-            # If an adapter named "default" already exists, replace it with the
-            # checkpoint weights. This is needed when the student was initially
-            # loaded from a base path and we want to resume from a checkpoint.
-            if "default" in student_model.peft_config:
-                student_model.delete_adapter("default")
-            student_model.load_adapter(checkpoint_dir, adapter_name="default", is_trainable=True)
+            # Replace the current "default" adapter weights with the checkpoint
+            # weights in-place. Deleting and re-adding the adapter can leave PEFT
+            # auxiliary modules with no active adapter and raise
+            # "Please specify at least one adapter to set".
+            from peft.utils import load_peft_weights, set_peft_model_state_dict
+            adapter_weights = load_peft_weights(checkpoint_dir)
+            set_peft_model_state_dict(student_model, adapter_weights, adapter_name="default")
             student_model.set_adapter("default")
         else:
             state_dict = torch.load(os.path.join(checkpoint_dir, "adapter_model.bin"),

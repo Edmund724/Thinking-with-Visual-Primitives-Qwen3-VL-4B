@@ -4,6 +4,20 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **重构 README，精简为首屏可扫描的模型发布风格，并将详细内容拆分到 `docs/`**
+  - 根因：原 `README.md` / `README_zh.md` 约 844 行，包含大量逐 stage 训练细节、时间戳、bug 修复记录、显存调优与未来优化方向，首屏信息密度低，对新人不友好。
+  - 参考 [meta-llama/llama](https://github.com/meta-llama/llama/blob/main/README.md)、[openai/whisper](https://github.com/openai/whisper/blob/main/README.md)、[Stability-AI/StableLM](https://github.com/Stability-AI/StableLM/blob/main/README.md) 等稳定模型发布项目的 README 风格，保留：标题 + badges + 一句话定位、核心特点、安装与最小推理示例、模型权重表、训练流程总览表、项目结构、测试、引用与许可。
+  - 新增 `docs/` 目录与 5 个独立文档：
+    - `docs/TRAINING.md`：完整 6-stage 训练命令、配置、断点续训、数据缓存、时间日志、显存提示。
+    - `docs/ARCHITECTURE.md`：视觉原语格式、显存优化、过程奖励函数、配置管理、Domain Seam、数据生成与校验。
+    - `docs/INFERENCE.md`：基础推理、批量推理、跨 stage 模型对比。
+    - `docs/OPTIMIZATION.md`：如何进一步贴近原论文的优化方向与 LLM-as-Judge 调用量说明。
+    - `docs/KNOWN_ISSUES.md`：已知限制与 troubleshooting。
+  - `README.md` / `README_zh.md`：删除重复段落与流水账式时间戳，所有详细内容通过相对链接指向 `docs/*.md`；行数从 844 行降至约 250 行。
+  - 验证：所有 `./docs/*.md` 链接在仓库根目录可解析；训练命令、模型链接、关键设计、限制说明均可在 README 或 docs 中找到。
+
 ### Added
 
 - **Stage 5 Unified RFT 默认 Fast mode（忠实论文的小规模 pipeline）**
@@ -24,6 +38,12 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - `src/training/opd_trainer.py`：将 `scheduler.step()` 移到真正执行 `optimizer.step()` 之后——即在 Point phase 的最后一个 batch 完成 `optimizer.step()` 后再调用 `scheduler.step()`，而不是每个 batch 都 step。这符合 OPD 并行蒸馏“每 epoch 累积 Box + Point 梯度后做一次参数更新”的论文思路，且不增加显存占用。
   - `src/training/opd_trainer.py`：由于 scheduler 现在按 epoch 粒度 step，将 `CosineAnnealingLR` 的 `T_max` 从 `total_steps_per_epoch * num_epochs` 调整为 `num_epochs`，保持 cosine 退火在训练结束时到达最低点。
   - 验证：`python -m py_compile src/training/opd_trainer.py scripts/run_stage6_opd.py` 通过；`python -m pytest tests/ -q` → 188 passed, 1 skipped。
+
+- **修复 Stage 6 OPD 从 checkpoint 续训时报 `ValueError: Please specify at least one adapter to set`**
+  - 根因：`src/training/opd_trainer.py` 的 `_load_opd_checkpoint()` 在恢复 adapter 权重时，先 `delete_adapter("default")` 再 `load_adapter(..., adapter_name="default")`。删除唯一 adapter 后 PEFT 内部 `active_adapters` 变为空，随后 `inject_adapter()` 调用 `set_adapter(self.active_adapters, ...)` 时把空列表传给辅助模块（auxiliary modules），触发 `ValueError: Please specify at least one adapter to set`。
+  - `src/training/opd_trainer.py`：改为直接使用 `peft.utils.load_peft_weights()` 读取 checkpoint adapter 权重，再通过 `peft.utils.set_peft_model_state_dict()` 原地写入当前 "default" adapter。避免删除/重建 adapter，保留原有参数对象（与 optimizer state 对应），同时消除 PEFT 空 adapter 列表错误。
+  - 效果：Stage 6 OPD 现在可以正常从 `outputs/stage6_opd/checkpoint-XXX` 自动或手动续训，checkpoint 的 adapter/optimizer/scheduler/epoch/step 状态均正确恢复。
+  - 验证：`python -m py_compile src/training/opd_trainer.py scripts/run_stage6_opd.py` 通过；`python -m pytest tests/ -q` → 188 passed, 1 skipped；在 GPU 上实际执行 `python scripts/run_stage6_opd.py --resume_from_checkpoint outputs/stage6_opd/checkpoint-2000`，成功加载并继续训练，日志显示 `Resumed at global_step=2000, epoch=1, step_in_epoch=2000`。
 
 - **强化 Stage 5 expert 切换时的显存释放，修复加载第二个 expert 时的 `CUDA driver error: device not ready`**
   - 根因：`src/training/memory_utils.py` 的 `clear_memory()` 在 `torch.cuda.empty_cache()` 之后才调用 `torch.cuda.synchronize()`。某些驱动/运行时状态下，先释放显存池再等待未完成 kernel 可能触发 `device not ready`，尤其是在第一个 expert 刚卸载、第二个 expert 的 adapter 权重要立即分配时。

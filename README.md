@@ -107,7 +107,7 @@ Stage 3b: Point Expert SFT         Point+Maze SFT                             ~1
 Stage 4a: Box Expert GRPO          Box expert GRPO (1 round, no early stop)   ~20.1h  ✅
 Stage 4b: Point Expert GRPO        Point expert GRPO (1 round, no early stop) ~36.4h ✅ (actual, 7 resume sessions)
 Stage 5:  Unified RFT              Expert-generated rollouts → Unified learning ~2.7h  ✅ (fast mode: 400 prompts × 2 rollouts, 81 Normal+Easy samples, loss 2.236)
-Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)) ~7h  (est.)
+Stage 6:  OPD                      On-Policy Distillation (D_KL(student||expert)) ~7h  ✅ Verified on 24GB (peak ~18.5GB with default config)
                                 ──────────────────────────────────────────────
                                 Total（已实测部分）:                         ~96.0h
 ```
@@ -312,6 +312,8 @@ python scripts/run_stage5_rft_unified.py \
 > **Expert path resolution**: `configs/stage6_opd.yaml` points `box_expert_path` / `point_expert_path` at the Stage 4a/4b output directories. `load_qlora_model()` automatically resolves these to the latest `round_N/adapter_model.safetensors` checkpoint, so you do not need to edit the config when Stage 4 runs with `num_rounds > 1`.
 >
 > **Timestamped training logs**: Per-step OPD logs already carry wall-clock timestamps from the stage logger, so you can track progress across multiple sessions.
+>
+> **VRAM optimization + safety guard for 24GB**: OPD freezes the `embed_tokens` / `lm_head` weights (already learned in earlier stages) and uses **8-bit AdamW**, reducing trainable parameters from ~917M to ~528M and optimizer-state memory by ~6GB. Peak allocated VRAM for the default config (`max_new_tokens=512`, one image per batch) is ~18.5GB, leaving comfortable headroom on a 24GB GPU. A safety check also verifies the visual-primitive special-token embeddings have non-random L2 norms before freezing; if they look uninitialized, a WARNING is printed advising you to re-train Stage 1-3/5 to avoid garbage / non-Latin output.
 
 ```bash
 python scripts/run_stage6_opd.py \

@@ -35,9 +35,144 @@ from ..models.qwen_vl_loader import (
     _set_use_cache_states,
     load_qlora_model,
 )
-from ..utils.constants import DEFAULT_DISTILL_TEMPERATURE
+from ..utils.constants import (
+    DEFAULT_DISTILL_TEMPERATURE,
+    SPECIAL_TOKENS,
+)
 from ..utils.conversation_builder import ConversationBuilder
 from .memory_utils import clear_memory, get_gpu_memory_gb, get_gpu_memory_reserved_gb
+
+
+def _freeze_opd_embeddings(model: torch.nn.Module, logger: logging.Logger) -> int:
+    """Freeze embed_tokens and lm_head so OPD only updates LoRA adapters.
+
+    IMPORTANT: This is safe ONLY because the Stage 5 student checkpoint already
+    learned the visual-primitive embeddings in earlier stages.  In Stage 1-3,
+    ``embed_tokens`` / ``lm_head`` are kept trainable via ``modules_to_save``;
+    without that training, the added special tokens stay at their random
+    initialization and the model emits garbage / non-Latin characters.  OPD is
+    pure reverse-KL distillation of the expert policies, so it does not need to
+    relearn those embeddings.
+
+    Keeping ``embed_tokens`` / ``lm_head`` trainable in Stage 6 adds ~390M
+    trainable parameters and ~3GB of AdamW state, which pushes the two-model OPD
+    setup (student + one expert) past 24GB.  Freezing them is consistent with the
+    paper's reverse-KL distillation objective and leaves only LoRA parameters to
+    be optimized.
+
+    A safety check verifies that the special-token embeddings look trained (L2
+    norm well above random-init magnitude) before freezing.  If they appear
+    uninitialized, a warning is emitted and the caller should abort and re-run
+    the preceding stages.
+    """
+    n = 0
+    for name, p in model.named_parameters():
+        if "embed_tokens" in name or "lm_head" in name:
+            p.requires_grad = False
+            n += p.numel()
+
+    # Guard: ensure the special-token embeddings were actually trained upstream.
+    # Randomly-initialized embeddings typically have an L2 norm ~ sqrt(dim) * sigma,
+    # where sigma ~ 0.02 for Qwen3-VL-4B (embed_dim=2048 -> norm ~ 0.9).  After even
+    # a small amount of training the norms cluster around 0.3-0.5.  We use a
+    # conservative threshold of 0.05 to catch pathological zero/untrained weights
+    # while tolerating very weak training.
+    _warn_if_embeddings_untrained(model, logger, min_norm=0.05)
+    return n
+
+
+def _warn_if_embeddings_untrained(
+    model: torch.nn.Module,
+    logger: logging.Logger,
+    min_norm: float = 0.05,
+) -> None:
+    """Log a warning if visual-primitive embeddings look randomly initialized."""
+    base = model.base_model.model if hasattr(model, "base_model") else model
+    tokenizer = getattr(model, "_tvp_processor_tokenizer", None)
+    if tokenizer is None:
+        # Try to locate the tokenizer through the processor attribute if available.
+        processor = getattr(model, "_tvp_processor", None)
+        if processor is not None:
+            tokenizer = getattr(processor, "tokenizer", None)
+
+    # Find embed_tokens / lm_head modules.
+    embed = None
+    lm_head = None
+    for name, module in base.named_modules():
+        if "embed_tokens" in name and hasattr(module, "weight"):
+            embed = module
+        if "lm_head" in name and hasattr(module, "weight"):
+            lm_head = module
+        if embed is not None and lm_head is not None and name.count(".") == 0:
+            # Only need the first (actual) ones; lm_head may also be under
+            # language_model, but the named_modules traversal will pick it up.
+            pass
+
+    if embed is None:
+        logger.warning("Could not locate embed_tokens; skipping special-token embedding check.")
+        return
+
+    # If we don't have a tokenizer, just check the last len(SPECIAL_TOKENS) rows.
+    ids_to_check: list[int] = []
+    if tokenizer is not None:
+        for tok in SPECIAL_TOKENS:
+            tok_id = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tok_id, int):
+                ids_to_check.append(tok_id)
+    else:
+        # Fallback: assume special tokens are the last rows added to the vocab.
+        ids_to_check = list(range(embed.num_embeddings - len(SPECIAL_TOKENS), embed.num_embeddings))
+        ids_to_check = [i for i in ids_to_check if 0 <= i < embed.num_embeddings]
+
+    if not ids_to_check:
+        return
+
+    norms = []
+    with torch.no_grad():
+        rows = embed.weight[ids_to_check]
+        norms = rows.norm(dim=-1).tolist()
+
+    low_norm_tokens = []
+    for tok_id, norm in zip(ids_to_check, norms):
+        if norm < min_norm:
+            token_str = tokenizer.convert_ids_to_tokens([tok_id])[0] if tokenizer is not None else str(tok_id)
+            low_norm_tokens.append((token_str, norm))
+
+    if low_norm_tokens:
+        details = ", ".join(f"{tok} (norm={norm:.4f})" for tok, norm in low_norm_tokens)
+        logger.warning(
+            "Special-token embeddings appear untrained (L2 norm below %.4f): %s. "
+            "This usually means embed_tokens/lm_head were frozen in earlier stages. "
+            "OPD will freeze them, which is unsafe with untrained embeddings and can "
+            "cause garbage / non-Latin output. Please re-train Stage 1-3/5 before OPD.",
+            min_norm, details,
+        )
+    else:
+        logger.info(
+            "Special-token embedding check passed (min norm=%.4f). Safe to freeze embed_tokens/lm_head for OPD.",
+            min(norms) if norms else 0.0,
+        )
+
+
+def _cast_frozen_norms_to_bf16(model: torch.nn.Module) -> int:
+    """Cast frozen text RMSNorm modules back to bfloat16.
+
+    ``prepare_model_for_kbit_training`` casts normalization layers to fp32 for
+    training stability.  In OPD those text layers are frozen, and their fp32
+    outputs trigger the flash-attn "Casting fp32 inputs back to bfloat16"
+    warning.  Restoring text RMSNorms to the model's native dtype removes the
+    warning without affecting gradients (only LoRA parameters are trainable).
+
+    Vision LayerNorms are left in fp32 because the vision backbone expects
+    fp32 inputs for its normalization blocks.
+    """
+    n = 0
+    for module in model.modules():
+        if "TextRMSNorm" in module.__class__.__name__:
+            if not any(p.requires_grad for p in module.parameters(recurse=False)):
+                module.to(torch.bfloat16)
+                n += 1
+    return n
 
 
 @contextmanager
@@ -260,9 +395,20 @@ def train_opd(
     for param in expert.parameters():
         param.requires_grad = False
     expert.eval()
+    norm_cast_expert = _cast_frozen_norms_to_bf16(expert)
+    if norm_cast_expert:
+        logger.info(f"Cast {norm_cast_expert} frozen norm layer(s) on expert back to bfloat16")
 
     # Student should be in train mode
     student_model.train()
+
+    # Freeze special-token embeddings; they were already learned in earlier stages.
+    frozen = _freeze_opd_embeddings(student_model, logger)
+    if frozen:
+        logger.info(f"Frozen embed_tokens/lm_head ({frozen:,} params) for OPD")
+    norm_cast = _cast_frozen_norms_to_bf16(student_model)
+    if norm_cast:
+        logger.info(f"Cast {norm_cast} frozen norm layer(s) back to bfloat16")
 
     # Build dataset
     dataset = OPDDataset(data=train_data, processor=processor)
@@ -275,11 +421,17 @@ def train_opd(
     )
     logger.info(f"OPD dataset: {len(dataset)} samples, {len(dataloader)} batches")
 
-    # Optimizer: only student LoRA params
+    # Optimizer: only student LoRA params; use 8-bit AdamW to fit in 24GB.
     trainable_params = [p for p in student_model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in trainable_params)
     logger.info(f"Trainable student params: {n_params:,} ({n_params/1e6:.1f}M)")
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
+    try:
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(trainable_params, lr=learning_rate, weight_decay=0.0)
+        logger.info("Using 8-bit AdamW for OPD")
+    except Exception as exc:  # pragma: no cover - bnb may be unavailable
+        logger.warning(f"8-bit AdamW unavailable ({exc}); falling back to fp32 AdamW")
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=len(dataloader) * num_epochs
     )
@@ -458,6 +610,14 @@ def train_opd_parallel(
 
     student_model.train()
 
+    # Freeze special-token embeddings; they were already learned in earlier stages.
+    frozen = _freeze_opd_embeddings(student_model, logger)
+    if frozen:
+        logger.info(f"Frozen embed_tokens/lm_head ({frozen:,} params) for OPD")
+    norm_cast = _cast_frozen_norms_to_bf16(student_model)
+    if norm_cast:
+        logger.info(f"Cast {norm_cast} frozen norm layer(s) back to bfloat16")
+
     # Build datasets
     box_dataset = OPDDataset(data=box_data, processor=processor)
     point_dataset = OPDDataset(data=point_data, processor=processor)
@@ -472,13 +632,19 @@ def train_opd_parallel(
         f"{total_steps_per_epoch} batches/epoch"
     )
 
-    # Optimizer: only student LoRA params
+    # Optimizer: only student LoRA params; use 8-bit AdamW to fit in 24GB.
     trainable_params = [p for p in student_model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in trainable_params)
     logger.info(f"Trainable student params: {n_params:,} ({n_params/1e6:.1f}M)")
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
+    try:
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(trainable_params, lr=learning_rate, weight_decay=0.0)
+        logger.info("Using 8-bit AdamW for OPD")
+    except Exception as exc:  # pragma: no cover - bnb may be unavailable
+        logger.warning(f"8-bit AdamW unavailable ({exc}); falling back to fp32 AdamW")
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps_per_epoch * num_epochs
+        optimizer, T_max=num_epochs
     )
 
     pad_token_id = processor.tokenizer.pad_token_id or 0
@@ -507,6 +673,9 @@ def train_opd_parallel(
         for param in box_expert.parameters():
             param.requires_grad = False
         box_expert.eval()
+        norm_cast_box = _cast_frozen_norms_to_bf16(box_expert)
+        if norm_cast_box:
+            logger.info(f"Cast {norm_cast_box} frozen norm layer(s) on box expert back to bfloat16")
         # Experts are frozen teachers; gradient checkpointing is unnecessary and
         # produces checkpoint warnings when called under no_grad.
         if getattr(box_expert, "is_gradient_checkpointing", False):
@@ -536,9 +705,20 @@ def train_opd_parallel(
                 lr = learning_rate * global_step / warmup_steps
                 for g in optimizer.param_groups:
                     g["lr"] = lr
-            if global_step > warmup_steps:
-                scheduler.step()
             pbar.set_postfix({"kl": f"{kl_val:.4f}", "phase": "box"})
+
+            if global_step % logging_steps == 0:
+                logger.info(
+                    f"  Epoch {epoch+1} | Step {global_step} | "
+                    f"KL: {kl_val:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+                )
+
+            if global_step % save_steps == 0:
+                _save_opd_checkpoint(
+                    student_model, optimizer, scheduler,
+                    global_step, epoch, step + 1,
+                    output_dir, logger,
+                )
 
         # Release box expert before loading point expert
         del box_expert
@@ -556,6 +736,9 @@ def train_opd_parallel(
         for param in point_expert.parameters():
             param.requires_grad = False
         point_expert.eval()
+        norm_cast_point = _cast_frozen_norms_to_bf16(point_expert)
+        if norm_cast_point:
+            logger.info(f"Cast {norm_cast_point} frozen norm layer(s) on point expert back to bfloat16")
         if getattr(point_expert, "is_gradient_checkpointing", False):
             point_expert.gradient_checkpointing_disable()
         point_expert.to(student_model.device)
@@ -588,7 +771,8 @@ def train_opd_parallel(
                 lr = learning_rate * global_step / warmup_steps
                 for g in optimizer.param_groups:
                     g["lr"] = lr
-            if global_step > warmup_steps:
+            elif is_last_batch:
+                # Step the scheduler exactly once per actual optimizer update.
                 scheduler.step()
             pbar.set_postfix({"kl": f"{kl_val:.4f}", "phase": "point"})
 
@@ -639,7 +823,8 @@ def _opd_single_batch(
 ) -> float:
     """Process a single OPD batch: generate, forward, compute KL, backward.
 
-    Returns the KL loss value.
+    Returns the KL loss value. When ``do_step=True`` the optimizer is stepped
+    before returning.
     """
     # Convert batch tensors to the student device. For image_grid_thw we keep
     # the collated [num_images, 3] shape; using v[0] would collapse it to [3]

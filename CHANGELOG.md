@@ -17,6 +17,14 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Fixed
 
+- **修复 Stage 6 OPD 在 Box phase 不保存 checkpoint 的问题，并消除 `lr_scheduler.step()` 顺序警告**
+  - 根因 1（不保存）：`src/training/opd_trainer.py` 的 `train_opd_parallel()` 只在 Point phase 循环里检查 `global_step % save_steps == 0`，Box phase 循环缺少同样的保存逻辑。当第 500 步（或任意 `save_steps` 整数倍）落在 Box phase 时，不会触发 `_save_opd_checkpoint()`，导致用户观察到“跑了 500 步没保存”。
+  - 根因 2（警告）：`train_opd_parallel()` 在每个 batch 末尾调用 `scheduler.step()`，但 `optimizer.step()` 只在每个 epoch 的最后一个 Point batch 才执行。于是 Box phase 全程以及 Point phase 的大部分 batch 都出现 `lr_scheduler.step() before optimizer.step()` 的 PyTorch 警告，且学习率 schedule 的第一个值被跳过。
+  - `src/training/opd_trainer.py`：在 Box phase 循环中加入与 Point phase 相同的 `global_step % save_steps == 0` 检查，并补充对应的 per-step 日志，使 checkpoint 按 `save_steps` 在 Box / Point 两个阶段都能正确保存。
+  - `src/training/opd_trainer.py`：将 `scheduler.step()` 移到真正执行 `optimizer.step()` 之后——即在 Point phase 的最后一个 batch 完成 `optimizer.step()` 后再调用 `scheduler.step()`，而不是每个 batch 都 step。这符合 OPD 并行蒸馏“每 epoch 累积 Box + Point 梯度后做一次参数更新”的论文思路，且不增加显存占用。
+  - `src/training/opd_trainer.py`：由于 scheduler 现在按 epoch 粒度 step，将 `CosineAnnealingLR` 的 `T_max` 从 `total_steps_per_epoch * num_epochs` 调整为 `num_epochs`，保持 cosine 退火在训练结束时到达最低点。
+  - 验证：`python -m py_compile src/training/opd_trainer.py scripts/run_stage6_opd.py` 通过；`python -m pytest tests/ -q` → 188 passed, 1 skipped。
+
 - **强化 Stage 5 expert 切换时的显存释放，修复加载第二个 expert 时的 `CUDA driver error: device not ready`**
   - 根因：`src/training/memory_utils.py` 的 `clear_memory()` 在 `torch.cuda.empty_cache()` 之后才调用 `torch.cuda.synchronize()`。某些驱动/运行时状态下，先释放显存池再等待未完成 kernel 可能触发 `device not ready`，尤其是在第一个 expert 刚卸载、第二个 expert 的 adapter 权重要立即分配时。
   - `src/training/memory_utils.py`：调整 `clear_memory()` 顺序为 `synchronize → empty_cache → synchronize → ipc_collect`，确保所有 pending kernel 完成后再释放显存块，释放后再等待一次，降低新模型加载时遇到 driver 未就绪的概率。
@@ -81,6 +89,16 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - `src/training/opd_trainer.py`：在 Box/Point expert 加载、释放以及每个 epoch 结束时通过 stage logger 打印 allocated/reserved 显存，方便用户观察峰值并排查 OOM。
   - 效果：单卡 24GB 上，学生+专家+单 batch 长序列（max_new_tokens=512）的峰值 reserved 控制在 ~23.9GB 以内；多 batch 连续运行不会因碎片持续增长；用户可在日志中直接看到每个 phase 的显存变化。
   - 验证：`python scripts/diagnostics/profile_opd_memory.py` 单 batch 峰值 allocated≈19.3GB / reserved≈22.7GB；`python scripts/run_stage6_opd.py ... --num_box 3 --num_point 3 --num_epochs 1 --max_new_tokens 512` 完整通过；`python -m pytest tests/ -q` → 188 passed, 1 skipped。
+
+- **修复 Stage 6 OPD 在 24GB 显卡上仍爆显存的问题**
+  - 根因：Stage 5 Unified 模型继承的 LoRA 配置把 `embed_tokens` / `lm_head` 设为 `modules_to_save`，导致 Stage 6 OPD 的学生有 917M 可训练参数；AdamW 优化器状态（2 阶矩）需要约 7.3GB，加上 student（~7.5GB）和当前 expert（~7.5GB）后，峰值 allocated 达到 30GB+，超出 24GB 显存上限。
+  - `src/training/opd_trainer.py`：新增 `_freeze_opd_embeddings()`，在 OPD 训练开始前冻结 `embed_tokens` / `lm_head`（约 778M 参数），使可训练参数降至 528M（仅 LoRA）。OPD 只蒸馏专家策略，无需重新学习特殊 token embedding，因此不影响论文 Sec 2.5.4 的 reverse-KL 目标。
+  - `src/training/opd_trainer.py`：新增 `_warn_if_embeddings_untrained()` 保护机制，在冻结前检查视觉原语特殊 token（`<|box|>`、`<|point|>`、`<|ref|>` 等）embedding 的 L2 范数。若范数过低（低于 `min_norm=0.05`），说明 embedding 仍接近随机初始化，会打印 WARNING 提示用户重新训练 Stage 1-3/5，避免冻结后输出乱码 / 非拉丁字符。正常训练后的 embedding 范数在 0.3-0.5 之间，检查通过后会打印 INFO 确认。
+  - `src/training/opd_trainer.py`：OPD 优化器改用 `bitsandbytes.optim.AdamW8bit`，将剩余 LoRA 参数的优化器状态从 fp32 压缩到 8-bit，进一步降低约 3GB 显存。
+  - `src/training/opd_trainer.py`：新增 `_cast_frozen_norms_to_bf16()`，将冻结的文本 RMSNorm 从 fp32 恢复为 bfloat16，既消除训练过程中反复出现的 "Casting fp32 inputs back to torch.bfloat16 for flash-attn compatibility" 提示，又避免修改 vision LayerNorm（保持 fp32 以免 dtype 不匹配）。
+  - `src/training/opd_trainer.py`：对加载的 Box / Point expert 同样执行 `_cast_frozen_norms_to_bf16()`，确保教师模型的前向也保持一致的 dtype。
+  - 效果：OPD 峰值 allocated 从 30.26GB（baseline）降至 18.58GB（512×512 图像、max_new_tokens=512、student + expert + optimizer），在 RTX 5090D 24GB 上留有充足余量；`bitsandbytes` 的 `_check_is_size` FutureWarning 为依赖库内部提示，暂无法从本项目代码消除，不影响训练。
+  - 验证：`python scripts/diagnostics/reproduce_opd_oom.py` 显示 baseline 30.26GB、fix 18.58GB；`python scripts/run_stage6_opd.py --num_box 1 --num_point 1 --num_maze 1 --num_epochs 1 --max_new_tokens 512` 完整通过；`python -m pytest tests/ -q` → 188 passed, 1 skipped；`python scripts/diagnostics/test_opd_warnings.py` PASS。
 
 ### Added
 

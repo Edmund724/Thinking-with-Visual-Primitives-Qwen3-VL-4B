@@ -107,7 +107,7 @@ Stage 3b: Point Expert SFT        Point+Maze 专项 SFT                      ~16
 Stage 4a: Box Expert GRPO         Box 专家 GRPO (1 轮，无早停)            ~20.1h  ✅
 Stage 4b: Point Expert GRPO       Point 专家 GRPO (1 轮，无早停)          ~36.4h ✅（实测，分 7 段 resume）
 Stage 5:  Unified RFT             专家生成 rollout → Unified 学习         ~2.7h  ✅（fast mode：400 prompts × 2 rollouts，81 条 Normal+Easy 样本，loss 2.236）
-Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    (预计)
+Stage 6:  OPD                     On-Policy Distillation (D_KL(student || expert))   ~7h    ✅ 已验证 24GB 可跑（默认配置峰值 ~18.5GB）
                                 ──────────────────────────────────────────────
                                 Total（已实测部分）:                         ~96.0h
 ```
@@ -319,6 +319,8 @@ python scripts/run_stage5_rft_unified.py \
 > **专家路径自动解析**：`configs/stage6_opd.yaml` 中的 `box_expert_path` / `point_expert_path` 指向 Stage 4a/4b 的输出目录。`load_qlora_model()` 会自动将其解析为最新的 `round_N/adapter_model.safetensors` checkpoint，因此即使 Stage 4 配置为 `num_rounds > 1` 也无需修改 Stage 6 配置。
 >
 > **带时间戳的训练日志**：OPD 的每步日志已通过 stage logger 自动带上墙钟时间戳，便于分多次跑时跟踪进度。
+>
+> **24GB 显存优化 + 安全保护**：OPD 在训练前冻结 `embed_tokens` / `lm_head`（这些特殊 token embedding 在前面阶段已经学好），并使用 **8-bit AdamW**，将可训练参数从约 917M 降至约 528M，优化器状态显存减少约 6GB。默认配置下（`max_new_tokens=512`、每 batch 一张图），峰值 allocated 显存约 **18.5GB**，在 RTX 5090D 24GB 上留有充足余量。为避免上游阶段训练异常导致 embedding 未学到，OPD 会在冻结前检查视觉原语特殊 token embedding 的 L2 范数；若发现范数过低（接近随机初始化），会打印 WARNING 提示重新训练 Stage 1-3/5，避免冻结后输出乱码。
 
 ```bash
 python scripts/run_stage6_opd.py \

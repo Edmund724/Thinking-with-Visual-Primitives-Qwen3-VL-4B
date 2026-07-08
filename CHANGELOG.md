@@ -20,6 +20,22 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Added
 
+- **在 ModelScope 模型说明与根 README 中明确标注各阶段权重类型（完整模型 vs LoRA adapter）**
+  - 根因：项目除 Stage 2 合并后的 `TVP-Pretrain-Qwen3-VL-4B` 为完整 bf16 模型外，其余阶段（SFT / GRPO / RFT / OPD）发布的均为 QLoRA adapter，但此前 README 与各 stage 输出目录下的 `README.md` 未在显眼位置说明，容易让使用者误以为每个 repo 都是独立完整模型。
+  - `README.md` / `README_zh.md`：模型权重表新增 `Type` / `类型` 列，明确只有 Pretrain（merged）是完整 bf16 模型，其余为 LoRA adapter；并将每个模型名改为指向 ModelScope 仓库的超链接。
+  - 各 stage 输出目录下的 `README.md`（共 7 个）：在每个模型的声明段落后新增「注意」提示，说明该仓库是完整模型还是仅含 LoRA adapter 权重，以及加载方式。这些 README 直接位于对应 `outputs/` 目录下，不再单独维护 `modelscope_readmes/` 副本。
+  - 验证：所有 Markdown 文件语法检查通过；`README.md` 与 `README_zh.md` 保持同步。
+
+- **新增 Stage 7：将 OPD LoRA adapter 合并为完整 bf16 模型**
+  - 根因：项目只有 Stage 2 合并后的预训练模型是完整模型，中间 SFT/GRPO/RFT/OPD 都是 LoRA adapter，导致最终发布给用户的 OPD 模型仍需要加载基座。增加一个轻量的 merge 阶段，使项目「头尾都是完整模型，中间是 LoRA adapter」，发布形态更完整、清晰。
+  - 新增 `scripts/run_stage7_merge_opd.py`：功能与 `run_stage2_merge.py` 类似，但输入为 `outputs/stage2_merged_base`（完整模型）和 `outputs/stage6_opd`（自动选择最新 `checkpoint-*` adapter），输出 `outputs/stage7_opd_merged/`。
+  - 新增 `configs/stage7_merge_opd.yaml`：默认参数 `base_model: outputs/stage2_merged_base`、`adapter_path: outputs/stage6_opd`、`output_dir: outputs/stage7_opd_merged`。
+  - `docs/TRAINING.md`：新增 Stage 7 章节，说明用法和输出。
+  - `README.md` / `README_zh.md`：训练流程表新增 Stage 7；OPD 模型权重行改为「OPD (final adapter) + OPD (merged)」共用 `TVP-OPD-Qwen3-VL-4B`，类型分别为 LoRA adapter 和 Full bf16 model。
+  - `modelscope_readmes/TVP-OPD-Qwen3-VL-4B.md`：说明本仓库发布的是合并后的完整 bf16 模型，训练流程增加 Stage 7。
+  - 删除 `modelscope_readmes/` 目录：将 7 个 ModelScope 说明文件直接放到对应 stage 的 `outputs/` 目录下作为 `README.md`，避免同一内容维护两份副本。
+  - 验证：`python -m py_compile scripts/run_stage7_merge_opd.py` 通过。
+
 - **Stage 5 Unified RFT 默认 Fast mode（忠实论文的小规模 pipeline）**
   - 根因：Stage 5 完整数据流程（17,000 prompts × 5 rollouts）耗时过长，但用户希望尽快走通论文机制，不要求最终精度。
   - `configs/stage5_rft_unified.yaml`：默认 prompt 数量下调为 `num_box_prompts: 100`、`num_counting_prompts: 50`、`num_clevr_prompts: 50`、`num_point_prompts: 100`、`num_maze_prompts: 50`、`num_path_prompts: 50`，`num_rollouts: 2`，`skip_expert_generation: false`。这样完整保留论文流程（Experts → rejection sampling → Easy/Normal/Hard difficulty grading → Normal + 5% Easy → Unified SFT），但数据筛选可在数分钟内完成。

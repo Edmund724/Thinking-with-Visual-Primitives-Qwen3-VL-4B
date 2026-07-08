@@ -208,6 +208,25 @@ python scripts/run_stage6_opd.py \
 
 ---
 
+## Stage 7: Merge OPD LoRA
+
+**Required**: merge the final Stage 6 OPD adapter back into the Stage 2 merged base to produce a standalone full bf16 model.
+
+```bash
+python scripts/run_stage7_merge_opd.py \
+    --base_model outputs/stage2_merged_base \
+    --adapter_path outputs/stage6_opd \
+    --output_dir outputs/stage7_opd_merged
+```
+
+`--adapter_path` can point to either an adapter directory (e.g. `outputs/stage6_opd/checkpoint-2500`) or the stage output directory (e.g. `outputs/stage6_opd`); the script automatically picks the latest `checkpoint-*` in the latter case.
+
+**Output**: `outputs/stage7_opd_merged/` (~8.8GB `model.safetensors`)
+
+This is the final standalone model and should be uploaded to the same ModelScope repo as the OPD (final adapter) checkpoint.
+
+---
+
 ## Common Training Utilities
 
 ### Timestamped logs

@@ -74,15 +74,18 @@ print(processor.tokenizer.decode(outputs[0], skip_special_tokens=False))
 
 各阶段 checkpoints 已上传至 ModelScope（中国大陆访问友好）：
 
-| 阶段 | ModelScope 模型名 |
-|------|------------------|
-| Pretrain（合并后） | `TVP-Pretrain-Qwen3-VL-4B` |
-| SFT Box 专家 | `TVP-SFT-Box-Qwen3-VL-4B` |
-| SFT Point 专家 | `TVP-SFT-Point-Qwen3-VL-4B` |
-| GRPO Box 专家 | `TVP-GRPO-Box-Qwen3-VL-4B` |
-| GRPO Point 专家 | `TVP-GRPO-Point-Qwen3-VL-4B` |
-| Unified RFT | `TVP-RFT-Unified-Qwen3-VL-4B` |
-| OPD（最终模型） | `TVP-OPD-Qwen3-VL-4B` |
+| 阶段 | ModelScope 模型名 | 类型 |
+|------|------------------|------|
+| Pretrain（合并后） | [TVP-Pretrain-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-Pretrain-Qwen3-VL-4B) | 完整 bf16 模型 |
+| SFT Box 专家 | [TVP-SFT-Box-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-SFT-Box-Qwen3-VL-4B) | LoRA adapter |
+| SFT Point 专家 | [TVP-SFT-Point-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-SFT-Point-Qwen3-VL-4B) | LoRA adapter |
+| GRPO Box 专家 | [TVP-GRPO-Box-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Box-Qwen3-VL-4B) | LoRA adapter |
+| GRPO Point 专家 | [TVP-GRPO-Point-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Point-Qwen3-VL-4B) | LoRA adapter |
+| Unified RFT | [TVP-RFT-Unified-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-RFT-Unified-Qwen3-VL-4B) | LoRA adapter |
+| OPD（最终 adapter） | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | LoRA adapter |
+| OPD（合并后） | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | 完整 bf16 模型 |
+
+LoRA adapter 会加载到对应的基座模型之上；`load_qlora_model(repo_name)` 会自动读取 `adapter_config.json` 中的基座模型路径并合并 adapter。
 
 **合集地址**：[Thinking-with-Visual-Primitives-Qwen3-VL-4B](https://modelscope.cn/collections/EdmundYY/Thinking-with-Visual-Primitives-Qwen3-VL-4B)
 
@@ -108,6 +111,7 @@ bash scripts/run_pipeline.sh
 | 4b | Point Expert GRPO | Point/迷宫/路径 prompts | `outputs/stage4b_grpo_point/` | ~36.4h |
 | 5 | Unified RFT | 专家 rollout | `outputs/stage5_rft_unified/` | ~2.7h |
 | 6 | OPD | Student + 专家 | `outputs/stage6_opd/` | ~7h |
+| 7 | Merge OPD LoRA | Stage 6 adapter + Stage 2 base | `outputs/stage7_opd_merged/` | ~1m |
 
 每阶段的命令、配置、断点续训与显存提示见 [docs/TRAINING.md](docs/TRAINING.md)。
 

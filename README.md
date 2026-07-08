@@ -74,15 +74,18 @@ For batch inference and cross-stage comparisons, see [docs/INFERENCE.md](docs/IN
 
 All checkpoints are available on ModelScope (China mainland friendly):
 
-| Stage | ModelScope name |
-|-------|-----------------|
-| Pretrain (merged) | `TVP-Pretrain-Qwen3-VL-4B` |
-| SFT Box expert | `TVP-SFT-Box-Qwen3-VL-4B` |
-| SFT Point expert | `TVP-SFT-Point-Qwen3-VL-4B` |
-| GRPO Box expert | `TVP-GRPO-Box-Qwen3-VL-4B` |
-| GRPO Point expert | `TVP-GRPO-Point-Qwen3-VL-4B` |
-| Unified RFT | `TVP-RFT-Unified-Qwen3-VL-4B` |
-| OPD (final) | `TVP-OPD-Qwen3-VL-4B` |
+| Stage | ModelScope name | Type |
+|-------|-----------------|------|
+| Pretrain (merged) | [TVP-Pretrain-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-Pretrain-Qwen3-VL-4B) | Full bf16 model |
+| SFT Box expert | [TVP-SFT-Box-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-SFT-Box-Qwen3-VL-4B) | LoRA adapter |
+| SFT Point expert | [TVP-SFT-Point-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-SFT-Point-Qwen3-VL-4B) | LoRA adapter |
+| GRPO Box expert | [TVP-GRPO-Box-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Box-Qwen3-VL-4B) | LoRA adapter |
+| GRPO Point expert | [TVP-GRPO-Point-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Point-Qwen3-VL-4B) | LoRA adapter |
+| Unified RFT | [TVP-RFT-Unified-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-RFT-Unified-Qwen3-VL-4B) | LoRA adapter |
+| OPD (final adapter) | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | LoRA adapter |
+| OPD (merged) | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | Full bf16 model |
+
+LoRA adapters are loaded on top of their respective base models; `load_qlora_model(repo_name)` handles this automatically by reading `adapter_config.json`.
 
 **Collection**: [Thinking-with-Visual-Primitives-Qwen3-VL-4B](https://modelscope.cn/collections/EdmundYY/Thinking-with-Visual-Primitives-Qwen3-VL-4B)
 
@@ -108,6 +111,7 @@ bash scripts/run_pipeline.sh
 | 4b | Point Expert GRPO | Point/maze/path prompts | `outputs/stage4b_grpo_point/` | ~36.4h |
 | 5 | Unified RFT | Expert rollouts | `outputs/stage5_rft_unified/` | ~2.7h |
 | 6 | OPD | Student + experts | `outputs/stage6_opd/` | ~7h |
+| 7 | Merge OPD LoRA | Stage 6 adapter + Stage 2 base | `outputs/stage7_opd_merged/` | ~1m |
 
 See [docs/TRAINING.md](docs/TRAINING.md) for per-stage commands, configs, resume, and memory tips.
 

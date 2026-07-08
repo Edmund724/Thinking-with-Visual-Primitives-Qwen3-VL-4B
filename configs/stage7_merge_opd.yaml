@@ -1,0 +1,4 @@
+# Stage 7: Merge Stage 6 OPD LoRA into the merged base model
+base_model: outputs/stage2_merged_base
+adapter_path: outputs/stage6_opd
+output_dir: outputs/stage7_opd_merged

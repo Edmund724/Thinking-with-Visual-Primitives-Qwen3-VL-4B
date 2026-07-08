@@ -82,8 +82,7 @@ All checkpoints are available on ModelScope (China mainland friendly):
 | GRPO Box expert | [TVP-GRPO-Box-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Box-Qwen3-VL-4B) | LoRA adapter |
 | GRPO Point expert | [TVP-GRPO-Point-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Point-Qwen3-VL-4B) | LoRA adapter |
 | Unified RFT | [TVP-RFT-Unified-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-RFT-Unified-Qwen3-VL-4B) | LoRA adapter |
-| OPD (final adapter) | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | LoRA adapter |
-| OPD (merged) | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | Full bf16 model |
+| OPD (final) | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | Full bf16 model |
 
 LoRA adapters are loaded on top of their respective base models; `load_qlora_model(repo_name)` handles this automatically by reading `adapter_config.json`.
 

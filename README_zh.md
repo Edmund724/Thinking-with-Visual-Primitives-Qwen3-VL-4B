@@ -82,8 +82,7 @@ print(processor.tokenizer.decode(outputs[0], skip_special_tokens=False))
 | GRPO Box 专家 | [TVP-GRPO-Box-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Box-Qwen3-VL-4B) | LoRA adapter |
 | GRPO Point 专家 | [TVP-GRPO-Point-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-GRPO-Point-Qwen3-VL-4B) | LoRA adapter |
 | Unified RFT | [TVP-RFT-Unified-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-RFT-Unified-Qwen3-VL-4B) | LoRA adapter |
-| OPD（最终 adapter） | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | LoRA adapter |
-| OPD（合并后） | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | 完整 bf16 模型 |
+| OPD（最终模型） | [TVP-OPD-Qwen3-VL-4B](https://modelscope.cn/models/EdmundYY/TVP-OPD-Qwen3-VL-4B) | 完整 bf16 模型 |
 
 LoRA adapter 会加载到对应的基座模型之上；`load_qlora_model(repo_name)` 会自动读取 `adapter_config.json` 中的基座模型路径并合并 adapter。
 

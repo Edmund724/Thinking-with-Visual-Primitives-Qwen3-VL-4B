@@ -109,7 +109,7 @@ bash scripts/run_pipeline.sh
 | 4a | Box Expert GRPO | Box prompts | `outputs/stage4a_grpo_box/` | ~20.1h |
 | 4b | Point Expert GRPO | Point/maze/path prompts | `outputs/stage4b_grpo_point/` | ~36.4h |
 | 5 | Unified RFT | Expert rollouts | `outputs/stage5_rft_unified/` | ~2.7h |
-| 6 | OPD | Student + experts | `outputs/stage6_opd/` | ~7h |
+| 6 | OPD | Student + experts | `outputs/stage6_opd/` | ~58.5h |
 | 7 | Merge OPD LoRA | Stage 6 adapter + Stage 2 base | `outputs/stage7_opd_merged/` | ~1m |
 
 See [docs/TRAINING.md](docs/TRAINING.md) for per-stage commands, configs, resume, and memory tips.

@@ -46,6 +46,11 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - 删除 `modelscope_readmes/` 目录：将 7 个 ModelScope 说明文件直接放到对应 stage 的 `outputs/` 目录下作为 `README.md`，避免同一内容维护两份副本。
   - 验证：`python -m py_compile scripts/run_stage7_merge_opd.py` 通过。
 
+- **记录 Stage 6 OPD 与 Stage 7 Merge 的真实 GPU 墙钟时间**
+  - Stage 6 OPD 分 9 个断点续训段完成：2026-07-07 11:11→15:25（4h 14m）、17:57→23:38（5h 41m）、07-08 15:43→22:56（7h 13m）、07-09 12:23→17:45（5h 22m）、20:38→07-10 10:12（13h 34m）、07-10 12:13→21:20（9h 7m）、23:03→07-11 01:26（2h 23m）、07-11 11:31→19:50（8h 19m）、21:49→07-12 00:24（2h 35m）。合计 **58h 29m**。日志中 Epoch 1/2 纯训练时间分别为 17976.7s / 9291.8s，不含中断间隔。
+  - Stage 7 Merge OPD LoRA 墙钟时间约 **33s**（~1m）。
+  - 更新 `README.md`、`README_zh.md`、`docs/TRAINING.md` 中的 pipeline 时间表。
+
 - **Stage 5 Unified RFT 默认 Fast mode（忠实论文的小规模 pipeline）**
   - 根因：Stage 5 完整数据流程（17,000 prompts × 5 rollouts）耗时过长，但用户希望尽快走通论文机制，不要求最终精度。
   - `configs/stage5_rft_unified.yaml`：默认 prompt 数量下调为 `num_box_prompts: 100`、`num_counting_prompts: 50`、`num_clevr_prompts: 50`、`num_point_prompts: 100`、`num_maze_prompts: 50`、`num_path_prompts: 50`，`num_rollouts: 2`，`skip_expert_generation: false`。这样完整保留论文流程（Experts → rejection sampling → Easy/Normal/Hard difficulty grading → Normal + 5% Easy → Unified SFT），但数据筛选可在数分钟内完成。

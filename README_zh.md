@@ -109,7 +109,7 @@ bash scripts/run_pipeline.sh
 | 4a | Box Expert GRPO | Box prompts | `outputs/stage4a_grpo_box/` | ~20.1h |
 | 4b | Point Expert GRPO | Point/迷宫/路径 prompts | `outputs/stage4b_grpo_point/` | ~36.4h |
 | 5 | Unified RFT | 专家 rollout | `outputs/stage5_rft_unified/` | ~2.7h |
-| 6 | OPD | Student + 专家 | `outputs/stage6_opd/` | ~7h |
+| 6 | OPD | Student + 专家 | `outputs/stage6_opd/` | ~58.5h |
 | 7 | Merge OPD LoRA | Stage 6 adapter + Stage 2 base | `outputs/stage7_opd_merged/` | ~1m |
 
 每阶段的命令、配置、断点续训与显存提示见 [docs/TRAINING.md](docs/TRAINING.md)。

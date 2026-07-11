@@ -12,9 +12,9 @@ Stage 3b: Point Expert SFT          Point + maze SFT                       ~16h
 Stage 4a: Box Expert GRPO           Box GRPO (1 epoch, no early stop)      ~20.1h
 Stage 4b: Point Expert GRPO         Point GRPO (1 epoch, no early stop)    ~36.4h
 Stage 5:  Unified RFT               Expert rollouts → unified SFT          ~2.7h
-Stage 6:  OPD                       On-policy distillation (KL)            ~7h
+Stage 6:  OPD                       On-policy distillation (KL)            ~58.5h
                                         ───────────────────────────────
-                                        Total verified runtime: ~96h
+                                        Total verified runtime: ~150.5h
 ```
 
 **Core design**:

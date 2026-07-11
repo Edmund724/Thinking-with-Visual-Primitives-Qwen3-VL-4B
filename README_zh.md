@@ -141,10 +141,21 @@ tvp-4b-5090d/
 ├── tests/                   # 单元测试与集成测试
 ├── outputs/                 # 按 stage 组织的训练产物
 ├── data/                    # COCO 与生成数据缓存
+├── lessons/                 # 教学课程（HTML）
+├── reference/               # 教学参考文档
+├── assets/                  # 共享教学资源（CSS 等）
+├── learning-records/        # 学习记录
+├── MISSION.md               # 学习使命
+├── RESOURCES.md             # 学习资源清单
 └── models/                  # 基座模型（需手动下载）
 ```
 
 视觉原语、奖励函数、显存优化、Domain Seam 等技术设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 教学材料
+
+- **课程 0001**：[Stage 5 RFT 与 Stage 6 OPD](lessons/0001-stage5-rft-stage6-opd.html) —— 讲解 Pipeline 全景、难度分级、Reverse KL 蒸馏、代码关键路径，并附交互式测验。
+- **参考文档**：[RFT & OPD 术语表](reference/0001-rft-opd-glossary.md) —— 术语、公式、超参速查。
 
 ---
 

@@ -40,6 +40,15 @@ build/
 # macOS
 .DS_Store
 
+# 教学材料（本地学习目录）
+lessons/
+reference/
+assets/
+learning-records/
+MISSION.md
+RESOURCES.md
+NOTES.md
+
 # 测试缓存
 .pytest_cache/
 .coverage

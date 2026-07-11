@@ -239,7 +239,25 @@ class StageRunner:
             _flush_log()
             sys.exit(1)
 
+        def _sigint_handler(signum: int, frame: Any) -> None:
+            nonlocal interrupted
+            interrupted = True
+            # Synchronize so any in-flight CUDA kernels finish before we exit.
+            # Without this, a long kernel can hold the process for seconds after
+            # the user presses Ctrl+C, making cancellation feel unresponsive.
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+            self.logger.info(
+                f"Received SIGINT at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}; exiting..."
+            )
+            _flush_log()
+            sys.exit(0)
+
         signal.signal(signal.SIGTERM, _sigterm_handler)
+        signal.signal(signal.SIGINT, _sigint_handler)
 
         torch.cuda.empty_cache()
         try:

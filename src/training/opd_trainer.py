@@ -934,6 +934,7 @@ def _opd_single_batch(
     # Variable-length sequences can leave large reserved blocks behind;
     # release them after each batch to keep fragmentation in check.
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
     return kl_loss.item()

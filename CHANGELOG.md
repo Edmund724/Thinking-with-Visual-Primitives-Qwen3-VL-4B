@@ -6,6 +6,16 @@ All notable changes to the GRPO training pipeline are documented in this file.
 
 ### Changed
 
+- **新增教学目录 `lessons/`、`reference/`、`assets/`，用于解释 Stage 5 RFT 与 Stage 6 OPD 机制**
+  - 根因：Stage 5/6 的算法设计（专家生成、难度分级、Reverse KL 蒸馏）对新人较难直接阅读代码理解。
+  - 新增 `lessons/0001-stage5-rft-stage6-opd.html`：自包含课程，覆盖 Pipeline 全景、RFT 数据筛选逻辑、OPD 蒸馏公式、代码关键路径与交互式测验。
+  - 新增 `reference/0001-rft-opd-glossary.md`：术语表与关键超参速查。
+  - 新增 `assets/style.css`：课程共享样式。
+  - 新增 `MISSION.md`、`RESOURCES.md`、`NOTES.md` 与 `learning-records/` 占位目录。
+  - 文件：`lessons/0001-stage5-rft-stage6-opd.html`、`reference/0001-rft-opd-glossary.md`、`assets/style.css`、`MISSION.md`、`RESOURCES.md`、`NOTES.md`
+
+### Changed
+
 - **重构 README，精简为首屏可扫描的模型发布风格，并将详细内容拆分到 `docs/`**
   - 根因：原 `README.md` / `README_zh.md` 约 844 行，包含大量逐 stage 训练细节、时间戳、bug 修复记录、显存调优与未来优化方向，首屏信息密度低，对新人不友好。
   - 参考 [meta-llama/llama](https://github.com/meta-llama/llama/blob/main/README.md)、[openai/whisper](https://github.com/openai/whisper/blob/main/README.md)、[Stability-AI/StableLM](https://github.com/Stability-AI/StableLM/blob/main/README.md) 等稳定模型发布项目的 README 风格，保留：标题 + badges + 一句话定位、核心特点、安装与最小推理示例、模型权重表、训练流程总览表、项目结构、测试、引用与许可。
@@ -898,3 +908,11 @@ All notable changes to the GRPO training pipeline are documented in this file.
   - 在 `scripts/run_stage1_pretrain.py`、`run_stage2_visual_pretrain.py`、`run_stage3a_sft_box.py`、`run_stage3b_sft_point.py` 顶部统一设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
   - 现在 stage1–stage6 全部脚本都内置该环境变量，无需每次手动在命令行添加。
   - 文件：`scripts/run_stage1_pretrain.py`, `scripts/run_stage2_visual_pretrain.py`, `scripts/run_stage3a_sft_box.py`, `scripts/run_stage3b_sft_point.py`
+
+### Fixed
+
+- **修复 Stage 6 OPD 训练时 Ctrl+C 无法及时取消的问题**
+  - 根因：Python 默认的 SIGINT 处理会在当前 CUDA kernel 执行完毕后才抛出 `KeyboardInterrupt`。如果训练循环恰好在一个大 kernel（如 `model.generate()` 或 `model()` forward）运行时收到 Ctrl+C，进程会被 CUDA runtime 阻塞数秒，导致需要多次按键才能退出。
+  - `src/training/stage_runner.py`：在 `StageRunner.run()` 中为 `signal.SIGINT` 注册显式 handler，调用 `torch.cuda.synchronize()` 等待 in-flight kernel 完成后立即 `sys.exit(0)`，避免 Python 主循环被 CUDA 阻塞。
+  - `src/training/opd_trainer.py`：在 `_opd_single_batch()` 的 `torch.cuda.empty_cache()` 前加入 `torch.cuda.synchronize()`，确保每个 batch 结束后 pending kernel 已落地，降低下一次 `cuda.synchronize()`（在 Ctrl+C handler 中）的等待时间。
+  - 验证：`python -m pytest tests/ -q` → 188 passed, 1 skipped；手动 SIGINT 测试确认取消延迟从秒级降至亚秒级。

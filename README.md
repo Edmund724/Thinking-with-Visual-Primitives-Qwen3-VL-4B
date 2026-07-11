@@ -141,22 +141,10 @@ tvp-4b-5090d/
 ├── tests/                   # Unit + integration tests
 ├── outputs/                 # Training artifacts (per stage)
 ├── data/                    # COCO + generated caches
-├── lessons/                 # Teaching lessons (HTML)
-├── reference/               # Teaching reference documents
-├── assets/                  # Shared teaching assets (CSS, etc.)
-├── learning-records/        # Learning records (ADRs for learning)
-├── MISSION.md               # Learning mission statement
-├── RESOURCES.md             # Curated learning resources
-├── NOTES.md                 # Scratchpad for teaching notes
 └── models/                  # Base model (download manually)
 ```
 
 For technical design details (visual primitives, reward functions, memory optimization, domain seams), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Teaching Materials
-
-- **Lesson 0001**: [Stage 5 RFT & Stage 6 OPD](lessons/0001-stage5-rft-stage6-opd.html) — explains the pipeline, difficulty grading, Reverse KL distillation, and code walkthrough with interactive quizzes.
-- **Reference**: [RFT & OPD Glossary](reference/0001-rft-opd-glossary.md) — quick lookup for terms, formulas, and hyperparameters.
 
 ---
 
